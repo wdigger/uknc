@@ -2,3 +2,9 @@
 /gcc/build
 /gcc/src
 /gcc/xgcc
+*.out
+*.o
+*.lda
+*.sav
+*.map
+example.dsk
