@@ -2,7 +2,7 @@
 .globl ___adddf3, ___mulsf3, ___negsf2, ___extendsfdf2, ___fixdfsi
 .globl ___addsf3, ___subsf3, ___divsf3, ___subdf3, ___truncdfsf2
 .globl ___divsi3, ___modsi3, ___fixsfsi, ___floatsidf, ___floatunsisf
-.globl ___ltsf2
+.globl ___ltsf2, ___eqsf2, ___nesf2
 
 ___addsf3:
     mov r0, -(sp)
@@ -230,5 +230,37 @@ ___ltsf2:
     blt 1f
     cmp 4(sp), 10(sp)
 1:  rts pc
+
+___eqsf2:
+    mov 2(sp), r0
+    cmp r0, 6(sp)
+    bne 1f
+
+    mov 4(sp), r0
+    cmp r0, 8(sp)
+    bne 1f
+
+    clr r0
+    rts pc
+
+1:
+    mov $1, r0
+    rts pc
+
+___nesf2:
+    mov 2(sp), r0
+    cmp r0, 6(sp)
+    beq 1f
+
+    mov 4(sp), r0
+    cmp r0, 8(sp)
+    beq 1f
+
+    clr r0
+    rts pc
+
+1:
+    mov $1, r0
+    rts pc
 
 .end
