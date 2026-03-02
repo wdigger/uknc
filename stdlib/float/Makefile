@@ -4,7 +4,7 @@ SIMH:= pdp11
 CC:=pdp11-aout-gcc
 OPT_FLAG:=-O2
 GCC_FLAGS:=-std=gnu23 -fomit-frame-pointer -msoft-float -fcprop-registers -fPIC -nostartfiles -nodefaultlibs -nostdlib -mbm2 $(OPT_FLAG)
-AS_FLAGS:=-mno-fpu -meis -pic
+AS_FLAGS:=-mno-fpu -meis -mfis -pic
 
 all:	libfloat.a test.sav test.dsk
 
