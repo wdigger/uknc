@@ -34,6 +34,10 @@ bool test_03() {
   return (test_add(12.34, 43.21) == 55.55f);
 }
 
+bool test_04() {
+  return ((654.321 / 123.456) == 5.30003402f);
+}
+
 #define TEST_RUN(name) if(name()) {puts(#name"\tOk");} else puts(#name"\tFailure");
 #define TEST_NEG_RUN(name) if(!name()) {puts(#name"\tOk");} else puts(#name"\tFailure");
 
@@ -43,4 +47,5 @@ int main() {
   TEST_RUN(test_02)
   TEST_NEG_RUN(test_02_n)
   TEST_RUN(test_03)
+  TEST_RUN(test_04)
 }

@@ -8,3 +8,5 @@
 *.sav
 *.map
 example.dsk
+*.a
+*.dsk
