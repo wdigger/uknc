@@ -14,6 +14,10 @@ float test_add(float a, float b) {
   return a + b;
 }
 
+float test_div(float a, float b) {
+  return a / b;
+}
+
 bool test_01() {
   return (const_55_55() == 55.55f);
 }
@@ -35,7 +39,7 @@ bool test_03() {
 }
 
 bool test_04() {
-  return ((654.321 / 123.456) == 5.30003402f);
+  return (test_div(654.321, 123.456) == 5.30003402f);
 }
 
 #define TEST_RUN(name) if(name()) {puts(#name"\tOk");} else puts(#name"\tFailure");
