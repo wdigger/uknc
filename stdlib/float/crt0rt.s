@@ -1,14 +1,12 @@
     .TITLE CRT0RT shim
     .IDENT "V00.00"
 
-    STACK = 01000
-
     .text
     .GLOBAL _main
 
     .GLOBAL start
 start:
-        mov   $STACK, sp
+        mov   @$042, sp  /стек заполнится из заголовка, но на случай запуска не из Rt-11
         jsr   pc, _main
         emt   0350	// .EXIT
         nop
