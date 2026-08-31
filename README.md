@@ -62,6 +62,25 @@ pdp11-uknc-rt11-gcc -std=gnu23 -fomit-frame-pointer -O2 \
   `ld/ldmain.c`). Так получилось после того, как выяснилось, что прямая
   линковка в `sav-pdp11` через generic BFD final-link даёт неверные
   релокации (например, для строковых констант).
+- **`pdp11rt11rel` — альтернативный формат вывода: родной relocatable-объект
+  RT-11** (`ld/emultempl/pdp11rt11rel.em`, `ld/emulparams/pdp11rt11rel.sh`) —
+  вместо `a.out-pdp11` пишет собственный формат RT-11 "Relocatable Object
+  Language" (блоки GSD/TXT/RLD/ENDMOD, имена в RADIX-50), описанный в RT-11
+  Volume and File Formats Manual — то, что понимает штатный линкер RT-11.
+  Устройство то же, что у `pdp11rt11sav`: линковка идёт через `-r` в
+  `a.out-pdp11` (тот же проверенный `pdp11_aout_link_input_section`), а
+  готовый файл затем перечитывается обычными вызовами BFD
+  (`bfd_canonicalize_symtab`/`reloc`) и переупаковывается в формат RT-11 —
+  без отдельного BFD-таргета в обе стороны. Нужна именно `-r`:
+
+  ```bash
+  pdp11-uknc-rt11-gcc -c -O2 foo.c -o foo.o
+  pdp11-uknc-rt11-ld -r -m pdp11rt11rel foo.o -o foo.rel
+  ```
+
+  Символы длиннее 6 символов и непредставимые в RADIX-50 (например, `_` в
+  начале имени, которое добавляет сам компилятор) усекаются/заменяются на
+  `.` — ограничение самого формата 1970-х, а не этой реализации.
 
 ### GCC
 

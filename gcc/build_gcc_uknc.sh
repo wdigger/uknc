@@ -18,10 +18,16 @@ cd ${BUILDDIR}
 curl https://ftp.gnu.org/gnu/binutils/binutils-${BINUTILS_VERSION}.tar.gz | tar -C ${BUILDDIR}/src -zxf -
 
 curl https://github.com/wdigger/binutils-gdb/commit/09c5f5bc048d3e7d96b93efba699ceae742da2b0.patch -o binutils_1.patch
+curl https://github.com/wdigger/binutils-gdb/commit/540689194f9fa20c6afe18aeee17630eb1f3b76c.patch -o binutils_2.patch
+curl https://github.com/wdigger/binutils-gdb/commit/26ad15d4a79361f4d322c5a89e61b339a154cef1.patch -o binutils_3.patch
 
 cd ${BUILDDIR}/src/binutils-${BINUTILS_VERSION}
 patch -p1 < ${BUILDDIR}/binutils_1.patch
+patch -p1 < ${BUILDDIR}/binutils_2.patch
+patch -p1 < ${BUILDDIR}/binutils_3.patch
 rm ${BUILDDIR}/binutils_1.patch
+rm ${BUILDDIR}/binutils_2.patch
+rm ${BUILDDIR}/binutils_3.patch
 
 cd ${BUILDDIR}
 mkdir -p build/binutils
@@ -69,10 +75,13 @@ curl https://sourceware.org/pub/newlib/newlib-${NEWLIB_VERSION}.tar.gz | tar -C 
 cp -R ${BUILDDIR}/src/newlib-${NEWLIB_VERSION}/newlib ${BUILDDIR}/src/gcc-${GCC_VERSION}/newlib
 
 curl https://github.com/wdigger/sourceware-mirror-newlib-cygwin/commit/4bfd315ea9955ae2915040d5ff4cd3eabb9f9e6e.patch -o newlib_1.patch
+curl https://github.com/wdigger/sourceware-mirror-newlib-cygwin/commit/bc9de697a22a121561f422cd7c68e52cbdb84c62.patch -o newlib_2.patch
 
 cd ${BUILDDIR}/src/gcc-${GCC_VERSION}
 patch -p1 < ${BUILDDIR}/newlib_1.patch
+patch -p1 < ${BUILDDIR}/newlib_2.patch
 rm ${BUILDDIR}/newlib_1.patch
+rm ${BUILDDIR}/newlib_2.patch
 
 # newlib_1.patch touches configure.host/libc/acinclude.m4, so configure and
 # Makefile.in must be regenerated from them -- but newlib's own shipped
