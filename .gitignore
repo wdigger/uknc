@@ -10,3 +10,4 @@
 example.dsk
 *.a
 *.dsk
+/gcc/autotools

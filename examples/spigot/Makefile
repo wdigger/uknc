@@ -1,8 +1,8 @@
-OBJS:=	spigot.o stdio.o
+OBJS:=	spigot.o
 SIMH:= pdp11
 CC:=pdp11-uknc-rt11-gcc
 OPT_FLAG:=-O2
-GCC_FLAGS:=-std=gnu23 -fomit-frame-pointer -msoft-float $(OPT_FLAG)
+GCC_FLAGS:=-std=gnu23 -fomit-frame-pointer $(OPT_FLAG)
 LD_FLAGS:=-Wl,--gc-sections -Wl,-Map=spigot.sav.map
 
 all:	spigot.dsk
@@ -11,7 +11,7 @@ all:	spigot.dsk
 	${CC} ${GCC_FLAGS} -c -o $@ $<
 
 spigot.sav:	$(OBJS)
-	${CC} ${GCC_FLAGS} -nodefaultlibs ${LD_FLAGS} -o $@ $(OBJS) -lgcc
+	${CC} ${GCC_FLAGS} ${LD_FLAGS} -o $@ $(OBJS)
 
 spigot.dsk:	spigot.sav
 	rm -f spigot.dsk

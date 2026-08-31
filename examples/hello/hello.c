@@ -1,12 +1,5 @@
+#include <stdio.h>
 
-int puts(const char* ptr) {
-  asm (
-      "emt    0351;\n\t"
-      :
-      : "r" (ptr)
-      );
-}
-
-int main() {
+int main(void) {
   puts("Hello GCC world!");
 }
