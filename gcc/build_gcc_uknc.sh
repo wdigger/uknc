@@ -76,12 +76,15 @@ cp -R ${BUILDDIR}/src/newlib-${NEWLIB_VERSION}/newlib ${BUILDDIR}/src/gcc-${GCC_
 
 curl https://github.com/wdigger/sourceware-mirror-newlib-cygwin/commit/4bfd315ea9955ae2915040d5ff4cd3eabb9f9e6e.patch -o newlib_1.patch
 curl https://github.com/wdigger/sourceware-mirror-newlib-cygwin/commit/bc9de697a22a121561f422cd7c68e52cbdb84c62.patch -o newlib_2.patch
+curl https://github.com/wdigger/sourceware-mirror-newlib-cygwin/commit/8ec5d302b54206f2d4e0aaba20ac6c3d910dcc6b.patch -o newlib_3.patch
 
 cd ${BUILDDIR}/src/gcc-${GCC_VERSION}
 patch -p1 < ${BUILDDIR}/newlib_1.patch
 patch -p1 < ${BUILDDIR}/newlib_2.patch
+patch -p1 < ${BUILDDIR}/newlib_3.patch
 rm ${BUILDDIR}/newlib_1.patch
 rm ${BUILDDIR}/newlib_2.patch
+rm ${BUILDDIR}/newlib_3.patch
 
 # newlib_1.patch touches configure.host/libc/acinclude.m4, so configure and
 # Makefile.in must be regenerated from them -- but newlib's own shipped
