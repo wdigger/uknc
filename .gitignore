@@ -10,4 +10,5 @@
 example.dsk
 *.a
 *.dsk
+*.ppu
 /gcc/autotools

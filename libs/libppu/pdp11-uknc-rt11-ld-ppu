@@ -1,0 +1,35 @@
+#!/usr/bin/env sh
+# pdp11-uknc-rt11-ld-ppu -- linker for PPU-side .ppu programs.
+#
+# A thin wrapper around the real pdp11-uknc-rt11-ld: passes every
+# argument through unchanged, with everything a PPU program's own
+# link needs already applied ahead of them --
+#
+#   -r -m pdp11rt11rel -T $SYSROOT/lib/ppu.ld -u start
+#       -L$SYSROOT/lib -lppu
+#
+# (see ppu_server.h/ppu.ld/ppus_start.c for what each of those is
+# actually for and why a PPU program's build needs it) -- so a
+# Makefile just needs:
+#
+#   pdp11-uknc-rt11-ld-ppu -o myprogram.ppu myprogram.o
+#
+# instead of spelling out every flag by hand, the same way this
+# project's real pdp11-uknc-rt11-ld is normally invoked for anything
+# CPU-side.
+#
+# Installed alongside the real pdp11-uknc-rt11-ld (see
+# ../../gcc/build_gcc_uknc.sh) -- its own directory is how this script
+# finds both that binary and the sysroot (a fixed sibling of it, per
+# this project's own build layout), so it keeps working wherever the
+# toolchain itself gets installed.
+
+set -e
+
+script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+sysroot="${script_dir}/../xgcc/pdp11-uknc-rt11"
+
+exec "${script_dir}/pdp11-uknc-rt11-ld" \
+    -r -m pdp11rt11rel -T "${sysroot}/lib/ppu.ld" -u start \
+    "$@" \
+    -L"${sysroot}/lib" -lppu

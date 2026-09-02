@@ -20,14 +20,17 @@ curl https://ftp.gnu.org/gnu/binutils/binutils-${BINUTILS_VERSION}.tar.gz | tar 
 curl https://github.com/wdigger/binutils-gdb/commit/09c5f5bc048d3e7d96b93efba699ceae742da2b0.patch -o binutils_1.patch
 curl https://github.com/wdigger/binutils-gdb/commit/540689194f9fa20c6afe18aeee17630eb1f3b76c.patch -o binutils_2.patch
 curl https://github.com/wdigger/binutils-gdb/commit/26ad15d4a79361f4d322c5a89e61b339a154cef1.patch -o binutils_3.patch
+curl https://github.com/wdigger/binutils-gdb/commit/2cfcf47acd27eea618556f00336990ceb8ab82ed.patch -o binutils_4.patch
 
 cd ${BUILDDIR}/src/binutils-${BINUTILS_VERSION}
 patch -p1 < ${BUILDDIR}/binutils_1.patch
 patch -p1 < ${BUILDDIR}/binutils_2.patch
 patch -p1 < ${BUILDDIR}/binutils_3.patch
+patch -p1 < ${BUILDDIR}/binutils_4.patch
 rm ${BUILDDIR}/binutils_1.patch
 rm ${BUILDDIR}/binutils_2.patch
 rm ${BUILDDIR}/binutils_3.patch
+rm ${BUILDDIR}/binutils_4.patch
 
 cd ${BUILDDIR}
 mkdir -p build/binutils
@@ -138,3 +141,15 @@ git clone https://github.com/nzeemin/ukncbtl-utils.git
 cd ${BUILDDIR}/src/ukncbtl-utils/rt11dsk
 make
 cp rt11dsk ${BUILDDIR}/bin/rt11dsk
+
+# Build and install libppu (../libs/libppu): installs libppu.a, its
+# headers (ppu_client.h/ppu_server.h), and ppu.ld into the sysroot
+# alongside libc.a, so any CPU-side program can just link with -lppu,
+# the same way the toolchain's own libc/libm/libg already work; also
+# installs pdp11-uknc-rt11-ld-ppu, a small wrapper around the real
+# pdp11-uknc-rt11-ld, into ${BUILDDIR}/bin alongside every other
+# pdp11-uknc-rt11-* tool -- the linker a PPU-side program should use
+# instead, with libppu's own linking requirements (ppu.ld, -u start,
+# -lppu) already built in.
+cd ${BUILDDIR}/../libs/libppu
+PATH="${BUILDDIR}/bin:${PATH}" make install
