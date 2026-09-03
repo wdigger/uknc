@@ -21,16 +21,19 @@ curl https://github.com/wdigger/binutils-gdb/commit/09c5f5bc048d3e7d96b93efba699
 curl https://github.com/wdigger/binutils-gdb/commit/540689194f9fa20c6afe18aeee17630eb1f3b76c.patch -o binutils_2.patch
 curl https://github.com/wdigger/binutils-gdb/commit/26ad15d4a79361f4d322c5a89e61b339a154cef1.patch -o binutils_3.patch
 curl https://github.com/wdigger/binutils-gdb/commit/2cfcf47acd27eea618556f00336990ceb8ab82ed.patch -o binutils_4.patch
+curl https://github.com/wdigger/binutils-gdb/commit/12a9ac2140efb341d65c863ec5d4d3ae0259b17c.patch -o binutils_5.patch
 
 cd ${BUILDDIR}/src/binutils-${BINUTILS_VERSION}
 patch -p1 < ${BUILDDIR}/binutils_1.patch
 patch -p1 < ${BUILDDIR}/binutils_2.patch
 patch -p1 < ${BUILDDIR}/binutils_3.patch
 patch -p1 < ${BUILDDIR}/binutils_4.patch
+patch -p1 < ${BUILDDIR}/binutils_5.patch
 rm ${BUILDDIR}/binutils_1.patch
 rm ${BUILDDIR}/binutils_2.patch
 rm ${BUILDDIR}/binutils_3.patch
 rm ${BUILDDIR}/binutils_4.patch
+rm ${BUILDDIR}/binutils_5.patch
 
 cd ${BUILDDIR}
 mkdir -p build/binutils
@@ -85,6 +88,7 @@ curl https://github.com/wdigger/sourceware-mirror-newlib-cygwin/commit/bc9de697a
 curl https://github.com/wdigger/sourceware-mirror-newlib-cygwin/commit/8ec5d302b54206f2d4e0aaba20ac6c3d910dcc6b.patch -o newlib_3.patch
 curl https://github.com/wdigger/sourceware-mirror-newlib-cygwin/commit/930a14e6d52128ddfb92f1d7a87d76b6a4f77bfe.patch -o newlib_4.patch
 curl https://github.com/wdigger/sourceware-mirror-newlib-cygwin/commit/d555cd2dc7d36f9f3381e8491565d306efa585f6.patch -o newlib_5.patch
+curl https://github.com/wdigger/sourceware-mirror-newlib-cygwin/commit/d01a026f73060db90afc9af2ea986549da41a715.patch -o newlib_6.patch
 
 cd ${BUILDDIR}/src/gcc-${GCC_VERSION}
 patch -p1 < ${BUILDDIR}/newlib_1.patch
@@ -92,11 +96,13 @@ patch -p1 < ${BUILDDIR}/newlib_2.patch
 patch -p1 < ${BUILDDIR}/newlib_3.patch
 patch -p1 < ${BUILDDIR}/newlib_4.patch
 patch -p1 < ${BUILDDIR}/newlib_5.patch
+patch -p1 < ${BUILDDIR}/newlib_6.patch
 rm ${BUILDDIR}/newlib_1.patch
 rm ${BUILDDIR}/newlib_2.patch
 rm ${BUILDDIR}/newlib_3.patch
 rm ${BUILDDIR}/newlib_4.patch
 rm ${BUILDDIR}/newlib_5.patch
+rm ${BUILDDIR}/newlib_6.patch
 
 # newlib_1.patch touches configure.host/libc/acinclude.m4, newlib_4.patch
 # touches libc/sys/rt11/Makefile.inc, and newlib_5.patch touches
