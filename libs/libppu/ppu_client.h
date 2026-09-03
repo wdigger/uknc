@@ -36,11 +36,11 @@ int ppuc_free(unsigned short ppu_addr);
 
 // Starts code running on the PPU at ppu_addr -- the address any
 // ppuc_load*() call returned. A well-behaved PPU program frees its own
-// memory block and returns to
-// the PPU's resident monitor when done (jumping to address 0176300
-// with R1 set to the block's base address -- see PRUN's own
-// convention; ppu_server.h, not yet implemented, will cover the PPU
-// side of this).
+// memory block and returns to the PPU's resident monitor when done
+// (jumping to address 0176300 with R1 set to the block's base address
+// -- see PRUN's own convention; ppu_server.h covers the PPU side of
+// this, and provides it automatically for a program built the normal
+// way -- see ppu_server.h/ppus_start.c).
 //
 // Returns 0 on success, or -1 on error with errno set:
 //   EIO  the PPU did not accept the run request
@@ -127,5 +127,102 @@ long ppuc_load_file(const char *name, unsigned int size);
 //   EIO     a short read, or (see ppuc_load()) the PPU did not accept
 //           the load
 long ppuc_load_code(const char *name);
+
+// Sends buf (size bytes) to a PPU program that is already running (via
+// ppuc_run()) and has armed itself to receive with ppus_recv_init()
+// (see ppu_server.h) -- a different channel usage than every function
+// above: those all talk to the PPU-resident monitor (still listening
+// at this point, since no PPU program has taken over yet), this one
+// talks to the program itself, once it has.
+//
+// The first call after each ppuc_run() blocks until that program's own
+// ppus_recv_init() confirms (over a separate handshake channel) that
+// it has actually taken over from the resident monitor -- see
+// ppuc_send.c's header comment for why this wait exists at all. A
+// program that never calls ppus_recv_init() never sends that
+// confirmation, so calling ppuc_send() for one hangs here forever;
+// this is a real, load-bearing precondition, not just documentation --
+// only call ppuc_send() for a program you know calls ppus_recv_init().
+//
+// There's no reply and so nothing to report failure with beyond that
+// one precondition -- once past it, every call lands as the next call
+// to that program's own ppus_receive(). size can be anything; a PPU
+// program's own ppus_receive() only ever sees the first PPUS_RECV_MAX
+// bytes of it (see ppu_server.h) -- keep it within that if the rest
+// matters.
+void ppuc_send(const void *buf, unsigned int size);
+
+// Receives one buffer sent by a running PPU program's own ppus_send()
+// (see ppu_server.h) -- the CPU-side counterpart to ppuc_send()/
+// ppus_recv_init(), in the opposite direction. Blocks until a full
+// message arrives; there is no non-blocking or timeout variant.
+//
+// Unlike ppuc_send(), this needs no handshake wait of its own -- but
+// if the PPU program also uses ppus_recv_init() (the CPU->PPU
+// direction), this CPU program must make its first ppuc_send() call
+// before ever calling ppuc_recv(): ppus_recv_init() sends a one-shot
+// handshake byte over the same channel ppuc_recv() reads, and
+// ppuc_send()'s first call is what consumes it (see ppuc_recv.c's
+// header comment for the full reasoning). Skipping that first
+// ppuc_send() call means ppuc_recv() misreads that handshake byte as
+// the start of a real message -- a real, load-bearing precondition,
+// not just documentation.
+//
+// size received larger than maxsize is not an error: the first
+// maxsize bytes land in buf, the rest is read and discarded (keeping
+// the wire framing correct for the next message) but otherwise lost.
+// Returns however many bytes actually landed in buf (at most
+// maxsize), so a caller can tell whether that happened.
+unsigned int ppuc_recv(void *buf, unsigned int maxsize);
+
+// Largest buffer the callback passed to ppuc_recv_init() will ever be
+// called with -- the CPU-side mirror of PPUS_RECV_MAX (see
+// ppu_server.h). A message longer than this is silently truncated to
+// this many bytes on arrival, not rejected.
+#define PPUC_RECV_MAX 64
+
+// The signature ppuc_recv_init()'s callback argument must have -- the
+// CPU-side mirror of ppus_receive_fn (see ppu_server.h). Runs inside
+// the interrupt handler ppuc_recv_init() installs (channel 1's own
+// vector, 0460), with interrupts at that channel's priority level
+// masked until it returns -- keep it short, same as ppus_receive_fn's
+// own contract, and don't call ppuc_*-family functions from it that
+// themselves wait on an interrupt (ppuc_recv_init()'s own state isn't
+// reentrant).
+typedef void (*ppuc_receive_fn)(const void *buf, unsigned int size);
+
+// Interrupt-driven alternative to ppuc_recv(): arms an interrupt
+// handler for channel 1 (vector 0460 -- see Board.cpp's
+// ChanWriteByPPU/ChanRxStateSetCPU) instead of blocking, so this
+// program can do other work between messages. callback is called for
+// every buffer a running PPU program's ppus_send() (see ppu_server.h)
+// delivers afterward.
+//
+// Same handshake-byte precondition as ppuc_recv() (see its own
+// comment): if the PPU program also calls ppus_recv_init() (the
+// CPU->PPU direction), this program's first ppuc_send() call must
+// happen -- consuming that one-shot handshake byte -- before ever
+// calling ppuc_recv_init(); arming the interrupt first would feed
+// that byte into this receiver's own state machine as if it were the
+// start of a real message, desyncing everything that follows.
+//
+// Must be paired with ppuc_recv_shutdown() before this program exits
+// -- see that function's own comment for why leaving the interrupt
+// armed is a real hazard, not just untidy.
+void ppuc_recv_init(ppuc_receive_fn callback);
+
+// Disarms the receiver ppuc_recv_init() armed: puts vector 0460/0462
+// back to whatever was there before (RT-11 itself, same as any other
+// unused vector) and disables channel 1's RX interrupt again. Call
+// this before this program exits -- otherwise the vector is left
+// pointing at this program's own ppuc_recv_isr, and RT-11 doesn't
+// clear memory between programs (see crt0rt.s), so a later, unrelated
+// program that happens to trigger a channel-1 interrupt (e.g. by
+// running a PPU program that also uses ppus_send()) would jump into
+// whatever that later program's own memory happens to hold at this
+// same address -- the same class of hazard ppus_recv_shutdown() (see
+// ppu_server.h) guards against on the PPU side, confirmed there
+// directly by reproducing a monitor halt without it.
+void ppuc_recv_shutdown(void);
 
 #endif  // PPU_CLIENT_H

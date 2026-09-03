@@ -104,4 +104,86 @@ void ppus_exit(void) __attribute__((noreturn));
                ".even\n"                \
                "2:" ::: "memory")
 
+// Largest buffer the callback passed to ppus_recv_init() will ever be
+// called with. ppuc_send() on the CPU side doesn't enforce this -- it
+// just sends whatever size it's given -- so a message longer than
+// this is silently truncated to this many bytes on arrival, not
+// rejected; keep messages within this on the CPU side if that
+// matters. A plain compile-time constant, not configurable per
+// program: ppus_recv.o's own receive buffer is sized to it statically
+// (see ppus_recv.c), so changing it means rebuilding libppu.a, not
+// just the calling program.
+#define PPUS_RECV_MAX 64
+
+// The signature ppus_recv_init()'s callback argument must have. Called
+// once for every buffer ppuc_send() delivers, once ppus_recv_init()
+// has armed the receiver -- buf points at an internal buffer private
+// to ppus_recv.c (valid only until the callback returns; copy anything
+// you need to keep), and size is however many bytes of it are
+// actually valid (at most PPUS_RECV_MAX, see above). Runs inside the
+// interrupt handler ppus_recv_init() installs, with interrupts at that
+// channel's own priority level masked (ordinary PDP-11
+// vectored-interrupt behavior) until it returns -- keep it short, the
+// same way any interrupt handler should be, and don't call
+// ppuc_*-family functions from it (those are for the CPU side; this
+// runs on the PPU).
+typedef void (*ppus_receive_fn)(const void *buf, unsigned int size);
+
+// Arms this program to receive buffers sent from the CPU via
+// ppuc_send() (see ppu_client.h): installs an interrupt handler for
+// the CPU<->PPU exchange channel and unmasks interrupts on this
+// processor (nothing before this point in a PPU program's life needs
+// them, so nothing has lowered its priority before now). callback is
+// called for every buffer that arrives afterward -- see
+// ppus_receive_fn above for its contract; it must stay valid (a real
+// function, not something on a stack that later goes out of scope)
+// for as long as the receiver stays armed, which in practice means for
+// the rest of the program's life, unless disarmed with
+// ppus_recv_shutdown() below.
+// Call this once from ppu_main(), before doing anything that would
+// race with a command arriving -- there is no other setup needed.
+//
+// Implemented in ppus_recv.c, a separate, ordinary libppu.a archive
+// member: unlike ppus_start.c's shim, this one is never forced into a
+// PPU program's link (no `-u` for it) -- it only comes along if a
+// program actually calls this function, the same ordinary
+// demand-driven archive linking libppu's CPU-side functions already
+// rely on.
+void ppus_recv_init(ppus_receive_fn callback);
+
+// Disarms the receiver: puts vector 0340/0342 back to whatever the
+// PPU-resident monitor had there before ppus_recv_init() installed
+// its own handler, and disables channel 2's RX interrupt again. Any
+// program that calls ppus_recv_init() MUST call this before returning
+// from ppu_main() (before ppus_start.c's shim runs ppus_exit(), which
+// frees this program's own PPU memory block) -- otherwise vector 0340
+// is left pointing at memory that's no longer guaranteed to hold
+// ppus_recv_isr, and a later channel-2 interrupt (e.g. from the
+// resident monitor's own use of ppuc_request() on behalf of a
+// subsequent ppuc_load_code()/ppuc_alloc() call) jumps into whatever's
+// actually there by then. Confirmed directly: omitting this call
+// reproduces a monitor halt shortly after an otherwise-correct
+// ppuc_send()/ppuc_recv() exchange completes and the CPU side reaches
+// its own .EXIT.
+void ppus_recv_shutdown(void);
+
+// Sends buf (size bytes) to the CPU, for a program to pick up with
+// ppuc_recv() (see ppu_client.h) -- the PPU-side counterpart to
+// ppuc_send()/ppus_recv_init(), in the opposite direction. Blocks
+// until every byte is out; no reply, and nothing to report failure
+// with -- this either lands as the next call to ppuc_recv() on the
+// CPU side, or, if nothing there is calling that, just sits in
+// channel 1's own hardware latch until something does.
+//
+// If this program also uses ppus_recv_init() (the CPU->PPU
+// direction), the CPU side must make its first ppuc_send() call
+// before calling ppuc_recv() to read anything sent here -- see
+// ppuc_recv.c's header comment for why; that's a CPU-side
+// precondition, nothing this function itself needs to worry about.
+//
+// Implemented in ppus_send.c, a separate, ordinary libppu.a archive
+// member -- only linked into a PPU program's module if that program
+// actually calls this function, same as ppus_recv_init() above.
+void ppus_send(const void *buf, unsigned int size);
+
 #endif  // PPU_SERVER_H

@@ -16,5 +16,9 @@ int ppuc_run(unsigned short ppu_addr) {
     errno = EIO;
     return -1;
   }
+  // A fresh program run means ppuc_send()'s next call (if any) must
+  // wait for a fresh ppus_recv_init() handshake -- see ppuc_send.c and
+  // ppuc_internal.h.
+  ppuc_send_need_handshake = 1;
   return 0;
 }

@@ -38,6 +38,16 @@
 #define PPU_CSR (*(volatile unsigned char *)0176674)
 #define PPU_DATA (*(volatile unsigned char *)0176676)
 
+// Channel 1's CPU-side registers -- a separate CPU<->PPU sub-channel
+// from channel 2 (PPU_CSR/PPU_DATA above) or channel 0 (the
+// console/keyboard channel). Shared by ppuc_send.c (the one-shot
+// "ppus_recv_init() has taken over vector 0340" handshake byte) and
+// ppuc_recv.c (real data from the PPU's own ppus_send() -- see
+// ppu_client.h) -- both read this same direction (PPU writes, CPU
+// reads), never anything else.
+#define PPU_CHAN1_CSR (*(volatile unsigned char *)0176660)
+#define PPU_CHAN1_DATA (*(volatile unsigned char *)0176662)
+
 #define PPU_DEV 032  // PPU device code, in ppu_desc.dev
 
 // Function codes for struct ppu_desc.func (PRUN's PF.* constants).
@@ -83,5 +93,12 @@ int ppuc_request(struct ppu_desc *desc);
 // to errno).
 int ppuc_write_buf(unsigned short ppu_addr, const void *buf,
                     unsigned int size);
+
+// Set to 1 by ppuc_run() every time it starts a PPU program, and
+// cleared by ppuc_send()'s first call after that (see ppuc_send.c for
+// the full story) -- makes the one-shot "wait for ppus_recv_init()'s
+// channel-1 ready handshake" apply fresh after every ppuc_run(), not
+// just once for the whole CPU program's lifetime.
+extern unsigned char ppuc_send_need_handshake;
 
 #endif  // PPUC_INTERNAL_H

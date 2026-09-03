@@ -1,4 +1,4 @@
-OBJS:=	ppuc_proto.o ppuc_alloc.o ppuc_free.o ppuc_write.o ppuc_run.o ppuc_load.o ppuc_load_reloc.o ppuc_load_file.o ppuc_load_code.o ppus_start.o
+OBJS:=	ppuc_proto.o ppuc_alloc.o ppuc_free.o ppuc_write.o ppuc_run.o ppuc_load.o ppuc_load_reloc.o ppuc_load_file.o ppuc_load_code.o ppuc_send.o ppuc_recv.o ppuc_recv_init.o ppus_start.o ppus_recv.o ppus_send.o
 HDRS:=	ppu_client.h ppu_server.h
 CC:=pdp11-uknc-rt11-gcc
 AR:=pdp11-uknc-rt11-ar

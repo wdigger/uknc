@@ -37,6 +37,32 @@
 // line that produces the module, so its own start() lands there
 // regardless of what's linked in after it. No per-module symbol
 // lookup is needed to find it.
+//
+// Only one CPU-side heap buffer is held at once: buf, the whole .PPU
+// file, read verbatim. Relocations are patched directly into buf, in
+// place, at each TXT block's own original bytes (see chunk_ptr/
+// chunk_len in apply_rld_block()/parse_txt_rld() below) -- there is no
+// second, separately-allocated image buffer holding the laid-out
+// .text/.data/.bss result. Each TXT chunk (now already relocated) is
+// written straight from its spot in buf to PPU memory once nothing
+// more will patch it (the next TXT block, or ENDMOD, is reached);
+// PPU_F_WRITE accepts any address/length, not just a single
+// whole-image blit, so this needs no reassembly on the CPU side at
+// all. BSS (and any inter-psect alignment padding) is zero-filled
+// directly on the PPU up front, in zero_fill_ppu(), before any TXT
+// chunk is written -- see ppuc_load_code() below.
+//
+// This avoids a real constraint the previous two-buffer design had,
+// found the hard way while testing ppus_send()/ppuc_recv() (see
+// ppu_client.h): holding both buf and a same-order-of-magnitude
+// content buffer at once meant combined peak size scaled with the
+// *PPU* program being loaded, not the calling CPU program -- a CPU
+// program that comfortably loaded a small PPU module could get
+// ENOMEM loading a larger one, even with the PPU itself having plenty
+// of free memory (confirmed directly: ppuc_alloc() for the same size,
+// called on its own, succeeded -- the failure was the second
+// malloc() on the CPU side). Halving the CPU-side buffer requirement
+// removes that scaling entirely.
 
 #include <errno.h>
 #include <fcntl.h>
@@ -172,25 +198,33 @@ static int parse_gsd(const unsigned char *buf, unsigned int size,
   return next_block(buf, size, pos, &blk) && blk.type == REL_BLK_ENDGSD;
 }
 
-// Applies every RLD entry in one RLD block, patching content[] in
-// place. *cur_psect/*chunk_start/*have_chunk carry the parser's
-// running p-sect-tracking state across TXT/RLD blocks (a LOCCTR_DEF
-// entry here updates *cur_psect and resets *have_chunk; a TXT block,
-// handled by the caller, sets *chunk_start and *have_chunk). Returns 1
-// on success, 0 on any malformed-file condition.
+// Applies every RLD entry in one RLD block, patching directly into
+// buf -- specifically into *chunk_ptr, the current TXT chunk's own
+// bytes at their original file position (set by the caller each time
+// a new TXT block arrives; see parse_txt_rld()). A relocation patch
+// is a pure overwrite (target_base + addend, computed from scratch),
+// never a read-modify-write, so patching in place needs no PPU
+// round-trip and no separate staging buffer -- the file's own REL
+// convention (this toolchain's own emitter is the only producer this
+// reader ever needs to handle) always emits a TXT chunk's relocations
+// before any other TXT block for the same p-sect, so *chunk_ptr still
+// points at the right bytes for every RLD block processed here.
+//
+// *cur_psect/*have_chunk carry the parser's running p-sect-tracking
+// state across TXT/RLD blocks (a LOCCTR_DEF entry here updates
+// *cur_psect and resets *have_chunk; a TXT block, handled by the
+// caller, sets *have_chunk and chunk_ptr/chunk_len). Returns 1 on
+// success, 0 on any malformed-file condition.
 static int apply_rld_block(const struct block *blk,
-                            const unsigned int psect_size[PSECT_COUNT],
-                            const unsigned int psect_off[PSECT_COUNT],
                             const unsigned int psect_base[PSECT_COUNT],
-                            unsigned char *content, unsigned int content_size,
-                            int *cur_psect, unsigned int *chunk_start,
-                            int *have_chunk) {
+                            unsigned char *chunk_ptr, unsigned int chunk_len,
+                            int *cur_psect, int *have_chunk) {
   unsigned int j = 0;
 
   while (j + 2 <= blk->body_len) {
     unsigned int disp = blk->body[j];
     unsigned int rtype = blk->body[j + 1];
-    unsigned int patch_off, target_base, addend;
+    unsigned int target_base, addend;
     unsigned short patched;
     int p;
 
@@ -212,8 +246,7 @@ static int apply_rld_block(const struct block *blk,
     if (!*have_chunk || *cur_psect < 0 || *cur_psect == PSECT_ABS) {
       return 0;
     }
-    patch_off = psect_off[*cur_psect] + *chunk_start + disp;
-    if (patch_off + 2 > content_size || (patch_off & 1) != 0) {
+    if (disp + 2 > chunk_len || (disp & 1) != 0) {
       return 0;
     }
 
@@ -280,68 +313,166 @@ static int apply_rld_block(const struct block *blk,
     }
 
     patched = (unsigned short)(target_base + addend);
-    content[patch_off] = (unsigned char)patched;
-    content[patch_off + 1] = (unsigned char)(patched >> 8);
+    chunk_ptr[disp] = (unsigned char)patched;
+    chunk_ptr[disp + 1] = (unsigned char)(patched >> 8);
   }
 
   return 1;
 }
 
+// Flushes one already-relocated TXT chunk from buf straight to PPU
+// memory at chunk_ppu_addr, copying it through a small, fixed-size
+// staging buffer first rather than handing chunk_ptr to
+// ppuc_write_buf() directly -- chunk_ptr points into the middle of
+// buf (at whatever byte offset the file's own block framing happened
+// to land on), which PPU_F_WRITE's word-count transfer cannot rely on
+// being even, unlike the previous design's content[] buffer (always a
+// fresh malloc(), which this target's allocator always returns
+// word-aligned). kStage is declared as unsigned short for the same
+// reason struct rt11_file's own transfer buffer is (see the rt11
+// newlib port's syscalls) -- it guarantees the even alignment a
+// word-based transfer needs; only the memcpy destination itself is
+// ever addressed byte-wise.
+//
+// Rounding the last piece's write length up to even when it's odd
+// reads one extra (harmless) byte from buf -- always in bounds, since
+// a TXT block's body has its own checksum byte right after it -- and
+// writes one extra padding byte on the PPU side, which is always
+// safe: psect_off's own even-alignment rounding guarantees at least
+// one padding byte after any odd-sized p-sect, and zero_fill_ppu()
+// (see ppuc_load_code()) has already covered it.
+static int flush_chunk(unsigned short chunk_ppu_addr,
+                        const unsigned char *chunk_ptr,
+                        unsigned int chunk_len) {
+  static unsigned short kStageWords[64];
+  unsigned char *const kStage = (unsigned char *)kStageWords;
+  unsigned int off = 0, piece, wlen;
+
+  while (off < chunk_len) {
+    piece = chunk_len - off;
+    if (piece > sizeof(kStageWords)) {
+      piece = sizeof(kStageWords);
+    }
+    memcpy(kStage, chunk_ptr + off, piece);
+    wlen = piece;
+    if (off + piece >= chunk_len && (wlen & 1) != 0) {
+      kStage[wlen] = chunk_ptr[off + wlen];  // checksum byte -- see above
+      wlen++;
+    }
+    if (!ppuc_write_buf((unsigned short)(chunk_ppu_addr + off), kStage,
+                         wlen)) {
+      return 0;
+    }
+    off += piece;
+  }
+  return 1;
+}
+
 // Reads TXT/RLD blocks starting at *pos (already positioned past
-// GSD/ENDGSD by parse_gsd()) up through ENDMOD, filling content[] and
-// patching every relocation via apply_rld_block(). Returns 1 on
-// success, 0 on any malformed-file condition.
-static int parse_txt_rld(const unsigned char *buf, unsigned int size,
+// GSD/ENDGSD by parse_gsd()) up through ENDMOD, patching every
+// relocation directly into buf (apply_rld_block()) and writing each
+// TXT chunk to PPU memory (flush_chunk()) once nothing more will
+// patch it -- deferred until the next TXT block or ENDMOD, since an
+// RLD block for the current chunk can still follow it. Returns 1 on
+// success, 0 on any malformed-file condition or PPU write failure
+// (errno is set to EIO for the latter; the caller doesn't need to set
+// it again).
+static int parse_txt_rld(unsigned char *buf, unsigned int size,
                           unsigned int *pos,
                           const unsigned int psect_size[PSECT_COUNT],
                           const unsigned int psect_off[PSECT_COUNT],
                           const unsigned int psect_base[PSECT_COUNT],
-                          unsigned char *content, unsigned int content_size) {
+                          unsigned int content_size) {
   struct block blk;
   int cur_psect = -1;
-  unsigned int chunk_start = 0;
   int have_chunk = 0;
+  int pending = 0;
+  unsigned char *chunk_ptr = NULL;
+  unsigned int chunk_len = 0;
+  unsigned short chunk_ppu_addr = 0;
 
   for (;;) {
     if (!next_block(buf, size, pos, &blk)) {
+      errno = EINVAL;
       return 0;
     }
     if (blk.type == REL_BLK_ENDMOD) {
+      if (pending && !flush_chunk(chunk_ppu_addr, chunk_ptr, chunk_len)) {
+        errno = EIO;
+        return 0;
+      }
       return 1;
     }
     if (blk.type == REL_BLK_TXT) {
       unsigned int cs = u16_le(blk.body);
       unsigned int n2 = blk.body_len - 2;
 
+      if (pending && !flush_chunk(chunk_ppu_addr, chunk_ptr, chunk_len)) {
+        errno = EIO;
+        return 0;
+      }
+      pending = 0;
+
       if (cur_psect < 0 || cur_psect == PSECT_ABS ||
           cs + n2 > psect_size[cur_psect] ||
           psect_off[cur_psect] + cs + n2 > content_size) {
+        errno = EINVAL;
         return 0;
       }
-      memcpy(content + psect_off[cur_psect] + cs, blk.body + 2, n2);
-      chunk_start = cs;
+      chunk_ptr = (unsigned char *)blk.body + 2;
+      chunk_len = n2;
+      chunk_ppu_addr = (unsigned short)(psect_base[cur_psect] + cs);
       have_chunk = 1;
+      pending = 1;
     } else if (blk.type == REL_BLK_RLD) {
-      if (!apply_rld_block(&blk, psect_size, psect_off, psect_base, content,
-                            content_size, &cur_psect, &chunk_start,
+      if (!apply_rld_block(&blk, psect_base, chunk_ptr, chunk_len, &cur_psect,
                             &have_chunk)) {
+        errno = EINVAL;
         return 0;
       }
     } else {
+      errno = EINVAL;
       return 0;
     }
   }
+}
+
+// Zero-fills size bytes of PPU memory starting at ppu_addr, in fixed
+// small chunks -- covers BSS and any inter-psect alignment padding,
+// which (unlike .text/.data) has no bytes of its own in the file to
+// copy from. Called once, up front, before any TXT chunk is written,
+// so every byte a TXT chunk doesn't touch is left zero rather than
+// whatever ppuc_alloc()'s block happened to already hold.
+static int zero_fill_ppu(unsigned short ppu_addr, unsigned int size) {
+  // unsigned short, not unsigned char[] -- see flush_chunk()'s own
+  // kStageWords for why: PPU_F_WRITE's word-count transfer needs an
+  // even source address, which only a genuinely word-typed buffer is
+  // guaranteed to have.
+  static const unsigned short kZeroWords[64] = {0};
+  const unsigned char *const kZero = (const unsigned char *)kZeroWords;
+  unsigned int off = 0, chunk;
+
+  while (off < size) {
+    chunk = size - off;
+    if (chunk > sizeof(kZeroWords)) {
+      chunk = sizeof(kZeroWords);
+    }
+    if (!ppuc_write_buf((unsigned short)(ppu_addr + off), kZero, chunk)) {
+      return 0;
+    }
+    off += chunk;
+  }
+  return 1;
 }
 
 long ppuc_load_code(const char *name) {
   int fd;
   struct stat st;
   unsigned char *buf;
-  unsigned char *content;
   unsigned int size, pos;
   int n, file_pos;
   unsigned int psect_size[PSECT_COUNT];
-  unsigned int psect_off[PSECT_COUNT];  // byte offset within content[]
+  unsigned int psect_off[PSECT_COUNT];  // byte offset within the PPU image
   unsigned int psect_base[PSECT_COUNT];
   unsigned int content_size;
   long alloc_result;
@@ -407,33 +538,24 @@ long ppuc_load_code(const char *name) {
   psect_base[PSECT_BSS] = ppu_addr + psect_off[PSECT_BSS];
   psect_base[PSECT_ABS] = 0;
 
-  content = malloc(content_size);
-  if (content == NULL) {
+  if (!zero_fill_ppu(ppu_addr, content_size)) {
     ppuc_free(ppu_addr);
-    free(buf);
-    errno = ENOMEM;
-    return -1;
-  }
-  memset(content, 0, content_size);
-
-  if (!parse_txt_rld(buf, size, &pos, psect_size, psect_off, psect_base,
-                      content, content_size)) {
-    ppuc_free(ppu_addr);
-    free(content);
-    free(buf);
-    errno = EINVAL;
-    return -1;
-  }
-
-  if (!ppuc_write_buf(ppu_addr, content, content_size)) {
-    ppuc_free(ppu_addr);
-    free(content);
     free(buf);
     errno = EIO;
     return -1;
   }
 
-  free(content);
+  // parse_txt_rld() patches relocations directly into buf and writes
+  // each already-relocated TXT chunk straight to PPU memory as it
+  // goes (see its own header comment) -- sets errno itself (EINVAL or
+  // EIO) on any failure.
+  if (!parse_txt_rld(buf, size, &pos, psect_size, psect_off, psect_base,
+                      content_size)) {
+    ppuc_free(ppu_addr);
+    free(buf);
+    return -1;
+  }
+
   free(buf);
   return ppu_addr;
 }
