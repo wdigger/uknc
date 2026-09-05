@@ -53,6 +53,7 @@ curl https://github.com/wdigger/gcc/commit/f2e04ca7b2367bba0496c214c68514e3fa1a7
 curl https://github.com/wdigger/gcc/commit/24515e85ed970c217555cf8f2d2c11fa1ffbfd25.patch -o gcc_6.patch
 curl https://github.com/wdigger/gcc/commit/c20c9b622ca597e17c2684071c7f38dfb5059037.patch -o gcc_7.patch
 curl https://github.com/wdigger/gcc/commit/7d0a64e14effd6a8307e4da5fc8aedada1723269.patch -o gcc_8.patch
+curl https://github.com/wdigger/gcc/commit/f2f0dea373eb9e38a668f3e85cfe67a331d2ef42.patch -o gcc_9.patch
 
 cd ${BUILDDIR}/src/gcc-${GCC_VERSION}
 patch -p1 < ${BUILDDIR}/gcc_1.patch
@@ -63,6 +64,7 @@ patch -p1 < ${BUILDDIR}/gcc_5.patch
 patch -p1 < ${BUILDDIR}/gcc_6.patch
 patch -p1 < ${BUILDDIR}/gcc_7.patch
 patch -p1 < ${BUILDDIR}/gcc_8.patch
+patch -p1 < ${BUILDDIR}/gcc_9.patch
 rm ${BUILDDIR}/gcc_1.patch
 rm ${BUILDDIR}/gcc_2.patch
 rm ${BUILDDIR}/gcc_3.patch
@@ -71,6 +73,7 @@ rm ${BUILDDIR}/gcc_5.patch
 rm ${BUILDDIR}/gcc_6.patch
 rm ${BUILDDIR}/gcc_7.patch
 rm ${BUILDDIR}/gcc_8.patch
+rm ${BUILDDIR}/gcc_9.patch
 
 # Download and patch newlib
 cd ${BUILDDIR}
@@ -158,4 +161,15 @@ cp rt11dsk ${BUILDDIR}/bin/rt11dsk
 # instead, with libppu's own linking requirements (ppu.ld, -u start,
 # -lppu) already built in.
 cd ${BUILDDIR}/../libs/libppu
+PATH="${BUILDDIR}/bin:${PATH}" make install
+
+# Build and install libpdp11 (../libs/libpdp11): plain-PDP-11
+# primitives (interrupt priority mask/unmask, interrupt vector
+# get/set/swap -- see its own pdp11_irq.h) shared by both CPU- and
+# PPU-side programs -- nothing here is UKNC-specific (unlike libppu,
+# which is this project's own CPU<->PPU protocol), so it needs no
+# special linker wrapper; installs libpdp11.a and pdp11_irq.h into the
+# sysroot the same way libc.a/libppu.a already are, so any program just
+# links with -lpdp11.
+cd ${BUILDDIR}/../libs/libpdp11
 PATH="${BUILDDIR}/bin:${PATH}" make install
