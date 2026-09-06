@@ -54,6 +54,8 @@ curl https://github.com/wdigger/gcc/commit/24515e85ed970c217555cf8f2d2c11fa1ffbf
 curl https://github.com/wdigger/gcc/commit/c20c9b622ca597e17c2684071c7f38dfb5059037.patch -o gcc_7.patch
 curl https://github.com/wdigger/gcc/commit/7d0a64e14effd6a8307e4da5fc8aedada1723269.patch -o gcc_8.patch
 curl https://github.com/wdigger/gcc/commit/f2f0dea373eb9e38a668f3e85cfe67a331d2ef42.patch -o gcc_9.patch
+curl https://github.com/wdigger/gcc/commit/3b581bf2b13a665f237b8c2c86aab5196769381d.patch -o gcc_10.patch
+curl https://github.com/wdigger/gcc/commit/03e44cf1026bcb2a980f93faa6c6b32030334a5a.patch -o gcc_11.patch
 
 cd ${BUILDDIR}/src/gcc-${GCC_VERSION}
 patch -p1 < ${BUILDDIR}/gcc_1.patch
@@ -65,6 +67,8 @@ patch -p1 < ${BUILDDIR}/gcc_6.patch
 patch -p1 < ${BUILDDIR}/gcc_7.patch
 patch -p1 < ${BUILDDIR}/gcc_8.patch
 patch -p1 < ${BUILDDIR}/gcc_9.patch
+patch -p1 < ${BUILDDIR}/gcc_10.patch
+patch -p1 < ${BUILDDIR}/gcc_11.patch
 rm ${BUILDDIR}/gcc_1.patch
 rm ${BUILDDIR}/gcc_2.patch
 rm ${BUILDDIR}/gcc_3.patch
@@ -74,6 +78,8 @@ rm ${BUILDDIR}/gcc_6.patch
 rm ${BUILDDIR}/gcc_7.patch
 rm ${BUILDDIR}/gcc_8.patch
 rm ${BUILDDIR}/gcc_9.patch
+rm ${BUILDDIR}/gcc_10.patch
+rm ${BUILDDIR}/gcc_11.patch
 
 # Download and patch newlib
 cd ${BUILDDIR}

@@ -4,10 +4,10 @@
 // default console screen memory (plane-offset 0100000, see below), then
 // stays resident -- its own keyboard interrupt handler (see kbd_init()
 // below) needs to stay installed for as long as gfour.c's own animation
-// loop is still running -- but, unlike examples/digger/diggerppu.c
-// (which really does run forever, matching Digger's own game session),
-// this program is only ever meant to run for the lifetime of one gfour
-// demo: the moment its own keyboard ISR sees an actual key press (not
+// loop is still running -- but, unlike a program meant to stay resident
+// for a whole game session, this program is only ever meant to run for
+// the lifetime of one gfour demo: the moment its own keyboard ISR sees
+// an actual key press (not
 // just a release -- same criterion as gfour.c's own kbd_recv()), it
 // forwards that event to the CPU as usual, then blanks the screen and
 // hands the *video* console back too (clear_screen()/restore_tag0()
