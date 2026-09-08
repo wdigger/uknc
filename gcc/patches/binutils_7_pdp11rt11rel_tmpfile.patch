@@ -1,0 +1,54 @@
+--- a/ld/emultempl/pdp11rt11rel.em	2026-09-09 01:28:35
++++ b/ld/emultempl/pdp11rt11rel.em	2026-09-09 01:27:42
+@@ -736,6 +736,7 @@
+   long symcount;
+   struct rel_psect_info psects[3];
+   const char *base;
++  char *tmpname;
+   char modname[7];
+   size_t i;
+   bool ok;
+@@ -779,10 +780,22 @@
+     modname[i] = base[i];
+   modname[i] = '\0';
+ 
+-  f = fopen (filename, "wb");
++  /* Written to a temporary file and renamed over the original, never
++     to \`filename\` directly: ibfd is still open on that same path and
++     rel_write_section below reads each section's contents and
++     relocations out of it as it goes.  Opening it "wb" here truncates
++     it under that reader, and every read after the point BFD has
++     cached fails with "file truncated" -- so whether the link worked
++     depended on file size and section order.  Seen as an intermittent
++     link failure on a PPU program that had merely grown a little
++     (2026-09-09).  */
++  tmpname = (char *) xmalloc (strlen (filename) + 5);
++  sprintf (tmpname, "%s.tmp", filename);
++
++  f = fopen (tmpname, "wb");
+   if (f == NULL)
+     fatal (_("%P: %s: cannot create RT-11 REL output: %s\n"),
+-	   filename, strerror (errno));
++	   tmpname, strerror (errno));
+ 
+   ok = rel_write_gsd (f, modname, syms, symcount, psects);
+   for (i = 0; ok && i < 3; i++)
+@@ -790,7 +803,17 @@
+   if (ok)
+     ok = relbuf_flush_bare (f, REL_BLK_ENDMOD);
+ 
+-  fclose (f);
++  if (fclose (f) != 0)
++    ok = false;
++  if (ok && rename (tmpname, filename) != 0)
++    {
++      fatal (_("%P: %s: cannot rename over the linked output: %s\n"),
++	     tmpname, strerror (errno));
++      ok = false;
++    }
++  if (!ok)
++    unlink (tmpname);
++  free (tmpname);
+   free (syms);
+   return ok;
+ }

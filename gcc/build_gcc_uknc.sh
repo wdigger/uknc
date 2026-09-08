@@ -33,6 +33,10 @@ patch -p1 < ${BUILDDIR}/binutils_5.patch
 # constants must be p-sect-relative (a .data reference was relocated by
 # .data's offset twice -- see the patch's own comment).
 patch -p1 < ${BUILDDIR}/patches/binutils_6_pdp11rt11rel_psect_constant.patch
+# The REL emitter truncated its own output file while still reading the
+# linked a.out back out of it -- an intermittent "file truncated" link
+# failure that depended on section sizes.
+patch -p1 < ${BUILDDIR}/patches/binutils_7_pdp11rt11rel_tmpfile.patch
 rm ${BUILDDIR}/binutils_1.patch
 rm ${BUILDDIR}/binutils_2.patch
 rm ${BUILDDIR}/binutils_3.patch
