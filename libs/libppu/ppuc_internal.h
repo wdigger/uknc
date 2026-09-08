@@ -101,4 +101,17 @@ int ppuc_write_buf(unsigned short ppu_addr, const void *buf,
 // just once for the whole CPU program's lifetime.
 extern unsigned char ppuc_send_need_handshake;
 
+// ppuc_rel.c -- the REL module reader shared by the loaders below. It
+// neither allocates nor reports errno; a caller that wants either does
+// it itself.
+//
+// ppuc_rel_content_size() returns how many bytes of PPU memory the
+// module's .text/.data/.bss will occupy once laid out consecutively
+// (0 if it is malformed) -- what to ask ppuc_alloc() for when the
+// caller has no address of its own in mind. ppuc_rel_load() loads and
+// relocates the module at `at`, returning 1 on success and 0 on a
+// malformed module or a failed PPU write. The module is only read.
+unsigned int ppuc_rel_content_size(const void *module, unsigned int size);
+int ppuc_rel_load(const void *module, unsigned int size, unsigned short at);
+
 #endif  // PPUC_INTERNAL_H

@@ -1,6 +1,14 @@
 // ppuc_run.c -- start code running on the PPU
-
-#include <errno.h>
+//
+// Failure is reported by the return value alone, deliberately: touching
+// errno here would cost a program some 7 K it may have no other use for.
+// On this newlib, errno resolves through _impure_ptr, and the object
+// defining it initialises the reentrancy struct with pointers to the
+// three standard FILEs -- which drags in the whole of stdio, and behind
+// it malloc, sbrk and the RT-11 read/write/close/lseek layer. Measured
+// on Digger, whose only other use for any of it had just been removed
+// (2026-09-09). errno stays where a program is paying for the C library
+// anyway: the file loaders and ppuc_alloc().
 
 #include "ppu_client.h"
 #include "ppuc_internal.h"
@@ -13,7 +21,6 @@ int ppuc_run(unsigned short ppu_addr) {
   desc.dev = PPU_DEV;
   desc.addr = ppu_addr;
   if (!ppuc_request(&desc)) {
-    errno = EIO;
     return -1;
   }
   // A fresh program run means ppuc_send()'s next call (if any) must

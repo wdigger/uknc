@@ -139,6 +139,18 @@ long ppuc_load_code(const char *name);
 // on the result. `at` must be even.
 long ppuc_load_code_at(const char *name, unsigned short at);
 
+// The same again, but from a REL module the caller already has in
+// memory rather than from a file -- typically the .ppu linked into the
+// calling program's own image as a C array (xxd -i). Loads at `at`,
+// which must be even, and returns it, or -1.
+//
+// This is the loader that costs nothing: unlike the two above it opens
+// no file, allocates nothing and never touches errno, so a program that
+// uses it links none of the C library on its account. The module is
+// only read from, so it may be const.
+long ppuc_load_code_buf(const void *module, unsigned int size,
+                        unsigned short at);
+
 // Sends buf (size bytes) to a PPU program that is already running (via
 // ppuc_run()) and has armed itself to receive with ppus_recv_init()
 // (see ppu_server.h) -- a different channel usage than every function
