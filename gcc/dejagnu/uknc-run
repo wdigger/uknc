@@ -93,31 +93,44 @@ cp "$disk" "$tmp/t.dsk"
 # Boot the machine, type "R T" at the monitor, let it run, read the
 # screen.  The waits are in frames: enough for the boot menu, the date
 # prompt, and then the program itself.
-{
-  echo "disk1 attach $tmp/t.dsk"
-  echo "reset"
-  echo "cf500"
-  echo "key 1"
-  echo "cf200"
-  echo "key ENTER"
-  echo "cf1500"
-  echo "key R"
-  echo "key SPACE"
-  echo "key T"
-  echo "key ENTER"
-  echo "cf$frames"
-  echo "screentext"
-  echo "q"
-} | (cd "$tmp" && "$emu" > screen.txt 2>&1) || true
+run_emulator () {
+  {
+    echo "disk1 attach $tmp/t.dsk"
+    echo "reset"
+    echo "cf500"
+    echo "key 1"
+    echo "cf200"
+    echo "key ENTER"
+    echo "cf1500"
+    echo "key R"
+    echo "key SPACE"
+    echo "key T"
+    echo "key ENTER"
+    echo "cf$1"
+    echo "screentext"
+    echo "q"
+  } | (cd "$tmp" && "$emu" > screen.txt 2>&1) || true
 
-[ -f "$tmp/screen.txt" ] || {
-  echo "uknc-run: the emulator produced nothing" >&2
-  exit 99
+  [ -f "$tmp/screen.txt" ] || {
+    echo "uknc-run: the emulator produced nothing" >&2
+    exit 99
+  }
+
+  # The screen comes back padded out to its full width, so trim first.
+  sed 's/[[:space:]]*$//' "$tmp/screen.txt" > "$screen"
+  grep -q "^\*\*\* EXIT code " "$screen"
 }
 
-# The screen comes back padded out to its full width, so trim first.
 screen=$tmp/clean.txt
-sed 's/[[:space:]]*$//' "$tmp/screen.txt" > "$screen"
+
+# Emulated time is not free -- every frame asked for is a frame run, even
+# after the program has finished -- so ask for a modest amount first and
+# only give a program that has not finished a longer second try.  That way
+# the common case stays fast and a slow program still gets its answer;
+# only a real hang pays for both.
+if ! run_emulator "$frames"; then
+  run_emulator "$((frames * 4))" || true
+fi
 
 # What the program printed is between the command that started it and the
 # marker, and the marker goes out with it: that line is how DejaGnu reads
