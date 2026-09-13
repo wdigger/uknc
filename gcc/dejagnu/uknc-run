@@ -1,0 +1,137 @@
+#!/bin/sh
+# uknc-run -- run an RT-11 .sav in the ukncbtl emulator, the way a
+# simulator would: print what the program printed, exit with its status.
+#
+# This is what makes DejaGnu's "sim" board work for this target, so that
+# the GCC testsuite's execution tests can actually run: see uknc-sim.exp
+# beside this file, and the README section about running them.  Used on
+# its own it is a convenient way to run one program:
+#
+#   uknc-run prog.sav; echo $?
+#
+# Nothing here is specific to the testsuite.  The program is put on a copy
+# of the RT-11 disk image under a name RT-11 will accept, the emulator is
+# told to boot and run it, and the screen is read back.  The exit status
+# comes from the marker uknc_exit.o prints (see uknc_exit.c): RT-11 itself
+# has no way to report one.  A program that never reaches _exit -- because
+# it hung, or trapped, or was too big to load -- prints no marker, and
+# this reports that as a failure.
+#
+# Paths can be overridden through the environment; the defaults are where
+# this project keeps things:
+#
+#   UKNC_EMU     ukncbtldebug, the console build of the emulator
+#   UKNC_DISK    the RT-11 disk image to boot
+#   UKNC_RT11DSK rt11dsk, which writes a file into that image
+#   UKNC_FRAMES  how long to wait, in emulated frames (50 = one second)
+
+set -e
+
+prog=$1
+if [ -z "$prog" ] || [ ! -f "$prog" ]; then
+  echo "uknc-run: no such program: $prog" >&2
+  exit 99
+fi
+
+here=$(cd "$(dirname "$0")" && pwd)
+root=$(cd "$here/../.." && pwd)
+
+emu=${UKNC_EMU:-$HOME/Development/ukncbtl-debugger-src/build/release/ukncbtldebug}
+disk=${UKNC_DISK:-$root/resources/rt11os.dsk}
+rt11dsk=${UKNC_RT11DSK:-rt11dsk}
+frames=${UKNC_FRAMES:-3000}
+
+for f in "$emu" "$disk"; do
+  if [ ! -f "$f" ]; then
+    echo "uknc-run: missing $f" >&2
+    exit 99
+  fi
+done
+
+# The emulator prints the screen through a wide character stream, which
+# gives up without a word if the locale cannot represent what is on it --
+# and RT-11 puts Cyrillic there.  Test harnesses run in the C locale, so
+# choose a UTF-8 one here rather than lose the output.
+if [ -z "$UKNC_LOCALE" ]; then
+  for l in en_US.UTF-8 C.UTF-8 UTF-8; do
+    if locale -a 2>/dev/null | grep -q -x "$l"; then
+      UKNC_LOCALE=$l
+      break
+    fi
+  done
+  UKNC_LOCALE=${UKNC_LOCALE:-en_US.UTF-8}
+fi
+LC_ALL=$UKNC_LOCALE
+export LC_ALL
+
+rom=$(dirname "$emu")/uknc_rom.bin
+if [ ! -f "$rom" ]; then
+  echo "uknc-run: missing $rom" >&2
+  exit 99
+fi
+
+# Every run gets its own directory, so that several can go at once --
+# "make check" runs tests in parallel.  The emulator wants its ROM in the
+# current directory, hence the link.
+tmp=$(mktemp -d "${TMPDIR:-/tmp}/uknc-run.XXXXXX")
+if [ -n "$UKNC_KEEP" ]; then
+  echo "uknc-run: keeping $tmp" >&2
+else
+  trap 'rm -rf "$tmp"' EXIT INT TERM
+fi
+ln -s "$rom" "$tmp/uknc_rom.bin"
+
+# RT-11 names are 6.3 and upper case, so whatever the program is called
+# here, on the disk it is T.SAV.
+cp "$prog" "$tmp/T.SAV"
+cp "$disk" "$tmp/t.dsk"
+"$rt11dsk" a "$tmp/t.dsk" "$tmp/T.SAV" > /dev/null 2>&1 || {
+  echo "uknc-run: could not put the program on the disk" >&2
+  exit 99
+}
+
+# Boot the machine, type "R T" at the monitor, let it run, read the
+# screen.  The waits are in frames: enough for the boot menu, the date
+# prompt, and then the program itself.
+{
+  echo "disk1 attach $tmp/t.dsk"
+  echo "reset"
+  echo "cf500"
+  echo "key 1"
+  echo "cf200"
+  echo "key ENTER"
+  echo "cf1500"
+  echo "key R"
+  echo "key SPACE"
+  echo "key T"
+  echo "key ENTER"
+  echo "cf$frames"
+  echo "screentext"
+  echo "q"
+} | (cd "$tmp" && "$emu" > screen.txt 2>&1) || true
+
+[ -f "$tmp/screen.txt" ] || {
+  echo "uknc-run: the emulator produced nothing" >&2
+  exit 99
+}
+
+# The screen comes back padded out to its full width, so trim first.
+screen=$tmp/clean.txt
+sed 's/[[:space:]]*$//' "$tmp/screen.txt" > "$screen"
+
+# What the program printed is between the command that started it and the
+# marker, and the marker goes out with it: that line is how DejaGnu reads
+# the status, and it strips it back out itself.
+sed -n '/^\.R T$/,/^\*\*\* EXIT code /p' "$screen" | sed '1d'
+
+status=$(sed -n 's/^\*\*\* EXIT code \([0-9][0-9]*\).*/\1/p' "$screen" | tail -1)
+if [ -z "$status" ]; then
+  # No marker: the program never reached _exit.  Say why if the monitor
+  # did, since "too big to load" and "trapped" look alike from here.
+  reason=$(grep -m1 -E "KMON-F|CТOП|Illegal|Trap" "$screen" || true)
+  [ -n "$reason" ] && echo "uknc-run: $reason" >&2
+  echo "uknc-run: no exit marker, the program did not finish" >&2
+  exit 98
+fi
+
+exit "$(expr "$status" + 0)"

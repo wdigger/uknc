@@ -1,0 +1,10 @@
+# Global DejaGnu config for this project, which exists so that DejaGnu
+# looks for board descriptions in boards/ beside it:
+#
+#   DEJAGNU=<this project>/gcc/dejagnu/site.exp \
+#     make check-gcc RUNTESTFLAGS="--target_board=uknc-sim execute.exp"
+#
+# See boards/uknc-sim.exp for what that board does and why it exists.
+# Nothing else belongs in here: per-board settings go in the board file.
+
+verbose "Loading the uknc project's DejaGnu config" 2

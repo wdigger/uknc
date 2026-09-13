@@ -1,0 +1,59 @@
+# DejaGnu board for pdp11-uknc-rt11: run the tests on a real UKNC, as
+# emulated by ukncbtl.
+#
+# Until this existed, nothing in the GCC testsuite here ever ran a
+# program: the suites that were being used compile only, so a wrong
+# answer at run time went unnoticed however long it had been there.  One
+# such bug -- the sign of a four-word comparison being read off the wrong
+# word -- survived for exactly that reason and was found by hand, through
+# a library that misbehaved.  This board is how the execution tests get to
+# run:
+#
+#   DEJAGNU=<this project>/gcc/dejagnu/site.exp \
+#     make check-gcc RUNTESTFLAGS="--target_board=uknc-sim execute.exp"
+#
+# DEJAGNU names a global config file, and DejaGnu looks for boards in a
+# "boards" directory beside it, which is why this file lives one level
+# down from the rest.
+#
+# Everything specific to the machine is in uknc-run beside this file: it
+# puts the program on a disk image, boots RT-11 in the emulator, runs the
+# program and reports what it printed and how it ended.  A run takes about
+# a second and a half, most of it the boot.
+#
+# Two link-time pieces come from here, both in uknc_exit.o, because RT-11
+# has no way to tell a caller how a program ended: a replacement _exit
+# that prints the status where the screen reader can see it, and a wrapper
+# around main, since the startup code ends the program itself rather than
+# calling exit().
+
+load_generic_config "sim"
+process_multilib_options ""
+
+# Where this board's own files are.  DEJAGNU_UKNC_DIR overrides it, for a
+# checkout somewhere else.
+if {[info exists env(DEJAGNU_UKNC_DIR)]} {
+    set uknc_dir $env(DEJAGNU_UKNC_DIR)
+} else {
+    set uknc_dir [file dirname [file dirname [file normalize [info script]]]]
+}
+
+set_board_info compiler "[find_gcc]"
+set_board_info cflags   ""
+set_board_info ldflags  "-Wl,--wrap=main $uknc_dir/uknc_exit.o"
+
+set_board_info sim "$uknc_dir/uknc-run"
+
+# One run is a second and a half, but a program that hangs waits out the
+# emulator's own frame count first, and a loaded machine can be slower
+# still, so leave room.
+set_board_info sim_time_limit 120
+
+set_board_info is_simulator 1
+set_board_info needs_status_wrapper 0
+
+# There is no operating system underneath in the sense the testsuite
+# means: no processes, no signals, no files beyond what RT-11 offers.
+set_board_info gdb,nosignals 1
+set_board_info gdb,noresults 1
+set_board_info noargs 1
