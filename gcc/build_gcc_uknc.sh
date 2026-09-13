@@ -72,6 +72,7 @@ curl https://github.com/wdigger/gcc/commit/2c4b24b9634e41fc19754c6c34dfd338ccbb2
 curl https://github.com/wdigger/gcc/commit/94e56e9b8984c979b77df483a6f1ac7feda81d9a.patch -o gcc_17.patch
 curl https://github.com/wdigger/gcc/commit/c81bf4ee927dcdcfc6758ead63fe3f758af15fd1.patch -o gcc_18.patch
 curl https://github.com/wdigger/gcc/commit/3ba9daebb25ee1304a03965b8ddf4bf39ce37579.patch -o gcc_19.patch
+curl https://github.com/wdigger/gcc/commit/5c5960e93efb3533eaa1f539c75fd7cd378589d0.patch -o gcc_20.patch
 
 cd ${BUILDDIR}/src/gcc-${GCC_VERSION}
 patch -p1 < ${BUILDDIR}/gcc_1.patch
@@ -93,6 +94,7 @@ patch -p1 < ${BUILDDIR}/gcc_16.patch
 patch -p1 < ${BUILDDIR}/gcc_17.patch
 patch -p1 < ${BUILDDIR}/gcc_18.patch
 patch -p1 < ${BUILDDIR}/gcc_19.patch
+patch -p1 < ${BUILDDIR}/gcc_20.patch
 rm ${BUILDDIR}/gcc_1.patch
 rm ${BUILDDIR}/gcc_2.patch
 rm ${BUILDDIR}/gcc_3.patch
@@ -112,6 +114,7 @@ rm ${BUILDDIR}/gcc_16.patch
 rm ${BUILDDIR}/gcc_17.patch
 rm ${BUILDDIR}/gcc_18.patch
 rm ${BUILDDIR}/gcc_19.patch
+rm ${BUILDDIR}/gcc_20.patch
 
 # Download and patch newlib
 cd ${BUILDDIR}
@@ -131,6 +134,7 @@ curl https://github.com/wdigger/sourceware-mirror-newlib-cygwin/commit/930a14e6d
 curl https://github.com/wdigger/sourceware-mirror-newlib-cygwin/commit/d555cd2dc7d36f9f3381e8491565d306efa585f6.patch -o newlib_5.patch
 curl https://github.com/wdigger/sourceware-mirror-newlib-cygwin/commit/d01a026f73060db90afc9af2ea986549da41a715.patch -o newlib_6.patch
 curl https://github.com/wdigger/sourceware-mirror-newlib-cygwin/commit/a3d569699dc78dfd3974af1560b80d71cc1c505e.patch -o newlib_7.patch
+curl https://github.com/wdigger/sourceware-mirror-newlib-cygwin/commit/21275ce2fb7390857455f8637db4fb70cfa1da68.patch -o newlib_8.patch
 
 cd ${BUILDDIR}/src/gcc-${GCC_VERSION}
 patch -p1 < ${BUILDDIR}/newlib_1.patch
@@ -140,6 +144,7 @@ patch -p1 < ${BUILDDIR}/newlib_4.patch
 patch -p1 < ${BUILDDIR}/newlib_5.patch
 patch -p1 < ${BUILDDIR}/newlib_6.patch
 patch -p1 < ${BUILDDIR}/newlib_7.patch
+patch -p1 < ${BUILDDIR}/newlib_8.patch
 rm ${BUILDDIR}/newlib_1.patch
 rm ${BUILDDIR}/newlib_2.patch
 rm ${BUILDDIR}/newlib_3.patch
@@ -147,6 +152,7 @@ rm ${BUILDDIR}/newlib_4.patch
 rm ${BUILDDIR}/newlib_5.patch
 rm ${BUILDDIR}/newlib_6.patch
 rm ${BUILDDIR}/newlib_7.patch
+rm ${BUILDDIR}/newlib_8.patch
 
 # newlib_1.patch touches configure.host/libc/acinclude.m4, newlib_4.patch
 # touches libc/sys/rt11/Makefile.inc, and newlib_5.patch touches

@@ -54,6 +54,9 @@ volatile float f1 = 1.0f, f99 = 99.75f, fm99 = -99.75f;
 volatile float fe11 = 1.23456789e11f, fsmall = 0.25f;
 volatile float fzero = 0.0f, fneg1 = -1.0f, fneg2 = -2.0f;
 volatile double da = 3.0, db = 2.0, dbig = 1e7, dneg = -1.5;
+/* Two values a hair apart, for the cancellation checks below.  */
+volatile double dnear = 0x1.0000000001p0;   /* 1 + 2**-40, exactly */
+volatile long long lltop = 0xd1cf7980LL, llmid = 0xd1cf00000000LL;
 
 static void check_float(const char *name, float got, float want) {
   union fw g, w;
@@ -195,6 +198,25 @@ int main(void) {
   check_int("d lt", dneg < db, 1);
   check_double("int to d", (double) i3, 3.0);
   check_long("d to long", (long long) dbig, 10000000LL);
+  /* Subtracting two nearly equal values leaves a result that has to be
+   * shifted a long way back up, and fp-bit settles its sign by testing a
+   * 64-bit difference against zero.  A backend bug in that test -- the
+   * sign of a four-word value was read off the first word that was not
+   * zero rather than off the most significant one -- made this come out
+   * as about minus one, which is what made sinh and expm1 wrong.
+   */
+  check_double("cancel", dnear - 1.0, 0x1p-40);
+  check_double("cancel twice", (dnear - 1.0) - 0x1p-40, 0.0);
+
+  /* The same backend bug seen directly: these are positive values whose
+   * most significant word is zero and whose next word has its top bit
+   * set, which used to test as negative.
+   */
+  check_int("llong sign", lltop >= 0, 1);
+  check_int("llong sign 2", llmid >= 0, 1);
+  check_int("llong gt", lltop > 0, 1);
+  check_int("llong neg", -lltop < 0, 1);
+
   check_double("float to d", (double) fa, 3.0);
   check_float("d to float", (float) da, 3.0f);
   check_float("d to float inexact", (float) (da / 7.0), (float) (3.0 / 7.0));
