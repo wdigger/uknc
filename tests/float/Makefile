@@ -5,12 +5,11 @@ OPT_FLAG:=-O2
 GCC_FLAGS:=-std=gnu23 -fomit-frame-pointer $(OPT_FLAG)
 LD_FLAGS:=-Wl,--gc-sections -Wl,-Map=float.sav.map
 
-# make FIS=1 adds the FIS instructions, which is what makes multiply and
-# divide come out right -- see float.c.  The default build matches the
-# toolchain's own default, so it checks the conversions, addition,
-# subtraction and comparison only.
-ifdef FIS
-GCC_FLAGS+=-mfis
+# The FIS instructions are on by default for this vendor, so the plain
+# build uses them; make NOFIS=1 to check the library routines instead.
+# Both have to pass, which is the point -- see float.c.
+ifdef NOFIS
+GCC_FLAGS+=-mno-fis
 endif
 
 all:	float.dsk

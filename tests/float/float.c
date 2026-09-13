@@ -10,9 +10,10 @@
  * numbers, and carries its own smaller conversions and comparisons for
  * single precision in libgcc/config/pdp11/fpconv-*.c.
  *
- * Everything is checked in both builds, with and without the FIS
- * instructions ("make FIS=1"), since fp-bit was taught both DEC formats
- * and is correct on its own; FIS only makes single precision faster.
+ * Everything is checked both ways, with the FIS instructions, which this
+ * vendor has on by default, and without them ("make NOFIS=1"), since
+ * fp-bit was taught both DEC formats and is correct on its own; FIS only
+ * makes single precision faster.
  *
  * Double precision is the DEC D format, an 8-bit exponent and 55 bits of
  * fraction, which is nothing like IEEE double and its 11-bit exponent --
