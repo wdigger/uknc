@@ -121,6 +121,8 @@ curl https://github.com/wdigger/gcc/commit/3ba9daebb25ee1304a03965b8ddf4bf39ce37
 curl https://github.com/wdigger/gcc/commit/5c5960e93efb3533eaa1f539c75fd7cd378589d0.patch -o gcc_20.patch
 curl https://github.com/wdigger/gcc/commit/6855b8200eba8577a7937f75a73c7002dc3ea7ef.patch -o gcc_21.patch
 curl https://github.com/wdigger/gcc/commit/e5432c3a7835f7541c7ca78bc7a1429bd2cfeb82.patch -o gcc_22.patch
+# From here on, patches that exist only on topic/1801bm1-gcc15.2-elf.
+curl https://github.com/wdigger/gcc/commit/78485b1287f758f315a2d7e4751f206b8fa3f586.patch -o gcc_23.patch
 
 cd ${BUILDDIR}/src-elf/gcc-${GCC_VERSION}
 patch -p1 < ${BUILDDIR}/gcc_1.patch
@@ -145,6 +147,7 @@ patch -p1 < ${BUILDDIR}/gcc_19.patch
 patch -p1 < ${BUILDDIR}/gcc_20.patch
 patch -p1 < ${BUILDDIR}/gcc_21.patch
 patch -p1 < ${BUILDDIR}/gcc_22.patch
+patch -p1 < ${BUILDDIR}/gcc_23.patch
 rm ${BUILDDIR}/gcc_1.patch
 rm ${BUILDDIR}/gcc_2.patch
 rm ${BUILDDIR}/gcc_3.patch
@@ -167,6 +170,7 @@ rm ${BUILDDIR}/gcc_19.patch
 rm ${BUILDDIR}/gcc_20.patch
 rm ${BUILDDIR}/gcc_21.patch
 rm ${BUILDDIR}/gcc_22.patch
+rm ${BUILDDIR}/gcc_23.patch
 
 # Download and patch newlib
 cd ${BUILDDIR}
@@ -251,7 +255,13 @@ cd ${BUILDDIR}
 mkdir -p build-elf/gcc
 cd build-elf/gcc
 ${BUILDDIR}/src-elf/gcc-${GCC_VERSION}/configure --prefix "${BUILDDIR}/xgcc-elf" --bindir "${BUILDDIR}/bin-elf" --target pdp11-uknc-rt11 --enable-languages=c --with-gnu-as --with-gnu-ld --with-newlib --enable-newlib-nano-malloc --enable-newlib-nano-formatted-io --disable-newlib-wide-orient --disable-libssp --disable-bootstrap --disable-multilib --disable-nls --disable-libstdcxx --disable-doc --with-system-zlib --disable-libquadmath
-make -j4 MAKEINFO=true && make install MAKEINFO=true
+# CFLAGS_FOR_TARGET carries -ffunction-sections/-fdata-sections into
+# newlib and libgcc.  A program only links the library members it needs,
+# but a member is a whole file, and one function of it is usually all
+# that gets called; with a section per function the linker drops the
+# rest.  It is worth a good deal here -- tests/fileio goes from 9200 to
+# 6728 bytes on it alone -- and costs nothing at run time.
+make -j4 MAKEINFO=true CFLAGS_FOR_TARGET="-g -O2 -ffunction-sections -fdata-sections" && make install MAKEINFO=true CFLAGS_FOR_TARGET="-g -O2 -ffunction-sections -fdata-sections"
 
 # Download and build rt11dsk -- host-side and format-agnostic, so take
 # the one the a.out build already produced if it is there.
