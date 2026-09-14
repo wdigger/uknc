@@ -215,6 +215,7 @@ curl https://github.com/wdigger/sourceware-mirror-newlib-cygwin/commit/d555cd2dc
 curl https://github.com/wdigger/sourceware-mirror-newlib-cygwin/commit/d01a026f73060db90afc9af2ea986549da41a715.patch -o newlib_6.patch
 curl https://github.com/wdigger/sourceware-mirror-newlib-cygwin/commit/a3d569699dc78dfd3974af1560b80d71cc1c505e.patch -o newlib_7.patch
 curl https://github.com/wdigger/sourceware-mirror-newlib-cygwin/commit/21275ce2fb7390857455f8637db4fb70cfa1da68.patch -o newlib_8.patch
+curl https://github.com/wdigger/sourceware-mirror-newlib-cygwin/commit/012906a36fad357f787143d17d142fd5d3db4916.patch -o newlib_9.patch
 
 cd ${BUILDDIR}/src/gcc-${GCC_VERSION}
 patch -p1 < ${BUILDDIR}/newlib_1.patch
@@ -225,6 +226,7 @@ patch -p1 < ${BUILDDIR}/newlib_5.patch
 patch -p1 < ${BUILDDIR}/newlib_6.patch
 patch -p1 < ${BUILDDIR}/newlib_7.patch
 patch -p1 < ${BUILDDIR}/newlib_8.patch
+patch -p1 < ${BUILDDIR}/newlib_9.patch
 rm ${BUILDDIR}/newlib_1.patch
 rm ${BUILDDIR}/newlib_2.patch
 rm ${BUILDDIR}/newlib_3.patch
@@ -233,6 +235,7 @@ rm ${BUILDDIR}/newlib_5.patch
 rm ${BUILDDIR}/newlib_6.patch
 rm ${BUILDDIR}/newlib_7.patch
 rm ${BUILDDIR}/newlib_8.patch
+rm ${BUILDDIR}/newlib_9.patch
 
 # newlib_1.patch touches configure.host/libc/acinclude.m4, newlib_4.patch
 # touches libc/sys/rt11/Makefile.inc, and newlib_5.patch touches
