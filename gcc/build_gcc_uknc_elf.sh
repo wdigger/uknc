@@ -64,6 +64,7 @@ curl https://github.com/wdigger/binutils-gdb/commit/71844960d2a0f3f1c7b9da975b31
 curl https://github.com/wdigger/binutils-gdb/commit/3c418668d2d87992c82af432728fbdf30ffa95f5.patch -o binutils_9.patch
 curl https://github.com/wdigger/binutils-gdb/commit/55bffd5194aa0c95453b0a09042a38bf5fc4a907.patch -o binutils_10.patch
 curl https://github.com/wdigger/binutils-gdb/commit/309a34cbb12e0dd70eccd957c7153b8e9c55cd1c.patch -o binutils_11.patch
+curl https://github.com/wdigger/binutils-gdb/commit/4441b8c3c080dbc34cda0a75eee8b99fe1843fc7.patch -o binutils_12.patch
 
 cd ${BUILDDIR}/src-elf/binutils-${BINUTILS_VERSION}
 patch -p1 < ${BUILDDIR}/binutils_1.patch
@@ -77,6 +78,7 @@ patch -p1 < ${BUILDDIR}/binutils_8.patch
 patch -p1 < ${BUILDDIR}/binutils_9.patch
 patch -p1 < ${BUILDDIR}/binutils_10.patch
 patch -p1 < ${BUILDDIR}/binutils_11.patch
+patch -p1 < ${BUILDDIR}/binutils_12.patch
 rm ${BUILDDIR}/binutils_1.patch
 rm ${BUILDDIR}/binutils_2.patch
 rm ${BUILDDIR}/binutils_3.patch
@@ -88,6 +90,7 @@ rm ${BUILDDIR}/binutils_8.patch
 rm ${BUILDDIR}/binutils_9.patch
 rm ${BUILDDIR}/binutils_10.patch
 rm ${BUILDDIR}/binutils_11.patch
+rm ${BUILDDIR}/binutils_12.patch
 
 cd ${BUILDDIR}
 mkdir -p build-elf/binutils
@@ -123,6 +126,7 @@ curl https://github.com/wdigger/gcc/commit/6855b8200eba8577a7937f75a73c7002dc3ea
 curl https://github.com/wdigger/gcc/commit/e5432c3a7835f7541c7ca78bc7a1429bd2cfeb82.patch -o gcc_22.patch
 # From here on, patches that exist only on topic/1801bm1-gcc15.2-elf.
 curl https://github.com/wdigger/gcc/commit/78485b1287f758f315a2d7e4751f206b8fa3f586.patch -o gcc_23.patch
+curl https://github.com/wdigger/gcc/commit/1e1e86e20bce98bd506e29ccd302ae9f7130e3e7.patch -o gcc_24.patch
 
 cd ${BUILDDIR}/src-elf/gcc-${GCC_VERSION}
 patch -p1 < ${BUILDDIR}/gcc_1.patch
@@ -148,6 +152,7 @@ patch -p1 < ${BUILDDIR}/gcc_20.patch
 patch -p1 < ${BUILDDIR}/gcc_21.patch
 patch -p1 < ${BUILDDIR}/gcc_22.patch
 patch -p1 < ${BUILDDIR}/gcc_23.patch
+patch -p1 < ${BUILDDIR}/gcc_24.patch
 rm ${BUILDDIR}/gcc_1.patch
 rm ${BUILDDIR}/gcc_2.patch
 rm ${BUILDDIR}/gcc_3.patch
@@ -171,6 +176,7 @@ rm ${BUILDDIR}/gcc_20.patch
 rm ${BUILDDIR}/gcc_21.patch
 rm ${BUILDDIR}/gcc_22.patch
 rm ${BUILDDIR}/gcc_23.patch
+rm ${BUILDDIR}/gcc_24.patch
 
 # Download and patch newlib
 cd ${BUILDDIR}
