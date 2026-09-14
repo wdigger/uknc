@@ -65,6 +65,7 @@ curl https://github.com/wdigger/binutils-gdb/commit/3c418668d2d87992c82af432728f
 curl https://github.com/wdigger/binutils-gdb/commit/55bffd5194aa0c95453b0a09042a38bf5fc4a907.patch -o binutils_10.patch
 curl https://github.com/wdigger/binutils-gdb/commit/309a34cbb12e0dd70eccd957c7153b8e9c55cd1c.patch -o binutils_11.patch
 curl https://github.com/wdigger/binutils-gdb/commit/4441b8c3c080dbc34cda0a75eee8b99fe1843fc7.patch -o binutils_12.patch
+curl https://github.com/wdigger/binutils-gdb/commit/b8f98c8fa4155508d1010fc53f016c04559adf7b.patch -o binutils_13.patch
 
 cd ${BUILDDIR}/src-elf/binutils-${BINUTILS_VERSION}
 patch -p1 < ${BUILDDIR}/binutils_1.patch
@@ -79,6 +80,7 @@ patch -p1 < ${BUILDDIR}/binutils_9.patch
 patch -p1 < ${BUILDDIR}/binutils_10.patch
 patch -p1 < ${BUILDDIR}/binutils_11.patch
 patch -p1 < ${BUILDDIR}/binutils_12.patch
+patch -p1 < ${BUILDDIR}/binutils_13.patch
 rm ${BUILDDIR}/binutils_1.patch
 rm ${BUILDDIR}/binutils_2.patch
 rm ${BUILDDIR}/binutils_3.patch
@@ -91,11 +93,17 @@ rm ${BUILDDIR}/binutils_9.patch
 rm ${BUILDDIR}/binutils_10.patch
 rm ${BUILDDIR}/binutils_11.patch
 rm ${BUILDDIR}/binutils_12.patch
+rm ${BUILDDIR}/binutils_13.patch
 
 cd ${BUILDDIR}
 mkdir -p build-elf/binutils
 cd build-elf/binutils
-${BUILDDIR}/src-elf/binutils-${BINUTILS_VERSION}/configure --prefix "${BUILDDIR}/xgcc-elf" --bindir "${BUILDDIR}/bin-elf" --target pdp11-uknc-rt11 --disable-libstdcxx --disable-doc --with-system-zlib
+# --enable-plugins is what lets ld load gcc's liblto_plugin.so, and so
+# what makes -flto work: without it ld reports "-plugin PLUGIN
+# (ignored)", sees an LTO object as an empty file with a
+# __gnu_lto_slim marker in it, and the link fails on an undefined main.
+# A cross binutils does not enable it on its own.
+${BUILDDIR}/src-elf/binutils-${BINUTILS_VERSION}/configure --prefix "${BUILDDIR}/xgcc-elf" --bindir "${BUILDDIR}/bin-elf" --target pdp11-uknc-rt11 --enable-plugins --disable-libstdcxx --disable-doc --with-system-zlib
 make -j4 MAKEINFO=true && make install MAKEINFO=true
 
 # Download and patch gcc
@@ -127,6 +135,7 @@ curl https://github.com/wdigger/gcc/commit/e5432c3a7835f7541c7ca78bc7a1429bd2cfe
 # From here on, patches that exist only on topic/1801bm1-gcc15.2-elf.
 curl https://github.com/wdigger/gcc/commit/78485b1287f758f315a2d7e4751f206b8fa3f586.patch -o gcc_23.patch
 curl https://github.com/wdigger/gcc/commit/1e1e86e20bce98bd506e29ccd302ae9f7130e3e7.patch -o gcc_24.patch
+curl https://github.com/wdigger/gcc/commit/bf880c06c6ce06e3ff010562ceeebec11939e5bc.patch -o gcc_25.patch
 
 cd ${BUILDDIR}/src-elf/gcc-${GCC_VERSION}
 patch -p1 < ${BUILDDIR}/gcc_1.patch
@@ -153,6 +162,7 @@ patch -p1 < ${BUILDDIR}/gcc_21.patch
 patch -p1 < ${BUILDDIR}/gcc_22.patch
 patch -p1 < ${BUILDDIR}/gcc_23.patch
 patch -p1 < ${BUILDDIR}/gcc_24.patch
+patch -p1 < ${BUILDDIR}/gcc_25.patch
 rm ${BUILDDIR}/gcc_1.patch
 rm ${BUILDDIR}/gcc_2.patch
 rm ${BUILDDIR}/gcc_3.patch
@@ -177,6 +187,7 @@ rm ${BUILDDIR}/gcc_21.patch
 rm ${BUILDDIR}/gcc_22.patch
 rm ${BUILDDIR}/gcc_23.patch
 rm ${BUILDDIR}/gcc_24.patch
+rm ${BUILDDIR}/gcc_25.patch
 
 # Download and patch newlib
 cd ${BUILDDIR}
