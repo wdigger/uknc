@@ -133,6 +133,7 @@ curl https://github.com/wdigger/gcc/commit/1e1e86e20bce98bd506e29ccd302ae9f7130e
 curl https://github.com/wdigger/gcc/commit/bf880c06c6ce06e3ff010562ceeebec11939e5bc.patch -o gcc_25.patch
 curl https://github.com/wdigger/gcc/commit/95168bc52dac315f438b441caa590d0a9332271e.patch -o gcc_26.patch
 curl https://github.com/wdigger/gcc/commit/761aa7b9472da88fe2cb4b0b870ff71fca60f210.patch -o gcc_27.patch
+curl https://github.com/wdigger/gcc/commit/8183b382d441ca97539b2fdd0975e2cc817f724d.patch -o gcc_28.patch
 
 cd ${BUILDDIR}/src/gcc-${GCC_VERSION}
 patch -p1 < ${BUILDDIR}/gcc_1.patch
@@ -162,6 +163,7 @@ patch -p1 < ${BUILDDIR}/gcc_24.patch
 patch -p1 < ${BUILDDIR}/gcc_25.patch
 patch -p1 < ${BUILDDIR}/gcc_26.patch
 patch -p1 < ${BUILDDIR}/gcc_27.patch
+patch -p1 < ${BUILDDIR}/gcc_28.patch
 rm ${BUILDDIR}/gcc_1.patch
 rm ${BUILDDIR}/gcc_2.patch
 rm ${BUILDDIR}/gcc_3.patch
@@ -189,6 +191,7 @@ rm ${BUILDDIR}/gcc_24.patch
 rm ${BUILDDIR}/gcc_25.patch
 rm ${BUILDDIR}/gcc_26.patch
 rm ${BUILDDIR}/gcc_27.patch
+rm ${BUILDDIR}/gcc_28.patch
 
 # Download and patch newlib
 cd ${BUILDDIR}
