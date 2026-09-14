@@ -26,7 +26,11 @@
  * both "ppus_start.o" and ".../lib/ppus_start.o" end in that name.
  */
 
-OUTPUT_FORMAT("a.out-pdp11", "a.out-pdp11", "a.out-pdp11")
+/* No OUTPUT_FORMAT here on purpose: a -T script replaces the built-in
+ * one entirely, so naming a format would pin this file to one object
+ * format, and the toolchain has two of them while the ELF work is in
+ * progress.  Left out, the emulation's own default applies, which is
+ * the right one either way.  */
 OUTPUT_ARCH(pdp11)
 
 SECTIONS
@@ -35,16 +39,19 @@ SECTIONS
   {
     *ppus_start.o(.text)
     *(.text)
+    *(.text.*)
   }
   .data :
   {
     *(.rodata)
     *(.rodata.*)
     *(.data)
+    *(.data.*)
   }
   .bss :
   {
     *(.bss)
+    *(.bss.*)
     *(COMMON)
   }
 }

@@ -62,6 +62,8 @@ curl https://github.com/wdigger/binutils-gdb/commit/e708665ce556d49513a5cb9c5ea6
 # From here on, patches that exist only on topic/rt11-elf-pdp11.
 curl https://github.com/wdigger/binutils-gdb/commit/71844960d2a0f3f1c7b9da975b311d88bb669515.patch -o binutils_8.patch
 curl https://github.com/wdigger/binutils-gdb/commit/3c418668d2d87992c82af432728fbdf30ffa95f5.patch -o binutils_9.patch
+curl https://github.com/wdigger/binutils-gdb/commit/55bffd5194aa0c95453b0a09042a38bf5fc4a907.patch -o binutils_10.patch
+curl https://github.com/wdigger/binutils-gdb/commit/309a34cbb12e0dd70eccd957c7153b8e9c55cd1c.patch -o binutils_11.patch
 
 cd ${BUILDDIR}/src-elf/binutils-${BINUTILS_VERSION}
 patch -p1 < ${BUILDDIR}/binutils_1.patch
@@ -73,6 +75,8 @@ patch -p1 < ${BUILDDIR}/binutils_6.patch
 patch -p1 < ${BUILDDIR}/binutils_7.patch
 patch -p1 < ${BUILDDIR}/binutils_8.patch
 patch -p1 < ${BUILDDIR}/binutils_9.patch
+patch -p1 < ${BUILDDIR}/binutils_10.patch
+patch -p1 < ${BUILDDIR}/binutils_11.patch
 rm ${BUILDDIR}/binutils_1.patch
 rm ${BUILDDIR}/binutils_2.patch
 rm ${BUILDDIR}/binutils_3.patch
@@ -82,6 +86,8 @@ rm ${BUILDDIR}/binutils_6.patch
 rm ${BUILDDIR}/binutils_7.patch
 rm ${BUILDDIR}/binutils_8.patch
 rm ${BUILDDIR}/binutils_9.patch
+rm ${BUILDDIR}/binutils_10.patch
+rm ${BUILDDIR}/binutils_11.patch
 
 cd ${BUILDDIR}
 mkdir -p build-elf/binutils
