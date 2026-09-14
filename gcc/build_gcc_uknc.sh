@@ -1,11 +1,37 @@
 #!/usr/bin/env sh
 set -e
 
+# Builds the pdp11-uknc-rt11 cross toolchain: binutils, gcc and newlib
+# from their vanilla releases, with this project's own patches fetched
+# one commit at a time from the forks
+#
+#   binutils  wdigger/binutils-gdb  topic/rt11-sav-pdp11
+#   gcc       wdigger/gcc           topic/1801bm1-gcc15.2
+#   newlib    wdigger/sourceware-…  rt11-port
+#
+# Objects are ELF.  They were a.out until 2026-09-14, which is why the
+# patch lists below have a second half: a.out has three sections and no
+# way to name a fourth, so -ffunction-sections was refused outright,
+# --gc-sections had nothing to collect, -g produced nothing and -flto
+# was impossible.  The last a.out state of each branch is frozen at
+# topic/rt11-sav-pdp11-aout and topic/1801bm1-gcc15.2-aout if it is ever
+# wanted back; the two produce byte-identical programs as long as
+# --gc-sections is off, which is how the change was checked.
+
 BINUTILS_VERSION="2.45"
 GCC_VERSION="15.2.0"
 NEWLIB_VERSION="4.6.0.20260123"
 
 BUILDDIR="${PWD}"
+
+# `curl ... | tar` hides a failed download: set -e sees only tar's exit
+# status, so a truncated stream leaves a half-extracted tree behind and
+# the script carries on to build against it.  Fetch to a file first.
+fetch_and_extract () {
+	curl -fL "$1" -o "${BUILDDIR}/tarball.tmp"
+	tar -C "$2" -zxf "${BUILDDIR}/tarball.tmp"
+	rm -f "${BUILDDIR}/tarball.tmp"
+}
 
 # Preparing folders
 cd ${BUILDDIR}
@@ -15,7 +41,7 @@ mkdir xgcc
 
 # Download, patch and build binutils
 cd ${BUILDDIR}
-curl https://ftp.gnu.org/gnu/binutils/binutils-${BINUTILS_VERSION}.tar.gz | tar -C ${BUILDDIR}/src -zxf -
+fetch_and_extract https://ftp.gnu.org/gnu/binutils/binutils-${BINUTILS_VERSION}.tar.gz ${BUILDDIR}/src
 
 curl https://github.com/wdigger/binutils-gdb/commit/09c5f5bc048d3e7d96b93efba699ceae742da2b0.patch -o binutils_1.patch
 curl https://github.com/wdigger/binutils-gdb/commit/540689194f9fa20c6afe18aeee17630eb1f3b76c.patch -o binutils_2.patch
@@ -24,6 +50,13 @@ curl https://github.com/wdigger/binutils-gdb/commit/2cfcf47acd27eea618556f003369
 curl https://github.com/wdigger/binutils-gdb/commit/12a9ac2140efb341d65c863ec5d4d3ae0259b17c.patch -o binutils_5.patch
 curl https://github.com/wdigger/binutils-gdb/commit/c3826bc61b812b776b95ac64a320ed4dfeaba492.patch -o binutils_6.patch
 curl https://github.com/wdigger/binutils-gdb/commit/e708665ce556d49513a5cb9c5ea69812bb4ef756.patch -o binutils_7.patch
+curl https://github.com/wdigger/binutils-gdb/commit/71844960d2a0f3f1c7b9da975b311d88bb669515.patch -o binutils_8.patch
+curl https://github.com/wdigger/binutils-gdb/commit/3c418668d2d87992c82af432728fbdf30ffa95f5.patch -o binutils_9.patch
+curl https://github.com/wdigger/binutils-gdb/commit/55bffd5194aa0c95453b0a09042a38bf5fc4a907.patch -o binutils_10.patch
+curl https://github.com/wdigger/binutils-gdb/commit/309a34cbb12e0dd70eccd957c7153b8e9c55cd1c.patch -o binutils_11.patch
+curl https://github.com/wdigger/binutils-gdb/commit/4441b8c3c080dbc34cda0a75eee8b99fe1843fc7.patch -o binutils_12.patch
+curl https://github.com/wdigger/binutils-gdb/commit/b8f98c8fa4155508d1010fc53f016c04559adf7b.patch -o binutils_13.patch
+curl https://github.com/wdigger/binutils-gdb/commit/955310c53463c00889de3b936847c9445097e1af.patch -o binutils_14.patch
 
 cd ${BUILDDIR}/src/binutils-${BINUTILS_VERSION}
 patch -p1 < ${BUILDDIR}/binutils_1.patch
@@ -33,6 +66,13 @@ patch -p1 < ${BUILDDIR}/binutils_4.patch
 patch -p1 < ${BUILDDIR}/binutils_5.patch
 patch -p1 < ${BUILDDIR}/binutils_6.patch
 patch -p1 < ${BUILDDIR}/binutils_7.patch
+patch -p1 < ${BUILDDIR}/binutils_8.patch
+patch -p1 < ${BUILDDIR}/binutils_9.patch
+patch -p1 < ${BUILDDIR}/binutils_10.patch
+patch -p1 < ${BUILDDIR}/binutils_11.patch
+patch -p1 < ${BUILDDIR}/binutils_12.patch
+patch -p1 < ${BUILDDIR}/binutils_13.patch
+patch -p1 < ${BUILDDIR}/binutils_14.patch
 rm ${BUILDDIR}/binutils_1.patch
 rm ${BUILDDIR}/binutils_2.patch
 rm ${BUILDDIR}/binutils_3.patch
@@ -40,16 +80,28 @@ rm ${BUILDDIR}/binutils_4.patch
 rm ${BUILDDIR}/binutils_5.patch
 rm ${BUILDDIR}/binutils_6.patch
 rm ${BUILDDIR}/binutils_7.patch
+rm ${BUILDDIR}/binutils_8.patch
+rm ${BUILDDIR}/binutils_9.patch
+rm ${BUILDDIR}/binutils_10.patch
+rm ${BUILDDIR}/binutils_11.patch
+rm ${BUILDDIR}/binutils_12.patch
+rm ${BUILDDIR}/binutils_13.patch
+rm ${BUILDDIR}/binutils_14.patch
 
 cd ${BUILDDIR}
 mkdir -p build/binutils
 cd build/binutils
-${BUILDDIR}/src/binutils-${BINUTILS_VERSION}/configure --prefix "${BUILDDIR}/xgcc" --bindir "${BUILDDIR}/bin" --target pdp11-uknc-rt11 --disable-libstdcxx --disable-doc --with-system-zlib
+# --enable-plugins is what lets ld load gcc's liblto_plugin.so, and so
+# what makes -flto work: without it ld reports "-plugin PLUGIN
+# (ignored)", sees an LTO object as an empty file with a
+# __gnu_lto_slim marker in it, and the link fails on an undefined main.
+# A cross binutils does not enable it on its own.
+${BUILDDIR}/src/binutils-${BINUTILS_VERSION}/configure --prefix "${BUILDDIR}/xgcc" --bindir "${BUILDDIR}/bin" --target pdp11-uknc-rt11 --enable-plugins --disable-libstdcxx --disable-doc --with-system-zlib
 make -j4 MAKEINFO=true && make install MAKEINFO=true
 
 # Download and patch gcc
 cd ${BUILDDIR}
-curl https://ftp.gnu.org/gnu/gcc/gcc-${GCC_VERSION}/gcc-${GCC_VERSION}.tar.gz | tar -C ${BUILDDIR}/src -zxf -
+fetch_and_extract https://ftp.gnu.org/gnu/gcc/gcc-${GCC_VERSION}/gcc-${GCC_VERSION}.tar.gz ${BUILDDIR}/src
 
 curl https://github.com/wdigger/gcc/commit/4e983b0232e8866a77efeb294d49f8ea166dc0e7.patch -o gcc_1.patch
 curl https://github.com/wdigger/gcc/commit/b6a22d2cc567af01c9847c20a1be508709f003f2.patch -o gcc_2.patch
@@ -73,6 +125,9 @@ curl https://github.com/wdigger/gcc/commit/3ba9daebb25ee1304a03965b8ddf4bf39ce37
 curl https://github.com/wdigger/gcc/commit/5c5960e93efb3533eaa1f539c75fd7cd378589d0.patch -o gcc_20.patch
 curl https://github.com/wdigger/gcc/commit/6855b8200eba8577a7937f75a73c7002dc3ea7ef.patch -o gcc_21.patch
 curl https://github.com/wdigger/gcc/commit/e5432c3a7835f7541c7ca78bc7a1429bd2cfeb82.patch -o gcc_22.patch
+curl https://github.com/wdigger/gcc/commit/78485b1287f758f315a2d7e4751f206b8fa3f586.patch -o gcc_23.patch
+curl https://github.com/wdigger/gcc/commit/1e1e86e20bce98bd506e29ccd302ae9f7130e3e7.patch -o gcc_24.patch
+curl https://github.com/wdigger/gcc/commit/bf880c06c6ce06e3ff010562ceeebec11939e5bc.patch -o gcc_25.patch
 
 cd ${BUILDDIR}/src/gcc-${GCC_VERSION}
 patch -p1 < ${BUILDDIR}/gcc_1.patch
@@ -97,6 +152,9 @@ patch -p1 < ${BUILDDIR}/gcc_19.patch
 patch -p1 < ${BUILDDIR}/gcc_20.patch
 patch -p1 < ${BUILDDIR}/gcc_21.patch
 patch -p1 < ${BUILDDIR}/gcc_22.patch
+patch -p1 < ${BUILDDIR}/gcc_23.patch
+patch -p1 < ${BUILDDIR}/gcc_24.patch
+patch -p1 < ${BUILDDIR}/gcc_25.patch
 rm ${BUILDDIR}/gcc_1.patch
 rm ${BUILDDIR}/gcc_2.patch
 rm ${BUILDDIR}/gcc_3.patch
@@ -119,6 +177,9 @@ rm ${BUILDDIR}/gcc_19.patch
 rm ${BUILDDIR}/gcc_20.patch
 rm ${BUILDDIR}/gcc_21.patch
 rm ${BUILDDIR}/gcc_22.patch
+rm ${BUILDDIR}/gcc_23.patch
+rm ${BUILDDIR}/gcc_24.patch
+rm ${BUILDDIR}/gcc_25.patch
 
 # Download and patch newlib
 cd ${BUILDDIR}
@@ -128,7 +189,7 @@ cd ${BUILDDIR}
 # already know how to build a "newlib" target module if the directory is
 # present and --with-newlib is passed -- see gcc/config.gcc's
 # pdp11-uknc-rt11 comment and newlib/libc/sys/rt11/ for the actual port).
-curl https://sourceware.org/pub/newlib/newlib-${NEWLIB_VERSION}.tar.gz | tar -C ${BUILDDIR}/src -zxf -
+fetch_and_extract https://sourceware.org/pub/newlib/newlib-${NEWLIB_VERSION}.tar.gz ${BUILDDIR}/src
 cp -R ${BUILDDIR}/src/newlib-${NEWLIB_VERSION}/newlib ${BUILDDIR}/src/gcc-${GCC_VERSION}/newlib
 
 curl https://github.com/wdigger/sourceware-mirror-newlib-cygwin/commit/4bfd315ea9955ae2915040d5ff4cd3eabb9f9e6e.patch -o newlib_1.patch
@@ -169,20 +230,22 @@ rm ${BUILDDIR}/newlib_8.patch
 # newlib itself was built with, rather than whatever the system happens to
 # have, and regenerate with those.
 cd ${BUILDDIR}
-curl https://ftp.gnu.org/gnu/autoconf/autoconf-2.69.tar.gz | tar -C ${BUILDDIR}/src -zxf -
+AUTOTOOLS="${BUILDDIR}/autotools"
+
+fetch_and_extract https://ftp.gnu.org/gnu/autoconf/autoconf-2.69.tar.gz ${BUILDDIR}/src
 
 cd ${BUILDDIR}/src/autoconf-2.69
-./configure --prefix "${BUILDDIR}/autotools"
+./configure --prefix "${AUTOTOOLS}"
 make && make install
 
 cd ${BUILDDIR}
-curl https://ftp.gnu.org/gnu/automake/automake-1.15.1.tar.gz | tar -C ${BUILDDIR}/src -zxf -
+fetch_and_extract https://ftp.gnu.org/gnu/automake/automake-1.15.1.tar.gz ${BUILDDIR}/src
 cd ${BUILDDIR}/src/automake-1.15.1
-PATH="${BUILDDIR}/autotools/bin:${PATH}" ./configure --prefix "${BUILDDIR}/autotools"
-PATH="${BUILDDIR}/autotools/bin:${PATH}" make && make install
+PATH="${AUTOTOOLS}/bin:${PATH}" ./configure --prefix "${AUTOTOOLS}"
+PATH="${AUTOTOOLS}/bin:${PATH}" make && make install
 
 cd ${BUILDDIR}/src/gcc-${GCC_VERSION}/newlib
-PATH="${BUILDDIR}/autotools/bin:${PATH}" autoreconf
+PATH="${AUTOTOOLS}/bin:${PATH}" autoreconf
 
 # Build gcc
 cd ${BUILDDIR}/src/gcc-${GCC_VERSION}
@@ -193,7 +256,13 @@ cd ${BUILDDIR}
 mkdir -p build/gcc
 cd build/gcc
 ${BUILDDIR}/src/gcc-${GCC_VERSION}/configure --prefix "${BUILDDIR}/xgcc" --bindir "${BUILDDIR}/bin" --target pdp11-uknc-rt11 --enable-languages=c --with-gnu-as --with-gnu-ld --with-newlib --enable-newlib-nano-malloc --enable-newlib-nano-formatted-io --disable-newlib-wide-orient --disable-libssp --disable-bootstrap --disable-multilib --disable-nls --disable-libstdcxx --disable-doc --with-system-zlib --disable-libquadmath
-make -j4 MAKEINFO=true && make install MAKEINFO=true
+# CFLAGS_FOR_TARGET carries -ffunction-sections/-fdata-sections into
+# newlib and libgcc.  A program only links the library members it needs,
+# but a member is a whole file, and one function of it is usually all
+# that gets called; with a section per function the linker drops the
+# rest.  It is worth a good deal here -- tests/fileio goes from 9200 to
+# 6728 bytes on it alone -- and costs nothing at run time.
+make -j4 MAKEINFO=true CFLAGS_FOR_TARGET="-g -O2 -ffunction-sections -fdata-sections" && make install MAKEINFO=true CFLAGS_FOR_TARGET="-g -O2 -ffunction-sections -fdata-sections"
 
 # Download and build rt11dsk
 cd ${BUILDDIR}/src
@@ -202,25 +271,18 @@ cd ${BUILDDIR}/src/ukncbtl-utils/rt11dsk
 make
 cp rt11dsk ${BUILDDIR}/bin/rt11dsk
 
-# Build and install libppu (../libs/libppu): installs libppu.a, its
-# headers (ppu_client.h/ppu_server.h), and ppu.ld into the sysroot
-# alongside libc.a, so any CPU-side program can just link with -lppu,
-# the same way the toolchain's own libc/libm/libg already work; also
-# installs pdp11-uknc-rt11-ld-ppu, a small wrapper around the real
-# pdp11-uknc-rt11-ld, into ${BUILDDIR}/bin alongside every other
-# pdp11-uknc-rt11-* tool -- the linker a PPU-side program should use
-# instead, with libppu's own linking requirements (ppu.ld, -u start,
-# -lppu) already built in.
+# Build and install libppu (../libs/libppu): libppu.a, its headers
+# (ppu_client.h/ppu_server.h) and ppu.ld go into the sysroot beside
+# libc.a, so a CPU-side program links with plain -lppu; and
+# pdp11-uknc-rt11-ld-ppu, a wrapper around the real linker carrying
+# libppu's own linking requirements (ppu.ld, -u start, -lppu), goes into
+# bin beside every other pdp11-uknc-rt11-* tool.
 cd ${BUILDDIR}/../libs/libppu
 PATH="${BUILDDIR}/bin:${PATH}" make install
 
-# Build and install libpdp11 (../libs/libpdp11): plain-PDP-11
-# primitives (interrupt priority mask/unmask, interrupt vector
-# get/set/swap -- see its own pdp11_irq.h) shared by both CPU- and
-# PPU-side programs -- nothing here is UKNC-specific (unlike libppu,
-# which is this project's own CPU<->PPU protocol), so it needs no
-# special linker wrapper; installs libpdp11.a and pdp11_irq.h into the
-# sysroot the same way libc.a/libppu.a already are, so any program just
-# links with -lpdp11.
+# Build and install libpdp11 (../libs/libpdp11): plain-PDP-11 primitives
+# (interrupt priority mask/unmask, interrupt vector get/set/swap -- see
+# its pdp11_irq.h) shared by CPU- and PPU-side programs.  Nothing here is
+# UKNC-specific, so it needs no wrapper of its own: -lpdp11 is enough.
 cd ${BUILDDIR}/../libs/libpdp11
 PATH="${BUILDDIR}/bin:${PATH}" make install

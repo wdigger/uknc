@@ -24,11 +24,11 @@
 # this project's own build layout), so it keeps working wherever the
 # toolchain itself gets installed.
 #
-# A toolchain built by a variant script installs into bin-<variant> and
-# xgcc-<variant> instead (build_gcc_uknc_elf.sh and bin-elf/xgcc-elf),
-# and both toolchains install this same wrapper.  Carry the suffix from
-# the directory this copy was run out of, or the ELF toolchain's ld
-# would quietly link against the a.out toolchain's libppu.a.
+# A toolchain built into bin-<variant> keeps its sysroot in
+# xgcc-<variant> to match, so carry the suffix from the directory this
+# copy was run out of.  That is how the ELF toolchain was built beside
+# the a.out one while the two existed side by side, and without it a
+# second toolchain's ld quietly links against the first one's libppu.a.
 
 set -e
 

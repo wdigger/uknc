@@ -2,10 +2,6 @@
 /gcc/build
 /gcc/src
 /gcc/xgcc
-/gcc/bin-elf
-/gcc/build-elf
-/gcc/src-elf
-/gcc/xgcc-elf
 *.out
 *.o
 *.lda
@@ -16,4 +12,3 @@ example.dsk
 *.dsk
 *.ppu
 /gcc/autotools
-/gcc/autotools-elf
