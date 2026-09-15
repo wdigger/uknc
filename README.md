@@ -111,18 +111,31 @@ pdp11-uknc-rt11-gcc -g -Wl,-m,pdp11rt11 -o prog.elf prog.c
 `long`, форматы плавающих DEC, `BPT` как точка останова, возврат в R0 (или в
 R0 и R1, старшая половина в R0).
 
-Пока это работа с файлом, а не с машиной: подключаться не к чему, потому что
-эмулятор не говорит по протоколу gdb. То есть `list`, `disassemble`,
-`info line`, `ptype`, `print` глобальных из образа — работают, а `run`,
-`target remote`, точки останова и `bt` — нет.
+К машине он тоже подключается: команда `gdbserver` в `ukncbtl-debugger`
+(ветка `gdbserver`) поднимает на `localhost` сервер протокола gdb. Порядок
+такой — довести программу в отладчике до нужного места, отдать машину, дальше
+работать из gdb:
 
 ```
-$ pdp11-uknc-rt11-gdb prog.elf
-(gdb) disassemble sum
-   0x00000266 <+0>:  mov  r5, -(sp)
-   0x00000268 <+2>:  mov  sp, r5
-   0x0000026a <+4>:  add  $-4, sp
+CPU:001226> gdbserver
+Listening on localhost:2345 for CPU
 ```
+
+```
+(gdb) target remote :2345
+(gdb) break g2.c:8
+(gdb) continue
+Breakpoint 1, sum (n=10) at g2.c:8
+(gdb) print total
+$1 = 55
+(gdb) bt
+#0  sum (n=10) at g2.c:8
+#1  0x000002aa in main () at g2.c:13
+```
+
+Регистры, память, точки останова, шаг, кадры, аргументы и локальные — всё
+работает; последние три держатся на call frame information, то есть требуют
+`-g`. Раскрутка обрывается на `main`: в стартовом коде CFI нет.
 
 Кадры описаны так, что call frame information читается первой (она у всего,
 собранного с `-g`, и она точная), а разбор пролога — запасной путь для
