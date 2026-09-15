@@ -22,8 +22,11 @@
 #
 #   UKNC_EMU     ukncbtldebug, the console build of the emulator
 #   UKNC_DISK    the RT-11 disk image to boot
+#   UKNC_ROM     the firmware; the default one boots without being asked
 #   UKNC_RT11DSK rt11dsk, which writes a file into that image
-#   UKNC_FRAMES  how long to wait, in emulated frames (50 = one second)
+#   UKNC_FRAMES  how long to wait for the program, in emulated frames
+#                (50 = one second)
+#   UKNC_BOOT_FRAMES  how long to wait for RT-11 to come up, same units
 
 set -e
 
@@ -38,10 +41,12 @@ root=$(cd "$here/../.." && pwd)
 
 emu=${UKNC_EMU:-$HOME/Development/ukncbtl-debugger-src/build/release/ukncbtldebug}
 disk=${UKNC_DISK:-$root/resources/rt11os.dsk}
+rom=${UKNC_ROM:-$root/rom/uknc_rom_autoboot.bin}
 rt11dsk=${UKNC_RT11DSK:-rt11dsk}
 frames=${UKNC_FRAMES:-3000}
+bootframes=${UKNC_BOOT_FRAMES:-900}
 
-for f in "$emu" "$disk"; do
+for f in "$emu" "$disk" "$rom"; do
   if [ ! -f "$f" ]; then
     echo "uknc-run: missing $f" >&2
     exit 99
@@ -64,12 +69,6 @@ fi
 LC_ALL=$UKNC_LOCALE
 export LC_ALL
 
-rom=$(dirname "$emu")/uknc_rom.bin
-if [ ! -f "$rom" ]; then
-  echo "uknc-run: missing $rom" >&2
-  exit 99
-fi
-
 # Every run gets its own directory, so that several can go at once --
 # "make check" runs tests in parallel.  The emulator wants its ROM in the
 # current directory, hence the link.
@@ -91,17 +90,24 @@ cp "$disk" "$tmp/t.dsk"
 }
 
 # Boot the machine, type "R T" at the monitor, let it run, read the
-# screen.  The waits are in frames: enough for the boot menu, the date
-# prompt, and then the program itself.
+# screen.  The waits are in frames, 50 to the second: 900 of them to
+# reach the RT-11 prompt -- it takes about 700 and that is emulated time,
+# so it does not vary with how busy the host is -- then as long as the
+# program needs.  A disk image slower to boot than this project's own can
+# be given more through UKNC_BOOT_FRAMES; the retry below lengthens only
+# the program's share.
+#
+# Nothing is typed to get there, because ../../rom/uknc_rom_autoboot.bin
+# is the firmware with its boot menu patched out -- it goes straight to
+# the disk.  The stock firmware stops at that menu and needs "1" and
+# ENTER, and the waiting for it cost 2200 frames rather than 900; point
+# UKNC_ROM at rom/uknc_rom.bin and put those keys back if it is ever
+# wanted.
 run_emulator () {
   {
     echo "disk1 attach $tmp/t.dsk"
     echo "reset"
-    echo "cf500"
-    echo "key 1"
-    echo "cf200"
-    echo "key ENTER"
-    echo "cf1500"
+    echo "cf$bootframes"
     echo "key R"
     echo "key SPACE"
     echo "key T"
