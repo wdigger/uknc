@@ -17,7 +17,8 @@ set -e
 # time over a release tarball.
 #
 # Run it from this directory.  It leaves src/ with the clone and bin/
-# with the binary, both of which are ignored by git.
+# with the binary and the machine's firmware beside it, all of which are
+# ignored by git.
 
 BUILDDIR="${PWD}"
 
@@ -39,9 +40,8 @@ cp ${BUILDDIR}/src/build/release/ukncbtldebug ${BUILDDIR}/bin/
 
 # The emulator wants uknc_rom.bin in the current directory at run time,
 # and the DejaGnu board in ../gcc/dejagnu looks for it beside the binary
-# (see uknc-run).  It is not in the debugger's repository and not in this
-# one either -- it is the machine's own firmware -- so put a copy in bin/
-# by hand before running anything.
+# (see uknc-run), so the machine's own firmware goes in next to it.
+cp ${BUILDDIR}/../rom/uknc_rom.bin ${BUILDDIR}/bin/
+
 echo
 echo "Built ${BUILDDIR}/bin/ukncbtldebug"
-echo "Copy uknc_rom.bin into ${BUILDDIR}/bin/ before running it."
