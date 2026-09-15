@@ -12,3 +12,5 @@ example.dsk
 *.dsk
 *.ppu
 /gcc/autotools
+/debugger/bin
+/debugger/src
