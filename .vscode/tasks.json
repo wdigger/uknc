@@ -33,7 +33,10 @@
             "label": "Собрать для отладки (ELF)",
             "detail": "то же самое, но линкуется ELF — с символами и DWARF, для gdb",
             "type": "shell",
-            "command": "make $(ls *.c | head -1 | sed 's/[.]c$//').elf",
+            // Имя цели берётся из самого Makefile: в большинстве
+            // примеров это имя файла, но не во всех (ppupong собирает
+            // ping.elf).
+            "command": "make $(grep -o '^[A-Za-z0-9_]*[.]elf' Makefile | head -1)",
             "options": { "cwd": "${fileDirname}" },
             "group": "build",
             "problemMatcher": ["$gcc"]
