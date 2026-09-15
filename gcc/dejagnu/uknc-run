@@ -68,8 +68,7 @@ for f in "$emu" "$disk" "$rom"; do
 done
 
 # Every run gets its own directory and its own port, so that several can
-# go at once -- "make check" runs tests in parallel.  The emulator wants
-# its ROM in the current directory, hence the link.
+# go at once -- "make check" runs tests in parallel.
 tmp=$(mktemp -d "${TMPDIR:-/tmp}/uknc-run.XXXXXX")
 port=${UKNC_PORT:-$(( 20000 + $$ % 20000 ))}
 
@@ -88,8 +87,6 @@ if [ -n "$UKNC_KEEP" ]; then
 fi
 trap cleanup EXIT INT TERM
 
-ln -s "$rom" "$tmp/uknc_rom.bin"
-
 # RT-11 names are 6.3 and upper case, so whatever the program is called
 # here, on the disk it is T.SAV.
 cp "$prog" "$tmp/T.SAV"
@@ -102,15 +99,10 @@ cp "$disk" "$tmp/t.dsk"
 # The emulator does nothing here but attach the disk and wait for gdb:
 # booting the machine and starting the program are gdb's "run", which the
 # server carries out by resetting, waiting for RT-11 and typing "R T" --
-# so nothing has to be timed from out here.  "p" switches it to the
-# central processor, which is where programs run; the frame count bounds
-# a program that never ends.
-{
-  echo "disk1 attach $tmp/t.dsk"
-  echo "p"
-  echo "gdbserver $port $frames"
-  echo "q"
-} | (cd "$tmp" && "$emu" > emulator.log 2>&1) &
+# so nothing has to be timed from out here.  The frame count is what
+# bounds a program that never ends.
+(cd "$tmp" && "$emu" --disk1 "$tmp/t.dsk" --rom "$rom" \
+     --port "$port" --frames "$frames" > emulator.log 2>&1) &
 emupid=$!
 
 # Wait for the port, which the server says it is listening on.  This is
