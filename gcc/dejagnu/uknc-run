@@ -10,23 +10,37 @@
 #   uknc-run prog.sav; echo $?
 #
 # Nothing here is specific to the testsuite.  The program is put on a copy
-# of the RT-11 disk image under a name RT-11 will accept, the emulator is
-# told to boot and run it, and the screen is read back.  The exit status
-# comes from the marker uknc_exit.o prints (see uknc_exit.c): RT-11 itself
-# has no way to report one.  A program that never reaches _exit -- because
-# it hung, or trapped, or was too big to load -- prints no marker, and
-# this reports that as a failure.
+# of the RT-11 disk image under a name RT-11 will accept, and gdb is asked
+# to run it.
+#
+# gdb, rather than the emulator's own console: the emulator serves gdb's
+# remote protocol ("gdbserver" in ukncbtl-debugger), and driving it that
+# way is both simpler and better than the keystrokes-and-screen-reading
+# this used to do.  A program's output arrives as a byte stream instead of
+# being read back off an 80-column screen that longer output would have
+# scrolled away, and the emulator says when the program has ended --
+# .EXIT is an operating-system call and the server watches for it -- so a
+# program that finishes early ends the run early instead of sitting out a
+# fixed frame count.
+#
+# The exit status still comes from the marker uknc_exit.o prints (see
+# uknc_exit.c): RT-11 has no way to report one, and .EXIT carries nothing.
+# A program that never reaches _exit -- because it hung, or trapped, or
+# was too big to load -- prints no marker, and this reports that as a
+# failure.
 #
 # Paths can be overridden through the environment; the defaults are where
 # this project keeps things:
 #
 #   UKNC_EMU     ukncbtldebug, the console build of the emulator
+#   UKNC_GDB     pdp11-uknc-rt11-gdb
 #   UKNC_DISK    the RT-11 disk image to boot
 #   UKNC_ROM     the firmware; the default one boots without being asked
 #   UKNC_RT11DSK rt11dsk, which writes a file into that image
-#   UKNC_FRAMES  how long to wait for the program, in emulated frames
-#                (50 = one second)
-#   UKNC_BOOT_FRAMES  how long to wait for RT-11 to come up, same units
+#   UKNC_FRAMES  how long to let a program run before calling it hung, in
+#                emulated frames (50 = one second)
+#   UKNC_PORT    the port to serve gdb on; one is derived per run so that
+#                several can go at once
 
 set -e
 
@@ -39,12 +53,12 @@ fi
 here=$(cd "$(dirname "$0")" && pwd)
 root=$(cd "$here/../.." && pwd)
 
-emu=${UKNC_EMU:-$HOME/Development/ukncbtl-debugger-src/build/release/ukncbtldebug}
+emu=${UKNC_EMU:-$root/debugger/bin/ukncbtldebug}
+gdb=${UKNC_GDB:-pdp11-uknc-rt11-gdb}
 disk=${UKNC_DISK:-$root/resources/rt11os.dsk}
 rom=${UKNC_ROM:-$root/rom/uknc_rom_autoboot.bin}
 rt11dsk=${UKNC_RT11DSK:-rt11dsk}
 frames=${UKNC_FRAMES:-3000}
-bootframes=${UKNC_BOOT_FRAMES:-900}
 
 for f in "$emu" "$disk" "$rom"; do
   if [ ! -f "$f" ]; then
@@ -53,31 +67,27 @@ for f in "$emu" "$disk" "$rom"; do
   fi
 done
 
-# The emulator prints the screen through a wide character stream, which
-# gives up without a word if the locale cannot represent what is on it --
-# and RT-11 puts Cyrillic there.  Test harnesses run in the C locale, so
-# choose a UTF-8 one here rather than lose the output.
-if [ -z "$UKNC_LOCALE" ]; then
-  for l in en_US.UTF-8 C.UTF-8 UTF-8; do
-    if locale -a 2>/dev/null | grep -q -x "$l"; then
-      UKNC_LOCALE=$l
-      break
-    fi
-  done
-  UKNC_LOCALE=${UKNC_LOCALE:-en_US.UTF-8}
-fi
-LC_ALL=$UKNC_LOCALE
-export LC_ALL
-
-# Every run gets its own directory, so that several can go at once --
-# "make check" runs tests in parallel.  The emulator wants its ROM in the
-# current directory, hence the link.
+# Every run gets its own directory and its own port, so that several can
+# go at once -- "make check" runs tests in parallel.  The emulator wants
+# its ROM in the current directory, hence the link.
 tmp=$(mktemp -d "${TMPDIR:-/tmp}/uknc-run.XXXXXX")
+port=${UKNC_PORT:-$(( 20000 + $$ % 20000 ))}
+
+emupid=
+cleanup () {
+  if [ -n "$emupid" ]; then
+    kill "$emupid" 2>/dev/null || true
+  fi
+  if [ -z "$UKNC_KEEP" ]; then
+    rm -rf "$tmp"
+  fi
+  return 0
+}
 if [ -n "$UKNC_KEEP" ]; then
   echo "uknc-run: keeping $tmp" >&2
-else
-  trap 'rm -rf "$tmp"' EXIT INT TERM
 fi
+trap cleanup EXIT INT TERM
+
 ln -s "$rom" "$tmp/uknc_rom.bin"
 
 # RT-11 names are 6.3 and upper case, so whatever the program is called
@@ -89,66 +99,77 @@ cp "$disk" "$tmp/t.dsk"
   exit 99
 }
 
-# Boot the machine, type "R T" at the monitor, let it run, read the
-# screen.  The waits are in frames, 50 to the second: 900 of them to
-# reach the RT-11 prompt -- it takes about 700 and that is emulated time,
-# so it does not vary with how busy the host is -- then as long as the
-# program needs.  A disk image slower to boot than this project's own can
-# be given more through UKNC_BOOT_FRAMES; the retry below lengthens only
-# the program's share.
-#
-# Nothing is typed to get there, because ../../rom/uknc_rom_autoboot.bin
-# is the firmware with its boot menu patched out -- it goes straight to
-# the disk.  The stock firmware stops at that menu and needs "1" and
-# ENTER, and the waiting for it cost 2200 frames rather than 900; point
-# UKNC_ROM at rom/uknc_rom.bin and put those keys back if it is ever
-# wanted.
-run_emulator () {
-  {
-    echo "disk1 attach $tmp/t.dsk"
-    echo "reset"
-    echo "cf$bootframes"
-    echo "key R"
-    echo "key SPACE"
-    echo "key T"
-    echo "key ENTER"
-    echo "cf$1"
-    echo "screentext"
-    echo "q"
-  } | (cd "$tmp" && "$emu" > screen.txt 2>&1) || true
+# The emulator does nothing here but attach the disk and wait for gdb:
+# booting the machine and starting the program are gdb's "run", which the
+# server carries out by resetting, waiting for RT-11 and typing "R T" --
+# so nothing has to be timed from out here.  "p" switches it to the
+# central processor, which is where programs run; the frame count bounds
+# a program that never ends.
+{
+  echo "disk1 attach $tmp/t.dsk"
+  echo "p"
+  echo "gdbserver $port $frames"
+  echo "q"
+} | (cd "$tmp" && "$emu" > emulator.log 2>&1) &
+emupid=$!
 
-  [ -f "$tmp/screen.txt" ] || {
-    echo "uknc-run: the emulator produced nothing" >&2
+# Wait for the port, which the server says it is listening on.  This is
+# quick -- nothing is booted yet -- but not instant.
+waited=0
+until grep -q "Listening on localhost:$port" "$tmp/emulator.log" 2>/dev/null; do
+  waited=$((waited + 1))
+  if [ "$waited" -gt 200 ]; then
+    echo "uknc-run: the emulator never started serving gdb" >&2
     exit 99
-  }
+  fi
+  sleep 0.05 2>/dev/null || sleep 1
+done
 
-  # The screen comes back padded out to its full width, so trim first.
-  sed 's/[[:space:]]*$//' "$tmp/screen.txt" > "$screen"
-  grep -q "^\*\*\* EXIT code " "$screen"
-}
+# gdb prints its own messages to stdout and the program's output to
+# stderr, so the two come back separately and neither has to be picked
+# out of the other.
+"$gdb" -batch -nx \
+  -ex "set confirm off" \
+  -ex "target extended-remote :$port" \
+  -ex "set remote exec-file T" \
+  -ex "run" \
+  > "$tmp/gdb.txt" 2> "$tmp/target.txt" || true
 
-screen=$tmp/clean.txt
+# Except for one thing: gdb warns, more than once, that it has no
+# executable to go with the process -- true, since what is being run is a
+# .sav and gdb reads ELF.  That is a warning about gdb's own knowledge,
+# not about the run, and it is the only thing on that stream which is not
+# the program's own output.
+# The carriage returns go with them: RT-11's console convention is CR LF
+# and newlib writes both, but this is handing back text, not driving a
+# terminal.  tr rather than sed, whose \r means a literal r in more than
+# one of the seds this might run under.
+tr -d '\r' < "$tmp/target.txt" |
+  sed -e '/^warning: No executable has been specified/d' \
+      -e '/^determining executable automatically/d' > "$tmp/stream.txt"
 
-# Emulated time is not free -- every frame asked for is a frame run, even
-# after the program has finished -- so ask for a modest amount first and
-# only give a program that has not finished a longer second try.  That way
-# the common case stays fast and a slow program still gets its answer;
-# only a real hang pays for both.
-if ! run_emulator "$frames"; then
-  run_emulator "$((frames * 4))" || true
+# And stop at the marker: what the machine prints after a program ends is
+# the monitor's prompt, not the program's output.  Everything up to and
+# including the marker, since that line is how DejaGnu reads the status
+# and it strips it back out itself.
+if grep -q '^\*\*\* EXIT code ' "$tmp/stream.txt"; then
+  sed -n '1,/^\*\*\* EXIT code /p' "$tmp/stream.txt" > "$tmp/output.txt"
+else
+  cp "$tmp/stream.txt" "$tmp/output.txt"
 fi
 
-# What the program printed is between the command that started it and the
-# marker, and the marker goes out with it: that line is how DejaGnu reads
-# the status, and it strips it back out itself.
-sed -n '/^\.R T$/,/^\*\*\* EXIT code /p' "$screen" | sed '1d'
+cat "$tmp/output.txt"
 
-status=$(sed -n 's/^\*\*\* EXIT code \([0-9][0-9]*\).*/\1/p' "$screen" | tail -1)
+status=$(sed -n 's/^\*\*\* EXIT code \([0-9][0-9]*\).*/\1/p' "$tmp/output.txt" | tail -1)
 if [ -z "$status" ]; then
-  # No marker: the program never reached _exit.  Say why if the monitor
-  # did, since "too big to load" and "trapped" look alike from here.
-  reason=$(grep -m1 -E "KMON-F|CТOП|Illegal|Trap" "$screen" || true)
-  [ -n "$reason" ] && echo "uknc-run: $reason" >&2
+  # No marker: the program never reached _exit.  Say why if there is
+  # anything to say -- a hang, a trap and "too big to load" look alike
+  # from here, and between the two streams some of them are told apart.
+  reason=$(grep -m1 -h -E "KMON-F|CТOП|signal" \
+           "$tmp/stream.txt" "$tmp/gdb.txt" 2>/dev/null || true)
+  if [ -n "$reason" ]; then
+    echo "uknc-run: $reason" >&2
+  fi
   echo "uknc-run: no exit marker, the program did not finish" >&2
   exit 98
 fi
