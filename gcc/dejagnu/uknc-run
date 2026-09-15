@@ -131,14 +131,21 @@ done
 # executable to go with the process -- true, since what is being run is a
 # .sav and gdb reads ELF.  That is a warning about gdb's own knowledge,
 # not about the run, and it is the only thing on that stream which is not
-# the program's own output.
+# the program's own output.  It is cut out wherever it appears, not only
+# at the start of a line: the program's last line often has no newline of
+# its own, and then the warning lands on the end of it.
 # The carriage returns go with them: RT-11's console convention is CR LF
 # and newlib writes both, but this is handing back text, not driving a
 # terminal.  tr rather than sed, whose \r means a literal r in more than
 # one of the seds this might run under.
+# The escape sequences go too: RT-11 clears to end of line as it prints
+# its prompt, and this is handing back text rather than driving a
+# terminal.
 tr -d '\r' < "$tmp/target.txt" |
-  sed -e '/^warning: No executable has been specified/d' \
-      -e '/^determining executable automatically/d' > "$tmp/stream.txt"
+  sed -e 's/warning: No executable has been specified and target does not support//' \
+      -e '/^determining executable automatically/d' \
+      -e 's/'"$(printf '\033')"'\[[0-9;]*[A-Za-z]//g' \
+      -e 's/'"$(printf '\033')"'[A-Za-z]//g' > "$tmp/stream.txt"
 
 # And stop at the marker: what the machine prints after a program ends is
 # the monitor's prompt, not the program's output.  Everything up to and
@@ -147,16 +154,31 @@ tr -d '\r' < "$tmp/target.txt" |
 if grep -q '^\*\*\* EXIT code ' "$tmp/stream.txt"; then
   sed -n '1,/^\*\*\* EXIT code /p' "$tmp/stream.txt" > "$tmp/output.txt"
 else
-  cp "$tmp/stream.txt" "$tmp/output.txt"
+  # Without a marker there is no such line to stop at, so instead drop
+  # what the monitor prints once it has the machine back: its prompt,
+  # and the blank lines around it.
+  awk '{ line[NR] = $0 }
+       END {
+         last = NR
+         while (last > 0 && line[last] ~ /^[. \t]*$/) last--
+         for (i = 1; i <= last; i++) print line[i]
+       }' "$tmp/stream.txt" > "$tmp/output.txt"
 fi
 
 cat "$tmp/output.txt"
 
 status=$(sed -n 's/^\*\*\* EXIT code \([0-9][0-9]*\).*/\1/p' "$tmp/output.txt" | tail -1)
 if [ -z "$status" ]; then
-  # No marker: the program never reached _exit.  Say why if there is
-  # anything to say -- a hang, a trap and "too big to load" look alike
-  # from here, and between the two streams some of them are told apart.
+  # No marker.  That means one of two quite different things, and gdb
+  # can tell them apart: a program linked without uknc_exit.o simply has
+  # no way to report a status, and one that hung or trapped never got
+  # that far.  gdb says "exited normally" only in the first case.
+  if grep -q "exited normally" "$tmp/gdb.txt"; then
+    exit 0
+  fi
+
+  # A hang, a trap and "too big to load" look alike from here; between
+  # the two streams some of them are told apart.
   reason=$(grep -m1 -h -E "KMON-F|CТOП|signal" \
            "$tmp/stream.txt" "$tmp/gdb.txt" 2>/dev/null || true)
   if [ -n "$reason" ]; then
