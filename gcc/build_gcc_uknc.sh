@@ -9,6 +9,9 @@ set -e
 #   gcc       wdigger/gcc           topic/1801bm1-gcc15.2
 #   newlib    wdigger/sourceware-…  rt11-port
 #
+# and gdb, which has no release of its own to patch and so is built from
+# that same binutils branch, cloned.
+#
 # Objects are ELF.  They were a.out until 2026-09-14, which is why the
 # patch lists below have a second half: a.out has three sections and no
 # way to name a fourth, so -ffunction-sections was refused outright,
@@ -101,6 +104,45 @@ cd build/binutils
 # A cross binutils does not enable it on its own.
 ${BUILDDIR}/src/binutils-${BINUTILS_VERSION}/configure --prefix "${BUILDDIR}/xgcc" --bindir "${BUILDDIR}/bin" --target pdp11-uknc-rt11 --enable-plugins --disable-libstdcxx --disable-doc --with-system-zlib
 make -j4 MAKEINFO=true && make install MAKEINFO=true
+
+# Clone and build gdb
+#
+# gdb is not in the binutils release tarball -- it shares a repository
+# with binutils but not a release -- and its pdp11 support is this
+# project's own (gdb/pdp11-tdep.c, on the same fork branch as the
+# binutils patches above).  So this one comes from the branch directly
+# rather than as a patch over a tarball: the branch already has the bfd
+# side of the ELF work applied, and applying it twice to a second
+# tarball would be the only alternative.  The clone is about 600MB.
+#
+# Everything but gdb is switched off here; binutils, gas and ld are the
+# ones built above, from the release.
+cd ${BUILDDIR}
+git clone --depth 1 --single-branch --branch topic/rt11-sav-pdp11 https://github.com/wdigger/binutils-gdb.git ${BUILDDIR}/src/gdb
+
+# gdb, alone among these, wants GMP and MPFR at build time -- it does
+# target arithmetic with them.  Its configure looks where the compiler
+# looks, so a package manager that installs outside that has to be
+# pointed at; on a distribution that puts them in /usr this loop finds
+# nothing and there is nothing to point at.
+GDB_MATH=""
+for prefix in /opt/local /opt/homebrew /usr/local; do
+	if [ -f "${prefix}/include/gmp.h" ] && [ -f "${prefix}/include/mpfr.h" ]; then
+		GDB_MATH="--with-gmp=${prefix} --with-mpfr=${prefix}"
+		break
+	fi
+done
+
+mkdir -p ${BUILDDIR}/build/gdb
+cd ${BUILDDIR}/build/gdb
+# CC/CXX are pinned to the platform's own cc/c++ rather than left to
+# configure, which prefers gcc/g++ wherever it finds them.  On macOS
+# with MacPorts gcc installed that pairs a GCC front end with Apple's
+# linker, and gdb is the one thing here that trips it: the link of the
+# Fortran expression parser fails with "invalid r_symbolnum ... in
+# f-exp.o".  On Linux cc and c++ are gcc and g++ anyway.
+CC="${CC:-cc}" CXX="${CXX:-c++}" ${BUILDDIR}/src/gdb/configure --prefix "${BUILDDIR}/xgcc" --bindir "${BUILDDIR}/bin" --target pdp11-uknc-rt11 --disable-binutils --disable-gas --disable-ld --disable-gold --disable-gprof --disable-gprofng --disable-sim --disable-nls --disable-werror --disable-doc --with-system-zlib ${GDB_MATH}
+make all-gdb -j4 MAKEINFO=true && make install-gdb MAKEINFO=true
 
 # Download and patch gcc
 cd ${BUILDDIR}
