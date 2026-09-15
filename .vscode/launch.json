@@ -1,0 +1,102 @@
+{
+    // Отладка на эмулируемой машине.
+    //
+    // Расширение ms-vscode.cpptools ведёт сеанс через pdp11-uknc-rt11-gdb,
+    // а машину поднимает само: debugServerPath запускает ukncbtldebug,
+    // serverStarted ждёт строку, которую тот печатает, когда открыл порт.
+    //
+    // Программа попадает в машину командой load — gdb пишет её прямо в
+    // память и выставляет точку входа. Поэтому образ диска нужен только
+    // чтобы загрузилась RT-11 (ключ --boot), а класть туда программу не
+    // надо: правка, F5 — и уже выполняется новый код.
+    //
+    // Отлаживается ELF (цель «Собрать для отладки»), а не .sav: символы и
+    // DWARF плоскому образу хранить негде. Код в них один и тот же.
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "УКНЦ: отладить открытый пример",
+            "type": "cppdbg",
+            "request": "launch",
+            "preLaunchTask": "Собрать для отладки (ELF)",
+
+            // Имя ELF берётся от открытого файла: hello.c -> hello.elf.
+            // В examples/ppupong программа называется иначе (ping.elf) --
+            // для таких пропишите путь целиком, как в конфигурации ниже.
+            "program": "${fileDirname}/${fileBasenameNoExtension}.elf",
+            "cwd": "${fileDirname}",
+
+            "MIMode": "gdb",
+            "miDebuggerPath": "${workspaceFolder}/gcc/bin/pdp11-uknc-rt11-gdb",
+            "miDebuggerServerAddress": "localhost:2345",
+
+            "debugServerPath": "${workspaceFolder}/debugger/bin/ukncbtldebug",
+            "debugServerArgs": "--disk1 ${workspaceFolder}/resources/rt11os.dsk --rom ${workspaceFolder}/rom/uknc_rom_autoboot.bin --boot --port 2345",
+            "serverStarted": "Listening on localhost",
+            "filterStdout": true,
+            "filterStderr": true,
+
+            // Подключились -- значит машина уже с загруженной RT-11;
+            // остаётся положить в неё программу.
+            "postRemoteConnectCommands": [
+                {
+                    "text": "-target-download",
+                    "description": "загрузить программу в память машины",
+                    "ignoreFailures": false
+                }
+            ],
+
+            // load оставляет счётчик команд на точке входа, так что дальше
+            // просто продолжить -- до первой точки останова или до конца.
+            "launchCompleteCommand": "exec-continue",
+
+            "externalConsole": false,
+            "internalConsoleOptions": "openOnSessionStart"
+        },
+
+        {
+            "name": "УКНЦ: отладить examples/hello",
+            "type": "cppdbg",
+            "request": "launch",
+            "program": "${workspaceFolder}/examples/hello/hello.elf",
+            "cwd": "${workspaceFolder}/examples/hello",
+
+            "MIMode": "gdb",
+            "miDebuggerPath": "${workspaceFolder}/gcc/bin/pdp11-uknc-rt11-gdb",
+            "miDebuggerServerAddress": "localhost:2345",
+
+            "debugServerPath": "${workspaceFolder}/debugger/bin/ukncbtldebug",
+            "debugServerArgs": "--disk1 ${workspaceFolder}/resources/rt11os.dsk --rom ${workspaceFolder}/rom/uknc_rom_autoboot.bin --boot --port 2345",
+            "serverStarted": "Listening on localhost",
+            "filterStdout": true,
+            "filterStderr": true,
+
+            "postRemoteConnectCommands": [
+                { "text": "-target-download", "description": "загрузить программу в память машины" }
+            ],
+            "launchCompleteCommand": "exec-continue",
+            "externalConsole": false
+        },
+
+        {
+            // Когда машину подняли сами:
+            //   ukncbtldebug --disk1 resources/rt11os.dsk \
+            //                --rom rom/uknc_rom_autoboot.bin --boot
+            "name": "УКНЦ: подключиться к запущенному эмулятору",
+            "type": "cppdbg",
+            "request": "launch",
+            "program": "${fileDirname}/${fileBasenameNoExtension}.elf",
+            "cwd": "${fileDirname}",
+
+            "MIMode": "gdb",
+            "miDebuggerPath": "${workspaceFolder}/gcc/bin/pdp11-uknc-rt11-gdb",
+            "miDebuggerServerAddress": "localhost:2345",
+
+            "postRemoteConnectCommands": [
+                { "text": "-target-download", "description": "загрузить программу в память машины" }
+            ],
+            "launchCompleteCommand": "exec-continue",
+            "externalConsole": false
+        }
+    ]
+}

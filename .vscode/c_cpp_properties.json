@@ -1,0 +1,32 @@
+{
+    // IntelliSense для кросс-цели: compilerPath указывает на сам
+    // компилятор, и расширение спрашивает у него и заголовки, и
+    // определения -- включая __SIZEOF_INT__ 2 и __SIZEOF_POINTER__ 2,
+    // из-за которых здесь всё и не так, как на настольной машине.
+    //
+    // Режим intelliSenseMode списка с pdp11 не содержит -- такой цели у
+    // расширения нет. Указан ближайший по смыслу 32-битный gcc; на
+    // разбор кода это не влияет, но подсказка sizeof может показать
+    // размер не той машины. Настоящий ответ всегда у компилятора.
+    "version": 4,
+    "configurations": [
+        {
+            "name": "pdp11-uknc-rt11",
+            "compilerPath": "${workspaceFolder}/gcc/bin/pdp11-uknc-rt11-gcc",
+            "compilerArgs": ["-std=gnu23"],
+            "cStandard": "gnu23",
+            "intelliSenseMode": "gcc-x86",
+            "includePath": [
+                "${workspaceFolder}/**",
+                "${workspaceFolder}/gcc/xgcc/pdp11-uknc-rt11/include"
+            ],
+            "browse": {
+                "path": [
+                    "${workspaceFolder}",
+                    "${workspaceFolder}/gcc/xgcc/pdp11-uknc-rt11/include"
+                ],
+                "limitSymbolsToIncludedHeaders": true
+            }
+        }
+    ]
+}

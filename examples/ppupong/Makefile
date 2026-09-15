@@ -7,7 +7,7 @@ OPT_FLAG:=-O2
 # can drop the ones nothing reaches.  Only the ELF toolchain can do
 # this; the older a.out one warns that it cannot and carries on.
 SECTION_FLAGS:=-ffunction-sections -fdata-sections
-GCC_FLAGS:=-std=gnu23 -fomit-frame-pointer $(OPT_FLAG) $(SECTION_FLAGS)
+GCC_FLAGS:=-std=gnu23 -fomit-frame-pointer $(OPT_FLAG) $(SECTION_FLAGS) -g
 LD_FLAGS:=-Wl,--gc-sections
 
 all:	ppupong.dsk
@@ -31,6 +31,12 @@ ppupongppu.o:	ppupongppu.c
 # the CPU side) are shortened, not the host-side source filenames.
 ping.sav:	$(OBJS)
 	${CC} ${LD_FLAGS} -Wl,-Map=$@.map -o $@ $(OBJS) -lppu
+
+# The same program linked as ELF instead of a flat image: same
+# objects, same addresses, but with the symbols and DWARF that a
+# .sav has nowhere to keep.  This is what gdb reads.
+ping.elf:	$(OBJS)
+	${CC} ${LD_FLAGS} -Wl,-m,pdp11rt11 -o $@ $(OBJS) -lppu
 
 pong.ppu:	ppupongppu.o
 	${LDPPU} -Map=$@.map -o $@ ppupongppu.o

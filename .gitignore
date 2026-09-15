@@ -6,6 +6,7 @@
 *.o
 *.lda
 *.sav
+*.elf
 *.map
 example.dsk
 *.a

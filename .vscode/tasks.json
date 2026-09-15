@@ -1,0 +1,75 @@
+{
+    // Сборка примеров и тестов. Задачи работают с той папкой, в которой
+    // лежит открытый файл, поэтому отдельной задачи на каждый пример не
+    // нужно: откройте examples/hello/hello.c и запустите сборку.
+    "version": "2.0.0",
+
+    "options": {
+        // Тулчейн собирается скриптом в gcc/ и никуда не ставится, так
+        // что его bin надо добавить в PATH. Там же rt11dsk.
+        "env": {
+            "PATH": "${workspaceFolder}/gcc/bin:${env:PATH}"
+        }
+    },
+
+    // Ошибки и предупреждения компилятора — в панель Problems. Формат
+    // у кросс-gcc обычный, отличается только имя программы.
+    "presentation": {
+        "reveal": "silent",
+        "clear": true
+    },
+
+    "tasks": [
+        {
+            "label": "Собрать (образ диска)",
+            "detail": "make в папке открытого файла: .sav и .dsk",
+            "type": "shell",
+            "command": "make",
+            "options": { "cwd": "${fileDirname}" },
+            "group": { "kind": "build", "isDefault": true },
+            "problemMatcher": ["$gcc"]
+        },
+        {
+            "label": "Собрать для отладки (ELF)",
+            "detail": "то же самое, но линкуется ELF — с символами и DWARF, для gdb",
+            "type": "shell",
+            "command": "make $(ls *.c | head -1 | sed 's/[.]c$//').elf",
+            "options": { "cwd": "${fileDirname}" },
+            "group": "build",
+            "problemMatcher": ["$gcc"]
+        },
+        {
+            "label": "Запустить на машине",
+            "detail": "собрать и прогнать через uknc-run, вывод сюда",
+            "type": "shell",
+            "command": "make && ${workspaceFolder}/gcc/dejagnu/uknc-run $(ls *.sav | head -1)",
+            "options": { "cwd": "${fileDirname}" },
+            "group": "test",
+            "presentation": { "reveal": "always", "clear": true },
+            "problemMatcher": ["$gcc"]
+        },
+        {
+            "label": "Очистить",
+            "type": "shell",
+            "command": "make clean",
+            "options": { "cwd": "${fileDirname}" },
+            "problemMatcher": []
+        },
+        {
+            "label": "Собрать тулчейн",
+            "detail": "с нуля: binutils, gdb, gcc, newlib — это надолго",
+            "type": "shell",
+            "command": "sh ./build_gcc_uknc.sh",
+            "options": { "cwd": "${workspaceFolder}/gcc" },
+            "problemMatcher": []
+        },
+        {
+            "label": "Собрать эмулятор",
+            "detail": "выкачивает ветку gdbserver и собирает ukncbtldebug",
+            "type": "shell",
+            "command": "sh ./build_debugger_uknc.sh",
+            "options": { "cwd": "${workspaceFolder}/debugger" },
+            "problemMatcher": []
+        }
+    ]
+}

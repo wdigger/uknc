@@ -7,7 +7,7 @@ OPT_FLAG:=-O2
 # can drop the ones nothing reaches.  Only the ELF toolchain can do
 # this; the older a.out one warns that it cannot and carries on.
 SECTION_FLAGS:=-ffunction-sections -fdata-sections
-GCC_FLAGS:=-std=gnu23 -fomit-frame-pointer $(OPT_FLAG) $(SECTION_FLAGS)
+GCC_FLAGS:=-std=gnu23 -fomit-frame-pointer $(OPT_FLAG) $(SECTION_FLAGS) -g
 LD_FLAGS:=-Wl,--gc-sections
 # pdp11-uknc-rt11-ld-ppu (unlike pdp11-uknc-rt11-gcc on the CPU side)
 # invokes the raw linker directly, so it never gets GCC's own default
@@ -37,6 +37,12 @@ gfourppu.o:	gfourppu.c
 # shortened, not the host-side source filenames.
 gfour.sav:	$(OBJS)
 	${CC} ${LD_FLAGS} -Wl,-Map=$@.map -o $@ $(OBJS) -lppu -lpdp11
+
+# The same program linked as ELF instead of a flat image: same
+# objects, same addresses, but with the symbols and DWARF that a
+# .sav has nowhere to keep.  This is what gdb reads.
+gfour.elf:	$(OBJS)
+	${CC} ${LD_FLAGS} -Wl,-m,pdp11rt11 -o $@ $(OBJS) -lppu -lpdp11
 
 gfppu.ppu:	gfourppu.o
 	${LDPPU} -Map=$@.map -o $@ gfourppu.o -L${SYSROOT}/lib -lpdp11

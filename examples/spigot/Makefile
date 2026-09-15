@@ -7,7 +7,7 @@ OPT_FLAG:=-O2
 # can drop the ones nothing reaches.  Only the ELF toolchain can do
 # this; the older a.out one warns that it cannot and carries on.
 SECTION_FLAGS:=-ffunction-sections -fdata-sections
-GCC_FLAGS:=-std=gnu23 -fomit-frame-pointer $(OPT_FLAG) $(SECTION_FLAGS)
+GCC_FLAGS:=-std=gnu23 -fomit-frame-pointer $(OPT_FLAG) $(SECTION_FLAGS) -g
 LD_FLAGS:=-Wl,--gc-sections -Wl,-Map=spigot.sav.map
 
 all:	spigot.dsk
@@ -18,10 +18,16 @@ all:	spigot.dsk
 spigot.sav:	$(OBJS)
 	${CC} ${GCC_FLAGS} ${LD_FLAGS} -o $@ $(OBJS)
 
+# The same program linked as ELF instead of a flat image: same
+# objects, same addresses, but with the symbols and DWARF that a
+# .sav has nowhere to keep.  This is what gdb reads.
+spigot.elf:	$(OBJS)
+	${CC} ${GCC_FLAGS} ${LD_FLAGS} -Wl,-m,pdp11rt11 -o $@ $(OBJS)
+
 spigot.dsk:	spigot.sav
 	rm -f spigot.dsk
 	cp ../../resources/rt11os.dsk spigot.dsk
 	rt11dsk a spigot.dsk spigot.sav
 
 clean:
-	@-rm *.o *.dsk *.sav.map *.sav
+	@-rm *.o *.dsk *.sav.map *.sav *.elf

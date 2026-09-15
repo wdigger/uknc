@@ -7,7 +7,7 @@ OPT_FLAG:=-Os
 # can drop the ones nothing reaches.  Only the ELF toolchain can do
 # this; the older a.out one warns that it cannot and carries on.
 SECTION_FLAGS:=-ffunction-sections -fdata-sections
-GCC_FLAGS:=-std=gnu23 -fomit-frame-pointer $(OPT_FLAG) $(SECTION_FLAGS)
+GCC_FLAGS:=-std=gnu23 -fomit-frame-pointer $(OPT_FLAG) $(SECTION_FLAGS) -g
 LD_FLAGS:=-Wl,--gc-sections
 SYSROOT:=../../gcc/xgcc/pdp11-uknc-rt11
 
@@ -31,6 +31,12 @@ sinppu.o:	../gfour/gfourppu.c
 
 sin.sav:	$(OBJS)
 	${CC} ${LD_FLAGS} -Wl,-Map=$@.map -o $@ $(OBJS) -lppu -lpdp11 -lm
+
+# The same program linked as ELF instead of a flat image: same
+# objects, same addresses, but with the symbols and DWARF that a
+# .sav has nowhere to keep.  This is what gdb reads.
+sin.elf:	$(OBJS)
+	${CC} ${LD_FLAGS} -Wl,-m,pdp11rt11 -o $@ $(OBJS) -lppu -lpdp11 -lm
 
 sinppu.ppu:	sinppu.o
 	${LDPPU} -Map=$@.map -o $@ sinppu.o -L${SYSROOT}/lib -lpdp11
