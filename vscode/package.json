@@ -1,0 +1,96 @@
+{
+    "name": "uknc",
+    "displayName": "УКНЦ",
+    "description": "Сборка, запуск и отладка программ для Электроники МС 0511 (УКНЦ)",
+    "version": "0.1.0",
+    "publisher": "wdigger",
+    "license": "MIT",
+    "engines": {
+        "vscode": "^1.75.0"
+    },
+    "categories": [
+        "Debuggers",
+        "Programming Languages"
+    ],
+    "main": "./extension.js",
+    "extensionDependencies": [
+        "ms-vscode.cpptools",
+        "ms-vscode.makefile-tools"
+    ],
+    "activationEvents": [
+        "onStartupFinished"
+    ],
+    "contributes": {
+        "configuration": {
+            "title": "УКНЦ",
+            "properties": {
+                "uknc.toolchainPath": {
+                    "type": "string",
+                    "default": "",
+                    "description": "Папка тулчейна УКНЦ. Пусто — искать самому: сначала выше папки проекта, потом по PATH, потом там, откуда расширение было собрано."
+                }
+            }
+        },
+        "debuggers": [
+            {
+                "type": "uknc",
+                "label": "УКНЦ",
+                "languages": [
+                    "c"
+                ],
+                "configurationAttributes": {
+                    "launch": {
+                        "properties": {
+                            "program": {
+                                "type": "string",
+                                "description": "ELF для отладки. Пусто — <имя папки>.elf рядом с открытым файлом."
+                            },
+                            "cwd": {
+                                "type": "string",
+                                "description": "Рабочая папка. Пусто — папка программы."
+                            }
+                        }
+                    }
+                },
+                "initialConfigurations": [
+                    {
+                        "type": "uknc",
+                        "request": "launch",
+                        "name": "УКНЦ"
+                    }
+                ],
+                "configurationSnippets": [
+                    {
+                        "label": "УКНЦ: отладить программу",
+                        "description": "Поднять машину, загрузить программу и остановиться на первой точке останова",
+                        "body": {
+                            "type": "uknc",
+                            "request": "launch",
+                            "name": "УКНЦ"
+                        }
+                    }
+                ]
+            }
+        ],
+        "commands": [
+            {
+                "command": "uknc.run",
+                "title": "Запустить на машине",
+                "category": "УКНЦ"
+            },
+            {
+                "command": "uknc.newProject",
+                "title": "Создать проект (Makefile)",
+                "category": "УКНЦ"
+            },
+            {
+                "command": "uknc.showToolchain",
+                "title": "Показать, где найден тулчейн",
+                "category": "УКНЦ"
+            }
+        ],
+        "configurationDefaults": {
+            "C_Cpp.default.configurationProvider": "ms-vscode.makefile-tools"
+        }
+    }
+}
