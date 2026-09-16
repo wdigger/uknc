@@ -18,6 +18,20 @@
 # project's real pdp11-uknc-rt11-ld is normally invoked for anything
 # CPU-side.
 #
+# With --elf first, the same objects are linked as an ELF executable
+# instead of an RT-11 object module:
+#
+#   pdp11-uknc-rt11-ld-ppu --elf -o myprogram.ppu.elf myprogram.o
+#
+# Same code, same layout, but with the symbols and DWARF a .PPU has
+# nowhere to keep -- this is what gdb reads to debug PPU code (see
+# ppu.gdb, and ppuc_code_base in ppu_client.h).  It is linked at
+# address 0, since where the module ends up is only known once it is
+# loaded; ppu.gdb's ppu-symbols command supplies that address as the
+# offset.  Nothing runs this file, so -r is dropped and the program's
+# own entry point named instead, to keep --gc-sections (if asked for)
+# from starting at nothing.
+#
 # Installed alongside the real pdp11-uknc-rt11-ld (see
 # ../../gcc/build_gcc_uknc.sh) -- its own directory is how this script
 # finds both that binary and the sysroot (a fixed sibling of it, per
@@ -39,7 +53,17 @@ case $(basename -- "${script_dir}") in
 esac
 sysroot="${script_dir}/../xgcc${variant}/pdp11-uknc-rt11"
 
+# The two differ only in the format and in -r; the script, the entry
+# point and the libraries are a PPU program's own and the same either
+# way.
+if [ "$1" = "--elf" ]; then
+    shift
+    set -- -m pdp11rt11 -e start "$@"
+else
+    set -- -r -m pdp11rt11rel "$@"
+fi
+
 exec "${script_dir}/pdp11-uknc-rt11-ld" \
-    -r -m pdp11rt11rel -T "${sysroot}/lib/ppu.ld" -u start \
+    -T "${sysroot}/lib/ppu.ld" -u start \
     "$@" \
     -L"${sysroot}/lib" -lppu

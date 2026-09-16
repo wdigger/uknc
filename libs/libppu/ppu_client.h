@@ -46,6 +46,16 @@ int ppuc_free(unsigned short ppu_addr);
 //   EIO  the PPU did not accept the run request
 int ppuc_run(unsigned short ppu_addr);
 
+// The address the last ppuc_run() started code at -- zero until the
+// first one succeeds. Nothing in libppu reads this; it is here for the
+// debugger, which has no other way to learn where a module ended up.
+// gdb cannot take symbols from the .PPU module itself (it is an RT-11
+// object module, and gdb reads ELF), so the same objects are linked a
+// second time as ELF -- see pdp11-uknc-rt11-ld-ppu --elf -- and that
+// file's symbols are placed over the running code with this address as
+// the offset. ppu.gdb's own ppu-symbols command does exactly that.
+extern unsigned short ppuc_code_base;
+
 // Allocates size bytes of PPU memory (see ppuc_alloc()) and copies buf
 // into it unmodified -- for code that's already position-independent
 // and needs no relocation; see ppuc_load_reloc() otherwise.

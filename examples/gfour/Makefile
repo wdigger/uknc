@@ -28,7 +28,7 @@ all:	gfour.dsk
 # ceiling independent of the PPU's own (much roomier) free memory --
 # see the note in ../../libs/libppu/ppuc_load_code.c.
 gfourppu.o:	gfourppu.c
-	${CC} -std=gnu23 -fomit-frame-pointer -Os -c -o $@ $<
+	${CC} -std=gnu23 -fomit-frame-pointer -Os -g -c -o $@ $<
 
 # GFOUR.SAV/GFPPU.PPU, not gfour.sav/gfourppu.ppu: RT-11 filenames are
 # limited to 6.3 characters -- "gfourppu" is two characters too long --
@@ -41,11 +41,27 @@ gfour.sav:	$(OBJS)
 # The same program linked as ELF instead of a flat image: same
 # objects, same addresses, but with the symbols and DWARF that a
 # .sav has nowhere to keep.  This is what gdb reads.
-gfour.elf:	$(OBJS)
+#
+# gfppu.ppu.elf comes with it: debugging the CPU side is when the PPU
+# side's symbols are wanted, and that is the only moment anything asks
+# for this target by name (the editor's own F5 builds <name>.elf).
+#
+# The disk image with it: F5 in the editor builds this target, and a
+# program whose PPU module is read from a file needs that file on the
+# disk it boots from (the program itself is put into memory by gdb).
+gfour.elf:	$(OBJS) gfppu.ppu.elf gfour.dsk
 	${CC} ${LD_FLAGS} -Wl,-m,pdp11rt11 -o $@ $(OBJS) -lppu -lpdp11
 
 gfppu.ppu:	gfourppu.o
 	${LDPPU} -Map=$@.map -o $@ gfourppu.o -L${SYSROOT}/lib -lpdp11
+
+# The PPU side as ELF: the same objects and the same layout, but with
+# the symbols and DWARF an RT-11 object module has nowhere to keep.
+# gdb reads this one to show PPU code -- see ../../libs/libppu/ppu.gdb,
+# which places it over the running module.  Linked at address 0, since
+# where the module ends up is decided when it is loaded.
+gfppu.ppu.elf:	gfourppu.o
+	${LDPPU} --elf -o $@ gfourppu.o -L${SYSROOT}/lib -lpdp11
 
 gfour.dsk:	gfour.sav gfppu.ppu
 	rm -f gfour.dsk
@@ -54,4 +70,4 @@ gfour.dsk:	gfour.sav gfppu.ppu
 	rt11dsk a gfour.dsk gfppu.ppu
 
 clean:
-	@-rm -f *.o *.dsk *.sav.map *.sav *.ppu *.ppu.map
+	@-rm -f *.o *.dsk *.sav.map *.sav *.ppu *.ppu.map *.ppu.elf

@@ -13,6 +13,11 @@
 #include "ppu_client.h"
 #include "ppuc_internal.h"
 
+// Where the code that is running on the PPU was loaded, kept for the
+// debugger's sake -- see ppu_client.h. Two bytes of .bss and one store
+// below; nothing here reads it.
+unsigned short ppuc_code_base;
+
 int ppuc_run(unsigned short ppu_addr) {
   struct ppu_desc desc;
 
@@ -27,5 +32,6 @@ int ppuc_run(unsigned short ppu_addr) {
   // wait for a fresh ppus_recv_init() handshake -- see ppuc_send.c and
   // ppuc_internal.h.
   ppuc_send_need_handshake = 1;
+  ppuc_code_base = ppu_addr;
   return 0;
 }

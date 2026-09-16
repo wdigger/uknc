@@ -28,7 +28,7 @@ libppu.a:	$(OBJS)
 
 install:	libppu.a
 	mkdir -p ${SYSROOT}/lib ${SYSROOT}/include
-	cp libppu.a ppu.ld ${SYSROOT}/lib/
+	cp libppu.a ppu.ld ppu.gdb ${SYSROOT}/lib/
 	cp ${HDRS} ${SYSROOT}/include/
 	cp pdp11-uknc-rt11-ld-ppu ${BINDIR}/
 	chmod +x ${BINDIR}/pdp11-uknc-rt11-ld-ppu
