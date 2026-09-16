@@ -6,7 +6,7 @@
 // functions the extension uses, hands it to that adapter, sets a
 // breakpoint and reports what comes back.
 //
-//   node test.js [ПАПКА-ПРОЕКТА [СТРОКА]]
+//   node test.js [ПАПКА-ПРОЕКТА [СТРОКА]] [screen]
 //
 // Default is examples/hello in the toolchain this file belongs to.  The
 // project must already be built (make <name>.elf).  The line to stop at
@@ -97,15 +97,17 @@ try {
 
 const program = findProgram(project);
 const source = findSource(project);
-const line = process.argv[3]
-      ? Number(process.argv[3])
-      : (source ? lineWithCode(source) : 1);
+const given = process.argv.slice(2).filter((a) => /^\d+$/.test(a))[0];
+const line = given ? Number(given) : (source ? lineWithCode(source) : 1);
 
 const launch = config.buildLaunchConfig({
     toolchain: toolchain,
     program: program,
     cwd: project,
     port: 2345,
+    // No window: this runs unattended, and there is nobody to look at
+    // it.  Pass "screen" to get one, which is what the editor does.
+    screen: process.argv.indexOf('screen') >= 0,
 });
 
 console.log('тулчейн:  ' + toolchain);

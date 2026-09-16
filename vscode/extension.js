@@ -219,6 +219,8 @@ const debugProvider = {
             cwd: dir || path.dirname(program),
             port: await freePort(),
             name: given.name,
+            screen: vscode.workspace.getConfiguration('uknc')
+                .get('screen', true),
         });
         return built;
     },

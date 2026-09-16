@@ -98,7 +98,10 @@ function findToolchain(options) {
     return null;
 }
 
-// The body the debug adapter gets.  This is the same shape cpptools'
+// The body the debug adapter gets.  `spec.screen` false leaves the
+// machine's screen out; anything else shows it, which is the default --
+// half of what this machine does it does on its screen, and a program
+// that draws is not debugged well through a console.  This is the same shape cpptools'
 // launch.json takes, because the adapter underneath is cpptools' own:
 // gdb drives the session, the emulator is started as its "debug server"
 // and is waited for by the line it prints, and the program is put into
@@ -168,7 +171,7 @@ function buildLaunchConfig(spec) {
             '--rom', partPath(root, 'firmware'),
             '--boot',
             '--port', String(port),
-        ].join(' '),
+        ].concat(spec.screen === false ? [] : ['--screen']).join(' '),
         serverStarted: 'Listening on localhost',
         filterStdout: true,
         filterStderr: true,
