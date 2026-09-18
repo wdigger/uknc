@@ -253,6 +253,22 @@ jobs:
           fi
           du -sh . | sed 's/^/package: /'
 
+      # The same program again, with the package this time: its own
+      # compiler, its own libraries, its own emulator, nothing on the
+      # machine outside the folder.  Building a package and shipping a
+      # package that works are two different claims, and the first
+      # release proved it -- everything above was green and the thing
+      # inside the dmg could not link hello.c.
+      - name: Run a program with the package
+        if: runner.os != 'Linux'
+        run: |
+          cd "dist/${name}"
+          export PATH="${PWD}/gcc/bin:${PATH}"
+          cp examples/hello/hello.c check.c
+          pdp11-uknc-rt11-gcc -std=gnu23 -O2 -o check.sav check.c
+          ./gcc/dejagnu/uknc-run check.sav
+          rm -f check.c check.sav check.sav.map
+
       # Linux gets no binaries. Anyone there builds this in an hour with
       # the script that is in it, and a binary linked against whatever
       # this runner happens to have is a liability on any other machine.
