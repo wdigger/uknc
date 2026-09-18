@@ -137,11 +137,13 @@ jobs:
       # behind; nothing else is rearranged.
       - name: Lay out the package
         run: |
-          version="${GITHUB_REF_NAME#v}"
-          case "${GITHUB_REF_TYPE}" in
-            tag) ;;
-            *)   version="$(cat VERSION 2>/dev/null || echo 0.0.0)+$(git rev-parse --short HEAD)" ;;
-          esac
+          # The version is the VERSION file's, and only a tagged build
+          # is called that plainly: anything else is some commit between
+          # two of them and says which.
+          version="$(cat VERSION)"
+          if [ "${GITHUB_REF_TYPE}" != "tag" ]; then
+            version="${version}+$(git rev-parse --short HEAD)"
+          fi
           echo "version=${version}" >> "$GITHUB_ENV"
           name="uknc-toolchain-${version}-${{ matrix.platform }}"
           echo "name=${name}" >> "$GITHUB_ENV"
