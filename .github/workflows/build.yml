@@ -3,11 +3,14 @@
 # An hour or more per platform -- binutils, gdb, gcc and newlib are all
 # built from source, and gdb's own clone is 600 MB -- so this does not
 # run on every push: start it by hand from the Actions tab, or push a
-# tag. What comes out is one package per platform, the same tree the
-# repository itself is a toolchain in (gcc/bin, gcc/xgcc, debugger/bin,
-# rom, resources), so everything that finds its own way around -- the
-# ld-ppu wrapper, uknc-run, the editor extension -- keeps working
-# unpacked.
+# tag.
+#
+# macOS and Windows get the built toolchain: the same tree the repository
+# itself is a toolchain in (gcc/bin, gcc/xgcc, debugger/bin, rom,
+# resources), so everything that finds its own way around -- the ld-ppu
+# wrapper, uknc-run, the editor extension -- keeps working unpacked.
+# Linux builds all of that too, and then packages the repository
+# instead: there the build is the check, not the product.
 name: Toolchain
 
 on:
@@ -146,22 +149,29 @@ jobs:
           make -C examples/hello hello.sav
           ./gcc/dejagnu/uknc-run examples/hello/hello.sav
 
-      # The package is a toolchain root, laid out exactly as this
-      # repository is one. Sources, build trees and the git checkout stay
-      # behind; nothing else is rearranged.
-      - name: Lay out the package
+      # The version is the VERSION file's, and only a tagged build is
+      # called that plainly: anything else is some commit between two of
+      # them and says which.
+      - name: What this build is called
         run: |
-          # The version is the VERSION file's, and only a tagged build
-          # is called that plainly: anything else is some commit between
-          # two of them and says which.
           version="$(cat VERSION)"
           if [ "${GITHUB_REF_TYPE}" != "tag" ]; then
             version="${version}+$(git rev-parse --short HEAD)"
           fi
           echo "version=${version}" >> "$GITHUB_ENV"
-          name="uknc-toolchain-${version}-${{ matrix.platform }}"
-          echo "name=${name}" >> "$GITHUB_ENV"
+          if [ "${RUNNER_OS}" = "Linux" ]; then
+            echo "name=uknc-${version}-src" >> "$GITHUB_ENV"
+          else
+            echo "name=uknc-toolchain-${version}-${{ matrix.platform }}" \
+              >> "$GITHUB_ENV"
+          fi
 
+      # The package is a toolchain root, laid out exactly as this
+      # repository is one. Sources, build trees and the git checkout stay
+      # behind; nothing else is rearranged.
+      - name: Lay out the package
+        if: runner.os != 'Linux'
+        run: |
           mkdir -p "dist/${name}"
           cd "dist/${name}"
           mkdir -p gcc debugger
@@ -204,10 +214,17 @@ jobs:
           fi
           du -sh . | sed 's/^/package: /'
 
-      - name: Package (tar.gz)
+      # Linux gets no binaries. Anyone there builds this in an hour with
+      # the script that is in it, and a binary linked against whatever
+      # this runner happens to have is a liability on any other machine.
+      # So what it packages is the repository at this commit -- and the
+      # build above is what says the repository builds.
+      - name: Package (the repository)
         if: runner.os == 'Linux'
         run: |
-          cd dist && tar -czf "${name}.tar.gz" "${name}"
+          mkdir -p dist
+          git archive --format=tar.gz --prefix="uknc-${version}/" \
+            -o "dist/${name}.tar.gz" HEAD
 
       - name: Package (dmg)
         if: runner.os == 'macOS'
