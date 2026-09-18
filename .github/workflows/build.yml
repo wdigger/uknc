@@ -1,0 +1,180 @@
+# Builds the whole toolchain for the three desktops and packages it.
+#
+# An hour or more per platform -- binutils, gdb, gcc and newlib are all
+# built from source, and gdb's own clone is 600 MB -- so this does not
+# run on every push: start it by hand from the Actions tab, or push a
+# tag. What comes out is one package per platform, the same tree the
+# repository itself is a toolchain in (gcc/bin, gcc/xgcc, debugger/bin,
+# rom, resources), so everything that finds its own way around -- the
+# ld-ppu wrapper, uknc-run, the editor extension -- keeps working
+# unpacked.
+name: Toolchain
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  build:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 300
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Linux
+            os: ubuntu-latest
+            platform: linux-x86_64
+            shell: bash
+          - name: macOS
+            os: macos-latest
+            platform: macos-arm64
+            shell: bash
+          - name: Windows
+            os: windows-latest
+            platform: windows-x86_64
+            shell: 'msys2 {0}'
+
+    defaults:
+      run:
+        shell: ${{ matrix.shell }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # What the build needs that a runner does not already have. gdb is
+      # the demanding one: it is built from a git clone rather than a
+      # release, so its parsers are generated here (bison, flex), and it
+      # does target arithmetic with GMP and MPFR.
+      - name: Tools (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential texinfo bison flex libtool \
+            libgmp-dev libmpfr-dev libmpc-dev zlib1g-dev
+          # The emulator's window is optional -- see util/Screen.cpp --
+          # and SDL3 is young enough not to be everywhere yet.
+          sudo apt-get install -y libsdl3-dev \
+            || echo "no SDL3 here: the emulator will have no screen"
+
+      - name: Tools (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          brew install gmp mpfr libmpc bison flex sdl3
+          # Apple's own bison is from 2006 and gdb's parsers need a
+          # newer one; Homebrew keeps it out of the way on purpose.
+          echo "$(brew --prefix bison)/bin" >> "$GITHUB_PATH"
+          echo "$(brew --prefix flex)/bin" >> "$GITHUB_PATH"
+
+      - name: Tools (Windows)
+        if: runner.os == 'Windows'
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: UCRT64
+          update: true
+          install: >-
+            git make patch curl tar diffutils texinfo bison flex perl
+            autoconf automake libtool
+            mingw-w64-ucrt-x86_64-toolchain
+            mingw-w64-ucrt-x86_64-gmp
+            mingw-w64-ucrt-x86_64-mpfr
+            mingw-w64-ucrt-x86_64-mpc
+            mingw-w64-ucrt-x86_64-zlib
+            mingw-w64-ucrt-x86_64-SDL3
+            mingw-w64-ucrt-x86_64-pkgconf
+
+      - name: Build the toolchain
+        run: cd gcc && sh ./build_gcc_uknc.sh
+
+      - name: Build the emulator
+        run: cd debugger && sh ./build_debugger_uknc.sh
+
+      # The toolchain builds a program, the machine runs it, and the
+      # program says so itself -- which is every piece of this working at
+      # once, and takes six seconds.
+      - name: Run a program on the machine
+        run: |
+          export PATH="${PWD}/gcc/bin:${PATH}"
+          make -C examples/hello hello.sav
+          ./gcc/dejagnu/uknc-run examples/hello/hello.sav
+
+      # The package is a toolchain root, laid out exactly as this
+      # repository is one. Sources, build trees and the git checkout stay
+      # behind; nothing else is rearranged.
+      - name: Lay out the package
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          case "${GITHUB_REF_TYPE}" in
+            tag) ;;
+            *)   version="$(cat VERSION 2>/dev/null || echo 0.0.0)+$(git rev-parse --short HEAD)" ;;
+          esac
+          echo "version=${version}" >> "$GITHUB_ENV"
+          name="uknc-toolchain-${version}-${{ matrix.platform }}"
+          echo "name=${name}" >> "$GITHUB_ENV"
+
+          mkdir -p "dist/${name}"
+          cd "dist/${name}"
+          mkdir -p gcc debugger
+          cp -R "${GITHUB_WORKSPACE}/gcc/bin" gcc/
+          cp -R "${GITHUB_WORKSPACE}/gcc/xgcc" gcc/
+          cp -R "${GITHUB_WORKSPACE}/gcc/dejagnu" gcc/
+          cp -R "${GITHUB_WORKSPACE}/debugger/bin" debugger/
+          cp -R "${GITHUB_WORKSPACE}/rom" .
+          cp -R "${GITHUB_WORKSPACE}/resources" .
+          cp -R "${GITHUB_WORKSPACE}/examples" .
+          cp -R "${GITHUB_WORKSPACE}/libs" .
+          cp "${GITHUB_WORKSPACE}/README.md" .
+          # What this package actually contains, for anyone holding the
+          # binary a year from now with no idea what went into it.
+          {
+            echo "uknc-toolchain ${version} (${{ matrix.platform }})"
+            echo "built $(date -u '+%Y-%m-%d %H:%M UTC') from ${GITHUB_SHA}"
+            echo
+            grep -E '^(BINUTILS|GCC|NEWLIB)_VERSION=' \
+              "${GITHUB_WORKSPACE}/gcc/build_gcc_uknc.sh"
+          } > VERSION.txt
+          find . -name '*.o' -delete
+          find . -name '*.dsk' -not -name 'rt11os.dsk' -delete
+
+      - name: Package (tar.gz)
+        if: runner.os == 'Linux'
+        run: |
+          cd dist && tar -czf "${name}.tar.gz" "${name}"
+
+      - name: Package (dmg)
+        if: runner.os == 'macOS'
+        run: |
+          cd dist
+          hdiutil create -volname "UKNC ${version}" -srcfolder "${name}" \
+            -ov -format UDZO "${name}.dmg"
+
+      - name: Package (installer)
+        if: runner.os == 'Windows'
+        run: |
+          # Inno Setup packs a folder, offers a PATH entry and writes an
+          # uninstaller, and needs no more than the script beside this
+          # file. The runner image has it; if some later image does not,
+          # it is one package away.
+          iscc="/c/Program Files (x86)/Inno Setup 6/ISCC.exe"
+          if [ ! -f "${iscc}" ]; then
+            cmd.exe /c "choco install innosetup -y --no-progress"
+          fi
+          "${iscc}" \
+            "/DAppVersion=${version}" \
+            "/DSourceDir=$(cygpath -w "${GITHUB_WORKSPACE}/dist/${name}")" \
+            "/DOutputDir=$(cygpath -w "${GITHUB_WORKSPACE}/dist")" \
+            "/DOutputName=${name}" \
+            "$(cygpath -w "${GITHUB_WORKSPACE}/.github/installer/uknc.iss")"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.name }}
+          path: |
+            dist/*.tar.gz
+            dist/*.dmg
+            dist/*.exe
+          if-no-files-found: error

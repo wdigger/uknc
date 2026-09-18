@@ -45,8 +45,14 @@ make release -j4
 # checked a binary's signature, and writing a new one over the same file
 # leaves that memory wrong -- the next run is killed outright, with
 # nothing said but "Killed: 9".
-rm -f ${BUILDDIR}/bin/ukncbtldebug
-cp ${BUILDDIR}/src/build/release/ukncbtldebug ${BUILDDIR}/bin/
+# .exe where there is one: Windows names executables that way and the
+# compiler writes that name whether or not it was asked to.
+EXE=""
+if [ -f "${BUILDDIR}/src/build/release/ukncbtldebug.exe" ]; then
+	EXE=".exe"
+fi
+rm -f ${BUILDDIR}/bin/ukncbtldebug${EXE}
+cp ${BUILDDIR}/src/build/release/ukncbtldebug${EXE} ${BUILDDIR}/bin/
 
 # The emulator wants uknc_rom.bin in the current directory at run time,
 # and the DejaGnu board in ../gcc/dejagnu looks for it beside the binary
@@ -54,4 +60,4 @@ cp ${BUILDDIR}/src/build/release/ukncbtldebug ${BUILDDIR}/bin/
 cp ${BUILDDIR}/../rom/uknc_rom.bin ${BUILDDIR}/bin/
 
 echo
-echo "Built ${BUILDDIR}/bin/ukncbtldebug"
+echo "Built ${BUILDDIR}/bin/ukncbtldebug${EXE}"

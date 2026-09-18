@@ -27,8 +27,15 @@ const PARTS = {
 // is still a toolchain.
 const PPU_SCRIPT = 'gcc/xgcc/pdp11-uknc-rt11/lib/ppu.gdb';
 
+// Windows spells its executables with .exe and nothing else does; the
+// same toolchain has to be recognised either way, so a part that is not
+// where it is named is looked for under that name too.
 function partPath(root, part) {
-    return path.join(root, PARTS[part]);
+    const named = path.join(root, PARTS[part]);
+    if (!fs.existsSync(named) && fs.existsSync(named + '.exe')) {
+        return named + '.exe';
+    }
+    return named;
 }
 
 // The parts that are not there, in the order above; empty means this is
@@ -72,7 +79,7 @@ function toolchainOnPath(pathVariable) {
             continue;
         }
         const gcc = path.join(dir, 'pdp11-uknc-rt11-gcc');
-        if (fs.existsSync(gcc)) {
+        if (fs.existsSync(gcc) || fs.existsSync(gcc + '.exe')) {
             const root = path.dirname(path.dirname(path.dirname(gcc)));
             if (isToolchain(root)) {
                 return root;
