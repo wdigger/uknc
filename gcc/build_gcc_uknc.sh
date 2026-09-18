@@ -78,6 +78,7 @@ curl https://github.com/wdigger/binutils-gdb/commit/4441b8c3c080dbc34cda0a75eee8
 curl https://github.com/wdigger/binutils-gdb/commit/b8f98c8fa4155508d1010fc53f016c04559adf7b.patch -o binutils_13.patch
 curl https://github.com/wdigger/binutils-gdb/commit/955310c53463c00889de3b936847c9445097e1af.patch -o binutils_14.patch
 curl https://github.com/wdigger/binutils-gdb/commit/c5f9f1a731dc888a83a57748a76a84e240f80c08.patch -o binutils_15.patch
+curl https://github.com/wdigger/binutils-gdb/commit/22490744a2d7d368a7ad6ca32acb6b6b4a02161f.patch -o binutils_16.patch
 
 cd ${BUILDDIR}/src/binutils-${BINUTILS_VERSION}
 patch -p1 < ${BUILDDIR}/binutils_1.patch
@@ -95,6 +96,7 @@ patch -p1 < ${BUILDDIR}/binutils_12.patch
 patch -p1 < ${BUILDDIR}/binutils_13.patch
 patch -p1 < ${BUILDDIR}/binutils_14.patch
 patch -p1 < ${BUILDDIR}/binutils_15.patch
+patch -p1 < ${BUILDDIR}/binutils_16.patch
 rm ${BUILDDIR}/binutils_1.patch
 rm ${BUILDDIR}/binutils_2.patch
 rm ${BUILDDIR}/binutils_3.patch
@@ -110,6 +112,7 @@ rm ${BUILDDIR}/binutils_12.patch
 rm ${BUILDDIR}/binutils_13.patch
 rm ${BUILDDIR}/binutils_14.patch
 rm ${BUILDDIR}/binutils_15.patch
+rm ${BUILDDIR}/binutils_16.patch
 
 cd ${BUILDDIR}
 mkdir -p build/binutils
