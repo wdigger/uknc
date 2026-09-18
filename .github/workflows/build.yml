@@ -120,6 +120,17 @@ jobs:
           pacman -S --noconfirm --needed mingw-w64-ucrt-x86_64-sdl3 \
             || echo "no SDL3 here: the emulator will have no screen"
 
+      # Worked out here, before anything is built, and used by both the
+      # restore and the save below.  hashFiles reads the tree as it is
+      # when the step runs, and building the toolchain writes into libs/
+      # (libppu.a and its objects) -- so a key computed at save time was
+      # a key no fresh checkout could ever match, and every run rebuilt
+      # everything and cached it for nobody.
+      - name: What to call the cached toolchain
+        run: |
+          echo "toolchainkey=toolchain-${{ runner.os }}-${{ hashFiles('gcc/build_gcc_uknc.sh', 'libs/**') }}" \
+            >> "$GITHUB_ENV"
+
       # Forty minutes of binutils, gdb, gcc and newlib that only change
       # when the script that builds them does.  Anything else being
       # fixed -- the emulator, the packaging, this file -- gets them
@@ -131,7 +142,7 @@ jobs:
           path: |
             gcc/bin
             gcc/xgcc
-          key: toolchain-${{ runner.os }}-${{ hashFiles('gcc/build_gcc_uknc.sh', 'libs/**') }}
+          key: ${{ env.toolchainkey }}
 
       - name: Build the toolchain
         if: steps.cache.outputs.cache-hit != 'true'
@@ -148,7 +159,7 @@ jobs:
           path: |
             gcc/bin
             gcc/xgcc
-          key: toolchain-${{ runner.os }}-${{ hashFiles('gcc/build_gcc_uknc.sh', 'libs/**') }}
+          key: ${{ env.toolchainkey }}
 
       - name: Build the emulator
         run: cd debugger && sh ./build_debugger_uknc.sh
