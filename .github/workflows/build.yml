@@ -41,8 +41,12 @@ jobs:
             {"key":"windows","name":"Windows","os":"windows-latest",
              "platform":"windows-x86_64", "shell":"msys2 {0}"}
           ]'
-          matrix=$(echo "${all}" | jq -c --arg w "${wanted}" \
-            '[.[] | select(($w | split(" ")) | index(.key))]')
+          # The names are passed as arguments rather than as one string
+          # so that jq does the matching against a list it was given:
+          # inside index(), "." is that list and not the entry.
+          matrix=$(echo "${all}" \
+            | jq -c '[.[] | select(.key as $k | $ARGS.positional | index($k))]' \
+                 --args ${wanted})
           echo "matrix=${matrix}" >> "$GITHUB_OUTPUT"
           echo "${matrix}" | jq .
 
