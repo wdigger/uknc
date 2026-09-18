@@ -95,10 +95,20 @@ trap cleanup EXIT INT TERM
 # here, on the disk it is T.SAV.
 cp "$prog" "$tmp/T.SAV"
 cp "$disk" "$tmp/t.dsk"
-"$rt11dsk" a "$tmp/t.dsk" "$tmp/T.SAV" > /dev/null 2>&1 || {
+
+# From inside that directory, with bare names: rt11dsk takes the name it
+# is given for the name on the disk, and a path is not a 6.3 name.  On
+# Windows it says so -- "Wrong filename format (long name: 7)" -- and
+# still exits zero, so the program quietly never reaches the disk and
+# the machine is left looking for it.  Hence the check afterwards as
+# well: the only answer worth having is whether the file is there.
+(cd "$tmp" && "$rt11dsk" a t.dsk T.SAV) > "$tmp/rt11dsk.log" 2>&1
+"$rt11dsk" l "$tmp/t.dsk" > "$tmp/catalog.log" 2>&1
+if ! grep -q "^T *\.SAV" "$tmp/catalog.log"; then
   echo "uknc-run: could not put the program on the disk" >&2
+  sed 's/^/uknc-run: rt11dsk: /' "$tmp/rt11dsk.log" >&2 2>/dev/null
   exit 99
-}
+fi
 
 # The emulator does nothing here but attach the disk and wait for gdb:
 # booting the machine and starting the program are gdb's "run", which the
