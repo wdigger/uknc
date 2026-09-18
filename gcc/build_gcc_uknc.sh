@@ -44,7 +44,17 @@ fi
 # the script carries on to build against it.  Fetch to a file first.
 fetch_and_extract () {
 	curl -fL "$1" -o "${BUILDDIR}/tarball.tmp"
-	tar -C "$2" -zxf "${BUILDDIR}/tarball.tmp"
+	# tar, alone among the tools here, reads "D:/path" as host:path and
+	# goes looking for a machine called D -- so it gets the same places
+	# named the way this shell names them.  (Everything else wants the
+	# Windows form; see BUILDDIR above.)
+	tarball="${BUILDDIR}/tarball.tmp"
+	dest="$2"
+	if command -v cygpath > /dev/null 2>&1; then
+		tarball="$(cygpath -u "${tarball}")"
+		dest="$(cygpath -u "${dest}")"
+	fi
+	tar -C "${dest}" -zxf "${tarball}"
 	rm -f "${BUILDDIR}/tarball.tmp"
 }
 
