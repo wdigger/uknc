@@ -179,7 +179,15 @@ jobs:
       - name: What this build is called
         run: |
           version="$(cat VERSION)"
-          if [ "${GITHUB_REF_TYPE}" != "tag" ]; then
+          if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
+            # The file is where the version lives; the tag only says
+            # which commit of it is being released.  Two answers to the
+            # same question is one too many.
+            if [ "${GITHUB_REF_NAME}" != "v${version}" ]; then
+              echo "tag ${GITHUB_REF_NAME} but VERSION says ${version}" >&2
+              exit 1
+            fi
+          else
             version="${version}+$(git rev-parse --short HEAD)"
           fi
           echo "version=${version}" >> "$GITHUB_ENV"
@@ -293,3 +301,49 @@ jobs:
             dist/*.exe
           compression-level: 0
           if-no-files-found: error
+
+  # A tag, and only a tag, is a release: the three packages, their
+  # checksums and what each of them is for.  Nothing here rebuilds
+  # anything -- it publishes what the jobs above made and checked.
+  release:
+    needs: build
+    if: github.ref_type == 'tag'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Gather what was built
+        run: |
+          mkdir -p release
+          find artifacts -type f -exec mv {} release/ \;
+          cd release
+          sha256sum * > SHA256SUMS
+          ls -l
+
+      - name: Say what is in it
+        run: |
+          versions=$(grep -E '^(BINUTILS|GCC|NEWLIB)_VERSION=' \
+            gcc/build_gcc_uknc.sh | tr -d '"' | tr '\n' ' ')
+          {
+            sed "s/@VERSION@/${GITHUB_REF_NAME#v}/g" .github/release-notes.md
+            echo
+            echo "Внутри: ${versions}"
+            echo "Собрано из ${GITHUB_SHA}."
+          } > notes.md
+          cat notes.md
+
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${GITHUB_REF_NAME}" release/* \
+            --title "УКНЦ ${GITHUB_REF_NAME}" \
+            --notes-file notes.md \
+            --verify-tag
