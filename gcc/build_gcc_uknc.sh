@@ -27,6 +27,18 @@ NEWLIB_VERSION="4.6.0.20260123"
 
 BUILDDIR="${PWD}"
 
+# On MSYS2 this builds native Windows programs, and the build then runs
+# some of them on paths it wrote down for itself -- gengtype reads
+# gtyp-input.list, for one.  Paths on a command line are translated by
+# the MSYS runtime on the way to a native program; paths inside a file
+# are not, and gengtype was handed /d/a/.../libcpp/include/line-map.h
+# and said there was no such file.  So the paths are written in a form
+# Windows understands from the start (D:/a/...), which this shell
+# understands equally well.
+if command -v cygpath > /dev/null 2>&1; then
+	BUILDDIR="$(cygpath -m "${BUILDDIR}")"
+fi
+
 # `curl ... | tar` hides a failed download: set -e sees only tar's exit
 # status, so a truncated stream leaves a half-extracted tree behind and
 # the script carries on to build against it.  Fetch to a file first.
