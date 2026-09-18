@@ -225,8 +225,15 @@ jobs:
             grep -E '^(BINUTILS|GCC|NEWLIB)_VERSION=' \
               "${GITHUB_WORKSPACE}/gcc/build_gcc_uknc.sh"
           } > VERSION.txt
-          find . -name '*.o' -delete
-          find . -name '*.dsk' -not -name 'rt11os.dsk' -delete
+          # The examples were built a moment ago to check the toolchain,
+          # and what that left behind is not part of it.  Only there,
+          # and only those: the toolchain's own object files are the
+          # ones every link needs -- crt0rt.o and parse_args.o sit in
+          # lib/gcc, and deleting them left a compiler that could not
+          # link a program at all.
+          find examples \( -name '*.o' -o -name '*.sav' -o -name '*.elf' \
+                        -o -name '*.map' -o -name '*.dsk' -o -name '*.ppu' \) \
+               -delete
 
           # Every one of these is built with the -g -O2 its own configure
           # defaults to, and what that leaves in gcc, gdb and cc1 is
