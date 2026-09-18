@@ -333,19 +333,26 @@ fi
 
 # GCC 15's own libcody writes u8"..." where it means const char*, which
 # stopped being true in C++20 -- so a host compiler that defaults to
-# C++20 or later (MSYS2 ships GCC 16) cannot build it.  Ask the compiler
-# what it thinks, and pin the standard only where the answer is wrong.
-GCC_CXX_STD=""
+# C++20 or later (MSYS2 ships GCC 16) cannot build it.
+#
+# The fix is that one feature and not the standard: libcody's own
+# configure insists on __cplusplus being exactly 201103 and adds
+# -std=c++11 itself when it is not, so pinning a standard here only
+# talks over it (-std=gnu++17 in CXXFLAGS comes after libcody's own
+# -std=c++11 on the command line and wins, and its configure then fails
+# outright with "C++11 is required").  -fno-char8_t changes what u8"x"
+# is and nothing else.
+GCC_CXX_FLAGS=""
 if ! printf 'const char *p = u8"x";\n' \
 	| ${CXX:-c++} -x c++ -fsyntax-only - > /dev/null 2>&1; then
-	GCC_CXX_STD="-std=gnu++17"
-	echo "host C++ is newer than gcc ${GCC_VERSION} expects: adding ${GCC_CXX_STD}"
+	GCC_CXX_FLAGS="-fno-char8_t"
+	echo "host C++ is newer than gcc ${GCC_VERSION} expects: adding ${GCC_CXX_FLAGS}"
 fi
 
 cd ${BUILDDIR}
 mkdir -p build/gcc
 cd build/gcc
-CXXFLAGS="${CXXFLAGS:--g -O2} ${GCC_CXX_STD}" ${BUILDDIR}/src/gcc-${GCC_VERSION}/configure --prefix "${BUILDDIR}/xgcc" --bindir "${BUILDDIR}/bin" --target pdp11-uknc-rt11 --enable-languages=c --with-gnu-as --with-gnu-ld --with-newlib --enable-newlib-nano-malloc --enable-newlib-nano-formatted-io --disable-newlib-wide-orient --disable-libssp --disable-bootstrap --disable-multilib --disable-nls --disable-libstdcxx --disable-doc --with-system-zlib --disable-libquadmath
+CXXFLAGS="${CXXFLAGS:--g -O2} ${GCC_CXX_FLAGS}" ${BUILDDIR}/src/gcc-${GCC_VERSION}/configure --prefix "${BUILDDIR}/xgcc" --bindir "${BUILDDIR}/bin" --target pdp11-uknc-rt11 --enable-languages=c --with-gnu-as --with-gnu-ld --with-newlib --enable-newlib-nano-malloc --enable-newlib-nano-formatted-io --disable-newlib-wide-orient --disable-libssp --disable-bootstrap --disable-multilib --disable-nls --disable-libstdcxx --disable-doc --with-system-zlib --disable-libquadmath
 # CFLAGS_FOR_TARGET carries -ffunction-sections/-fdata-sections into
 # newlib and libgcc.  A program only links the library members it needs,
 # but a member is a whole file, and one function of it is usually all
