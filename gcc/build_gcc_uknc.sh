@@ -102,8 +102,14 @@ cd build/binutils
 # (ignored)", sees an LTO object as an empty file with a
 # __gnu_lto_slim marker in it, and the link fails on an undefined main.
 # A cross binutils does not enable it on its own.
+# Two statements rather than "make && make install": under set -e a
+# command on the left of && is exempt, so a failed build went quietly on
+# to install nothing and the script carried on to the next package --
+# which is how a broken gcc reached the point of compiling libppu with a
+# compiler that was never installed.
 ${BUILDDIR}/src/binutils-${BINUTILS_VERSION}/configure --prefix "${BUILDDIR}/xgcc" --bindir "${BUILDDIR}/bin" --target pdp11-uknc-rt11 --enable-plugins --disable-libstdcxx --disable-doc --with-system-zlib
-make -j4 MAKEINFO=true && make install MAKEINFO=true
+make -j4 MAKEINFO=true
+make install MAKEINFO=true
 
 # Clone and build gdb
 #
@@ -142,7 +148,8 @@ cd ${BUILDDIR}/build/gdb
 # Fortran expression parser fails with "invalid r_symbolnum ... in
 # f-exp.o".  On Linux cc and c++ are gcc and g++ anyway.
 CC="${CC:-cc}" CXX="${CXX:-c++}" ${BUILDDIR}/src/gdb/configure --prefix "${BUILDDIR}/xgcc" --bindir "${BUILDDIR}/bin" --target pdp11-uknc-rt11 --disable-binutils --disable-gas --disable-ld --disable-gold --disable-gprof --disable-gprofng --disable-sim --disable-nls --disable-werror --disable-doc --with-system-zlib ${GDB_MATH}
-make all-gdb -j4 MAKEINFO=true && make install-gdb MAKEINFO=true
+make all-gdb -j4 MAKEINFO=true
+make install-gdb MAKEINFO=true
 
 # Download and patch gcc
 cd ${BUILDDIR}
@@ -296,13 +303,15 @@ fetch_and_extract https://ftp.gnu.org/gnu/autoconf/autoconf-2.69.tar.gz ${BUILDD
 
 cd ${BUILDDIR}/src/autoconf-2.69
 ./configure --prefix "${AUTOTOOLS}"
-make && make install
+make
+make install
 
 cd ${BUILDDIR}
 fetch_and_extract https://ftp.gnu.org/gnu/automake/automake-1.15.1.tar.gz ${BUILDDIR}/src
 cd ${BUILDDIR}/src/automake-1.15.1
 PATH="${AUTOTOOLS}/bin:${PATH}" ./configure --prefix "${AUTOTOOLS}"
-PATH="${AUTOTOOLS}/bin:${PATH}" make && make install
+PATH="${AUTOTOOLS}/bin:${PATH}" make
+PATH="${AUTOTOOLS}/bin:${PATH}" make install
 
 cd ${BUILDDIR}/src/gcc-${GCC_VERSION}/newlib
 PATH="${AUTOTOOLS}/bin:${PATH}" autoreconf
@@ -310,7 +319,17 @@ PATH="${AUTOTOOLS}/bin:${PATH}" autoreconf
 # Build gcc
 cd ${BUILDDIR}/src/gcc-${GCC_VERSION}
 
-./contrib/download_prerequisites
+# GCC wants GMP, MPFR and MPC, and ships a script that fetches them into
+# its own tree.  Where the host already has them, use those: on MSYS2
+# the in-tree GMP fails its own "Oops, mp_limb_t doesn't seem to work"
+# check and takes the whole build with it, while the packaged one builds
+# gcc perfectly well.
+if printf '#include <gmp.h>\n#include <mpfr.h>\n#include <mpc.h>\n' \
+	| ${CC:-cc} -E - > /dev/null 2>&1; then
+	echo "GMP, MPFR and MPC: using the host's own"
+else
+	./contrib/download_prerequisites
+fi
 
 cd ${BUILDDIR}
 mkdir -p build/gcc
@@ -322,7 +341,8 @@ ${BUILDDIR}/src/gcc-${GCC_VERSION}/configure --prefix "${BUILDDIR}/xgcc" --bindi
 # that gets called; with a section per function the linker drops the
 # rest.  It is worth a good deal here -- tests/fileio goes from 9200 to
 # 6728 bytes on it alone -- and costs nothing at run time.
-make -j4 MAKEINFO=true CFLAGS_FOR_TARGET="-g -O2 -ffunction-sections -fdata-sections" && make install MAKEINFO=true CFLAGS_FOR_TARGET="-g -O2 -ffunction-sections -fdata-sections"
+make -j4 MAKEINFO=true CFLAGS_FOR_TARGET="-g -O2 -ffunction-sections -fdata-sections"
+make install MAKEINFO=true CFLAGS_FOR_TARGET="-g -O2 -ffunction-sections -fdata-sections"
 
 # Download and build rt11dsk
 cd ${BUILDDIR}/src
