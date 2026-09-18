@@ -294,6 +294,11 @@ jobs:
           if [ ! -f "${iscc}" ]; then
             cmd.exe /c "choco install innosetup -y --no-progress"
           fi
+          # MSYS2 rewrites an argument that looks like a POSIX path on
+          # its way to a native program, and every /D here looks like
+          # one: ISCC was handed three filenames and said so. This says
+          # to leave them alone.
+          export MSYS2_ARG_CONV_EXCL='*'
           "${iscc}" \
             "/DAppVersion=${version}" \
             "/DSourceDir=$(cygpath -w "${GITHUB_WORKSPACE}/dist/${name}")" \
