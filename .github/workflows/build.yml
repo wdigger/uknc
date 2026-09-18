@@ -171,16 +171,6 @@ jobs:
         run: |
           export PATH="${PWD}/gcc/bin:${PATH}"
           make -C examples/hello hello.sav
-          # TEMPORARY: the disk the machine is asked to run the program
-          # from -- made the same way uknc-run makes it, and then read
-          # back, since "the machine never reached the program" is as
-          # much about the disk as about the program.
-          mkdir -p check
-          cp resources/rt11os.dsk check/t.dsk
-          cp examples/hello/hello.sav check/T.SAV
-          rt11dsk a check/t.dsk check/T.SAV || true
-          rt11dsk l check/t.dsk | head -30 || true
-          sha256sum check/t.dsk examples/hello/hello.sav || true
           ./gcc/dejagnu/uknc-run examples/hello/hello.sav
 
       # The version is the VERSION file's, and only a tagged build is
@@ -199,22 +189,6 @@ jobs:
             echo "name=uknc-toolchain-${version}-${{ matrix.platform }}" \
               >> "$GITHUB_ENV"
           fi
-
-      # TEMPORARY: the program this build made, when the machine would
-      # not run it -- the same file built here weighs the same as one
-      # built on macOS and is not the same bytes, and the difference is
-      # the thing to look at.
-      - name: The program that did not run
-        if: failure()
-        uses: actions/upload-artifact@v4
-        with:
-          name: hello-${{ matrix.platform }}
-          path: |
-            examples/hello/hello.sav
-            examples/hello/hello.o
-            examples/hello/hello.sav.map
-            check/t.dsk
-          if-no-files-found: warn
 
       # The package is a toolchain root, laid out exactly as this
       # repository is one. Sources, build trees and the git checkout stay
