@@ -172,6 +172,24 @@ jobs:
           find . -name '*.o' -delete
           find . -name '*.dsk' -not -name 'rt11os.dsk' -delete
 
+          # Every one of these is built with the -g -O2 its own configure
+          # defaults to, and what that leaves in gcc, gdb and cc1 is
+          # hundreds of megabytes of debug information about the
+          # compiler, for people who are not debugging the compiler. The
+          # first package came to 567 MB.
+          #
+          # Host programs only -- the archives under gcc/xgcc are for the
+          # machine, and their debug information is the whole point of
+          # CFLAGS_FOR_TARGET carrying -g (it is what lets gdb step
+          # through newlib). Scripts and anything else strip cannot read
+          # are stepped over.
+          if [ "${RUNNER_OS}" = "macOS" ]; then
+            find . -type f -perm -u+x -exec strip -x {} + 2>/dev/null || true
+          else
+            find . -type f -perm -u+x -exec strip {} + 2>/dev/null || true
+          fi
+          du -sh . | sed 's/^/package: /'
+
       - name: Package (tar.gz)
         if: runner.os == 'Linux'
         run: |
