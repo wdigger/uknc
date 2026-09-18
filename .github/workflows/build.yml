@@ -12,38 +12,56 @@ name: Toolchain
 
 on:
   workflow_dispatch:
+    inputs:
+      platforms:
+        description: 'Which to build, space separated: linux macos windows'
+        default: 'linux macos windows'
   push:
     tags:
       - 'v*'
 
 jobs:
+  # Which platforms this run is for.  A tag builds all three; by hand,
+  # one can be asked for on its own, which is worth having when the
+  # thing being fixed is that one's own build and the other two take an
+  # hour each to tell you nothing new.
+  choose:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.pick.outputs.matrix }}
+    steps:
+      - id: pick
+        run: |
+          wanted='${{ inputs.platforms || 'linux macos windows' }}'
+          all='[
+            {"key":"linux",  "name":"Linux",  "os":"ubuntu-latest",
+             "platform":"linux-x86_64",   "shell":"bash"},
+            {"key":"macos",  "name":"macOS",  "os":"macos-latest",
+             "platform":"macos-arm64",    "shell":"bash"},
+            {"key":"windows","name":"Windows","os":"windows-latest",
+             "platform":"windows-x86_64", "shell":"msys2 {0}"}
+          ]'
+          matrix=$(echo "${all}" | jq -c --arg w "${wanted}" \
+            '[.[] | select(($w | split(" ")) | index(.key))]')
+          echo "matrix=${matrix}" >> "$GITHUB_OUTPUT"
+          echo "${matrix}" | jq .
+
   build:
+    needs: choose
     name: ${{ matrix.name }}
     runs-on: ${{ matrix.os }}
     timeout-minutes: 300
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - name: Linux
-            os: ubuntu-latest
-            platform: linux-x86_64
-            shell: bash
-          - name: macOS
-            os: macos-latest
-            platform: macos-arm64
-            shell: bash
-          - name: Windows
-            os: windows-latest
-            platform: windows-x86_64
-            shell: 'msys2 {0}'
+        include: ${{ fromJSON(needs.choose.outputs.matrix) }}
 
     defaults:
       run:
         shell: ${{ matrix.shell }}
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       # What the build needs that a runner does not already have. gdb is
       # the demanding one: it is built from a git clone rather than a
@@ -84,8 +102,16 @@ jobs:
             mingw-w64-ucrt-x86_64-mpfr
             mingw-w64-ucrt-x86_64-mpc
             mingw-w64-ucrt-x86_64-zlib
-            mingw-w64-ucrt-x86_64-SDL3
             mingw-w64-ucrt-x86_64-pkgconf
+
+      # Separately, and allowed to fail: the emulator's window is
+      # optional (see util/Screen.cpp) and SDL3 is young enough that not
+      # every package set has it yet.
+      - name: SDL3 (Windows)
+        if: runner.os == 'Windows'
+        run: |
+          pacman -S --noconfirm --needed mingw-w64-ucrt-x86_64-sdl3 \
+            || echo "no SDL3 here: the emulator will have no screen"
 
       - name: Build the toolchain
         run: cd gcc && sh ./build_gcc_uknc.sh
