@@ -1,0 +1,8 @@
+# Nothing here is rewritten on the way out of git.
+#
+# The machine's own files -- firmware, disk images, the programs built
+# for it -- are byte for byte or they are nothing, and the shell scripts
+# are run by shells that want LF on every platform, including under
+# MSYS2 on Windows.  A checkout that "helpfully" turned LF into CRLF
+# would break both, quietly and at a distance.
+* -text

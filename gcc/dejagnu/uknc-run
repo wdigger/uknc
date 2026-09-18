@@ -194,6 +194,9 @@ if [ -z "$status" ]; then
     echo "uknc-run: $reason" >&2
   fi
   echo "uknc-run: no exit marker, the program did not finish" >&2
+  # Whatever the machine had to say about it -- it is the one place the
+  # reason ever turns up, and this directory is about to be removed.
+  sed 's/^/uknc-run: emulator: /' "$tmp/emulator.log" >&2 2>/dev/null
   exit 98
 fi
 
