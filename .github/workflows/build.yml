@@ -194,6 +194,21 @@ jobs:
               >> "$GITHUB_ENV"
           fi
 
+      # TEMPORARY: the program this build made, when the machine would
+      # not run it -- the same file built here weighs the same as one
+      # built on macOS and is not the same bytes, and the difference is
+      # the thing to look at.
+      - name: The program that did not run
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: hello-${{ matrix.platform }}
+          path: |
+            examples/hello/hello.sav
+            examples/hello/hello.o
+            examples/hello/hello.sav.map
+          if-no-files-found: warn
+
       # The package is a toolchain root, laid out exactly as this
       # repository is one. Sources, build trees and the git checkout stay
       # behind; nothing else is rearranged.
