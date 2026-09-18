@@ -27,16 +27,21 @@ NEWLIB_VERSION="4.6.0.20260123"
 
 BUILDDIR="${PWD}"
 
-# On MSYS2 this builds native Windows programs, and the build then runs
-# some of them on paths it wrote down for itself -- gengtype reads
-# gtyp-input.list, for one.  Paths on a command line are translated by
-# the MSYS runtime on the way to a native program; paths inside a file
-# are not, and gengtype was handed /d/a/.../libcpp/include/line-map.h
-# and said there was no such file.  So the paths are written in a form
-# Windows understands from the start (D:/a/...), which this shell
-# understands equally well.
+# Where the sources are, as the configure scripts are told.
+#
+# On MSYS2 that is relative to the build directory, and this is the
+# whole trick to building here.  What comes out is native Windows
+# programs, and the build runs some of them on paths it wrote down for
+# itself: gengtype reads its input list out of a file, where the MSYS
+# runtime is not there to translate /d/a/... into something Windows
+# knows, and it says there is no such file.  Writing D:/a/... instead
+# fixes that and breaks make, which reads the colon in a rule as its own
+# separator ("target pattern contains no '%'", in gettext's Makefiles).
+# A relative path is neither: no drive letter for make to trip on, and
+# nothing to translate for gengtype.  Elsewhere, absolute as before.
+SRCPREFIX="${BUILDDIR}/src"
 if command -v cygpath > /dev/null 2>&1; then
-	BUILDDIR="$(cygpath -m "${BUILDDIR}")"
+	SRCPREFIX="../../src"
 fi
 
 # `curl ... | tar` hides a failed download: set -e sees only tar's exit
@@ -44,17 +49,7 @@ fi
 # the script carries on to build against it.  Fetch to a file first.
 fetch_and_extract () {
 	curl -fL "$1" -o "${BUILDDIR}/tarball.tmp"
-	# tar, alone among the tools here, reads "D:/path" as host:path and
-	# goes looking for a machine called D -- so it gets the same places
-	# named the way this shell names them.  (Everything else wants the
-	# Windows form; see BUILDDIR above.)
-	tarball="${BUILDDIR}/tarball.tmp"
-	dest="$2"
-	if command -v cygpath > /dev/null 2>&1; then
-		tarball="$(cygpath -u "${tarball}")"
-		dest="$(cygpath -u "${dest}")"
-	fi
-	tar -C "${dest}" -zxf "${tarball}"
+	tar -C "$2" -zxf "${BUILDDIR}/tarball.tmp"
 	rm -f "${BUILDDIR}/tarball.tmp"
 }
 
@@ -129,7 +124,7 @@ cd build/binutils
 # to install nothing and the script carried on to the next package --
 # which is how a broken gcc reached the point of compiling libppu with a
 # compiler that was never installed.
-${BUILDDIR}/src/binutils-${BINUTILS_VERSION}/configure --prefix "${BUILDDIR}/xgcc" --bindir "${BUILDDIR}/bin" --target pdp11-uknc-rt11 --enable-plugins --disable-libstdcxx --disable-doc --with-system-zlib
+${SRCPREFIX}/binutils-${BINUTILS_VERSION}/configure --prefix "${BUILDDIR}/xgcc" --bindir "${BUILDDIR}/bin" --target pdp11-uknc-rt11 --enable-plugins --disable-libstdcxx --disable-doc --with-system-zlib
 make -j4 MAKEINFO=true
 make install MAKEINFO=true
 
@@ -169,7 +164,7 @@ cd ${BUILDDIR}/build/gdb
 # linker, and gdb is the one thing here that trips it: the link of the
 # Fortran expression parser fails with "invalid r_symbolnum ... in
 # f-exp.o".  On Linux cc and c++ are gcc and g++ anyway.
-CC="${CC:-cc}" CXX="${CXX:-c++}" ${BUILDDIR}/src/gdb/configure --prefix "${BUILDDIR}/xgcc" --bindir "${BUILDDIR}/bin" --target pdp11-uknc-rt11 --disable-binutils --disable-gas --disable-ld --disable-gold --disable-gprof --disable-gprofng --disable-sim --disable-nls --disable-werror --disable-doc --with-system-zlib ${GDB_MATH}
+CC="${CC:-cc}" CXX="${CXX:-c++}" ${SRCPREFIX}/gdb/configure --prefix "${BUILDDIR}/xgcc" --bindir "${BUILDDIR}/bin" --target pdp11-uknc-rt11 --disable-binutils --disable-gas --disable-ld --disable-gold --disable-gprof --disable-gprofng --disable-sim --disable-nls --disable-werror --disable-doc --with-system-zlib ${GDB_MATH}
 make all-gdb -j4 MAKEINFO=true
 make install-gdb MAKEINFO=true
 
@@ -374,7 +369,7 @@ fi
 cd ${BUILDDIR}
 mkdir -p build/gcc
 cd build/gcc
-CXXFLAGS="${CXXFLAGS:--g -O2} ${GCC_CXX_FLAGS}" ${BUILDDIR}/src/gcc-${GCC_VERSION}/configure --prefix "${BUILDDIR}/xgcc" --bindir "${BUILDDIR}/bin" --target pdp11-uknc-rt11 --enable-languages=c --with-gnu-as --with-gnu-ld --with-newlib --enable-newlib-nano-malloc --enable-newlib-nano-formatted-io --disable-newlib-wide-orient --disable-libssp --disable-bootstrap --disable-multilib --disable-nls --disable-libstdcxx --disable-doc --with-system-zlib --disable-libquadmath
+CXXFLAGS="${CXXFLAGS:--g -O2} ${GCC_CXX_FLAGS}" ${SRCPREFIX}/gcc-${GCC_VERSION}/configure --prefix "${BUILDDIR}/xgcc" --bindir "${BUILDDIR}/bin" --target pdp11-uknc-rt11 --enable-languages=c --with-gnu-as --with-gnu-ld --with-newlib --enable-newlib-nano-malloc --enable-newlib-nano-formatted-io --disable-newlib-wide-orient --disable-libssp --disable-bootstrap --disable-multilib --disable-nls --disable-libstdcxx --disable-doc --with-system-zlib --disable-libquadmath
 # CFLAGS_FOR_TARGET carries -ffunction-sections/-fdata-sections into
 # newlib and libgcc.  A program only links the library members it needs,
 # but a member is a whole file, and one function of it is usually all
