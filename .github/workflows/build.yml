@@ -126,7 +126,7 @@ jobs:
       # back in thirty seconds instead.
       - name: The toolchain from last time
         id: cache
-        uses: actions/cache@v4
+        uses: actions/cache/restore@v4
         with:
           path: |
             gcc/bin
@@ -136,6 +136,19 @@ jobs:
       - name: Build the toolchain
         if: steps.cache.outputs.cache-hit != 'true'
         run: cd gcc && sh ./build_gcc_uknc.sh
+
+      # Saved here rather than at the end of the job, because the whole
+      # point is the next attempt at whatever comes after: a job that
+      # fails further on would otherwise throw away the forty minutes it
+      # got right.
+      - name: Keep the toolchain for next time
+        if: steps.cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            gcc/bin
+            gcc/xgcc
+          key: toolchain-${{ runner.os }}-${{ hashFiles('gcc/build_gcc_uknc.sh', 'libs/**') }}
 
       - name: Build the emulator
         run: cd debugger && sh ./build_debugger_uknc.sh
