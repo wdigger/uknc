@@ -331,10 +331,21 @@ else
 	./contrib/download_prerequisites
 fi
 
+# GCC 15's own libcody writes u8"..." where it means const char*, which
+# stopped being true in C++20 -- so a host compiler that defaults to
+# C++20 or later (MSYS2 ships GCC 16) cannot build it.  Ask the compiler
+# what it thinks, and pin the standard only where the answer is wrong.
+GCC_CXX_STD=""
+if ! printf 'const char *p = u8"x";\n' \
+	| ${CXX:-c++} -x c++ -fsyntax-only - > /dev/null 2>&1; then
+	GCC_CXX_STD="-std=gnu++17"
+	echo "host C++ is newer than gcc ${GCC_VERSION} expects: adding ${GCC_CXX_STD}"
+fi
+
 cd ${BUILDDIR}
 mkdir -p build/gcc
 cd build/gcc
-${BUILDDIR}/src/gcc-${GCC_VERSION}/configure --prefix "${BUILDDIR}/xgcc" --bindir "${BUILDDIR}/bin" --target pdp11-uknc-rt11 --enable-languages=c --with-gnu-as --with-gnu-ld --with-newlib --enable-newlib-nano-malloc --enable-newlib-nano-formatted-io --disable-newlib-wide-orient --disable-libssp --disable-bootstrap --disable-multilib --disable-nls --disable-libstdcxx --disable-doc --with-system-zlib --disable-libquadmath
+CXXFLAGS="${CXXFLAGS:--g -O2} ${GCC_CXX_STD}" ${BUILDDIR}/src/gcc-${GCC_VERSION}/configure --prefix "${BUILDDIR}/xgcc" --bindir "${BUILDDIR}/bin" --target pdp11-uknc-rt11 --enable-languages=c --with-gnu-as --with-gnu-ld --with-newlib --enable-newlib-nano-malloc --enable-newlib-nano-formatted-io --disable-newlib-wide-orient --disable-libssp --disable-bootstrap --disable-multilib --disable-nls --disable-libstdcxx --disable-doc --with-system-zlib --disable-libquadmath
 # CFLAGS_FOR_TARGET carries -ffunction-sections/-fdata-sections into
 # newlib and libgcc.  A program only links the library members it needs,
 # but a member is a whole file, and one function of it is usually all

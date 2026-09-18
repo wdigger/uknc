@@ -112,7 +112,9 @@ emupid=$!
 # Wait for the port, which the server says it is listening on.  This is
 # quick -- nothing is booted yet -- but not instant.
 waited=0
-until grep -q "Listening on localhost:$port" "$tmp/emulator.log" 2>/dev/null; do
+# The line, not the number in it: what the emulator prints is its own
+# business, and this already knows which port it asked for.
+until grep -q "Listening on localhost" "$tmp/emulator.log" 2>/dev/null; do
   waited=$((waited + 1))
   if [ "$waited" -gt 200 ]; then
     echo "uknc-run: the emulator never started serving gdb" >&2
