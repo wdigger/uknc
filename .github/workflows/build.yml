@@ -234,6 +234,10 @@ jobs:
             "/DOutputName=${name}" \
             "$(cygpath -w "${GITHUB_WORKSPACE}/.github/installer/uknc.iss")"
 
+      # Actions wraps every artifact in a zip of its own, and all three
+      # of these are compressed already -- a .dmg twice over. Stored,
+      # then, not deflated again for nothing. (A release asset is
+      # attached as the file itself, with no zip anywhere.)
       - uses: actions/upload-artifact@v4
         with:
           name: ${{ env.name }}
@@ -241,4 +245,5 @@ jobs:
             dist/*.tar.gz
             dist/*.dmg
             dist/*.exe
+          compression-level: 0
           if-no-files-found: error
