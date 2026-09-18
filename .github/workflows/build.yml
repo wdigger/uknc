@@ -160,6 +160,10 @@ jobs:
         run: |
           export PATH="${PWD}/gcc/bin:${PATH}"
           make -C examples/hello hello.sav
+          # TEMPORARY: what the machine is being given, byte for byte.
+          sha256sum rom/uknc_rom_autoboot.bin resources/rt11os.dsk \
+                    examples/hello/hello.sav || true
+          ls -l examples/hello/hello.sav || true
           ./gcc/dejagnu/uknc-run examples/hello/hello.sav
 
       # The version is the VERSION file's, and only a tagged build is
