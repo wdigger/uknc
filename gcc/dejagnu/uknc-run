@@ -116,6 +116,9 @@ until grep -q "Listening on localhost:$port" "$tmp/emulator.log" 2>/dev/null; do
   waited=$((waited + 1))
   if [ "$waited" -gt 200 ]; then
     echo "uknc-run: the emulator never started serving gdb" >&2
+    # Whatever it did say instead is the only thing worth knowing here,
+    # and the directory it is in goes away with this script.
+    sed 's/^/uknc-run: emulator: /' "$tmp/emulator.log" >&2 2>/dev/null
     exit 99
   fi
   sleep 0.05 2>/dev/null || sleep 1

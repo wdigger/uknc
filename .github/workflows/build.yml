@@ -117,7 +117,21 @@ jobs:
           pacman -S --noconfirm --needed mingw-w64-ucrt-x86_64-sdl3 \
             || echo "no SDL3 here: the emulator will have no screen"
 
+      # Forty minutes of binutils, gdb, gcc and newlib that only change
+      # when the script that builds them does.  Anything else being
+      # fixed -- the emulator, the packaging, this file -- gets them
+      # back in thirty seconds instead.
+      - name: The toolchain from last time
+        id: cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            gcc/bin
+            gcc/xgcc
+          key: toolchain-${{ runner.os }}-${{ hashFiles('gcc/build_gcc_uknc.sh', 'libs/**') }}
+
       - name: Build the toolchain
+        if: steps.cache.outputs.cache-hit != 'true'
         run: cd gcc && sh ./build_gcc_uknc.sh
 
       - name: Build the emulator
