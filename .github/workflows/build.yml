@@ -271,9 +271,12 @@ jobs:
           # renamed to @rpath, which each program then looks for beside
           # itself -- and the copies are put through the same treatment,
           # since a library has libraries of its own (MPFR wants GMP).
+          # Nothing left after the filtering is the answer being looked
+          # for here, not a failure -- and grep says otherwise, which
+          # under "set -e -o pipefail" ends the step where it stands.
           collect () {
             otool -L "$1" | tail -n +2 | awk '{print $1}' \
-              | grep -vE '^/usr/lib/|^/System/|^@'
+              | grep -vE '^/usr/lib/|^/System/|^@' || true
           }
 
           again=yes
