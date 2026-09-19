@@ -253,6 +253,109 @@ jobs:
           fi
           du -sh . | sed 's/^/package: /'
 
+      # Everything the package needs that the machine it lands on might
+      # not have.  Here that is Homebrew's and MSYS2's: SDL3 for the
+      # emulator, GMP, MPFR and zstd for gdb.  Left out, the package
+      # works perfectly on the machine that built it and dies on the
+      # first one that never installed them -- which is not a theory:
+      # gdb here stopped starting the day a package manager was tidied
+      # away underneath it.
+      - name: Take the libraries with it
+        if: runner.os == 'macOS'
+        run: |
+          cd "dist/${name}"
+          mkdir -p lib
+
+          # Every program in the package, and everything it asks for
+          # that is not part of the system.  Copied once into lib/ and
+          # renamed to @rpath, which each program then looks for beside
+          # itself -- and the copies are put through the same treatment,
+          # since a library has libraries of its own (MPFR wants GMP).
+          collect () {
+            otool -L "$1" | tail -n +2 | awk '{print $1}' \
+              | grep -vE '^/usr/lib/|^/System/|^@'
+          }
+
+          again=yes
+          while [ "${again}" = yes ]; do
+            again=no
+            for binary in $(find . -type f -perm -u+x) lib/*.dylib; do
+              [ -f "${binary}" ] || continue
+              for dep in $(collect "${binary}"); do
+                base=$(basename "${dep}")
+                if [ ! -f "lib/${base}" ]; then
+                  cp "${dep}" "lib/${base}"
+                  chmod u+w "lib/${base}"
+                  install_name_tool -id "@rpath/${base}" "lib/${base}"
+                  again=yes
+                fi
+                install_name_tool -change "${dep}" "@rpath/${base}" \
+                  "${binary}"
+              done
+            done
+          done
+
+          # Where @rpath is, from wherever the program sits.
+          for binary in $(find . -type f -perm -u+x); do
+            case "$(file -b "${binary}")" in
+              *Mach-O*) ;;
+              *) continue ;;
+            esac
+            depth=$(dirname "${binary}" | awk -F/ '{print NF - 1}')
+            up=""
+            i=0
+            while [ ${i} -lt ${depth} ]; do up="${up}../"; i=$((i + 1)); done
+            install_name_tool -add_rpath "@loader_path/${up}lib" \
+              "${binary}" 2>/dev/null || true
+            # Rewriting a program breaks its signature, and on Apple
+            # Silicon a broken signature is a program that will not run
+            # at all -- killed outright, with nothing said.
+            codesign -f -s - "${binary}" 2>/dev/null || true
+          done
+          for library in lib/*.dylib; do
+            [ -f "${library}" ] && codesign -f -s - "${library}" || true
+          done
+
+          echo "still wanted from outside:"
+          for binary in $(find . -type f -perm -u+x); do
+            collect "${binary}" | sed "s|^|  ${binary}: |"
+          done | tee outside.txt
+          if [ -s outside.txt ]; then
+            echo "a package that needs what is not in it" >&2
+            exit 1
+          fi
+          rm -f outside.txt
+
+      - name: Take the libraries with it
+        if: runner.os == 'Windows'
+        run: |
+          cd "dist/${name}"
+          # ldd lists what a program loads, with the paths it will load
+          # them from; everything under the package set's own prefix has
+          # to come along, beside the program that wants it (which is
+          # where Windows looks first).
+          for exe in $(find . -name '*.exe'); do
+            for dll in $(ldd "${exe}" | awk '{print $3}' \
+                         | grep -i '^/ucrt64/'); do
+              cp -n "${dll}" "$(dirname "${exe}")/" || true
+            done
+          done
+
+          echo "still wanted from outside:"
+          left=""
+          for exe in $(find . -name '*.exe'); do
+            missing=$(ldd "${exe}" | awk '{print $3}' | grep -i '^/ucrt64/' \
+                      || true)
+            if [ -n "${missing}" ]; then
+              echo "  ${exe}: ${missing}"
+              left=yes
+            fi
+          done
+          if [ -n "${left}" ]; then
+            echo "a package that needs what is not in it" >&2
+            exit 1
+          fi
+
       # The same program again, with the package this time: its own
       # compiler, its own libraries, its own emulator, nothing on the
       # machine outside the folder.  Building a package and shipping a
