@@ -63,6 +63,76 @@ pdp11-uknc-rt11-gcc -std=gnu23 -fomit-frame-pointer -O2 \
 — `build_gcc_uknc.sh` скачивает их автоматически. Ниже — что этот тулчейн
 умеет сверх ванильных binutils/GCC/newlib.
 
+### Сборка проекта через CMake
+
+В `cmake/` лежит тулчейн-файл, который цепляется к любому проекту на CMake:
+
+```bash
+cmake -B build -DCMAKE_TOOLCHAIN_FILE=/путь/к/uknc/cmake/uknc-toolchain.cmake
+cmake --build build
+```
+
+Тулчейн он находит сам — по собственному расположению (файл лежит в корне
+тулчейна, а распакованный релиз устроен так же), либо по `-DUKNC_ROOT=...`
+(или одноимённой переменной окружения), либо по `pdp11-uknc-rt11-gcc` в
+`PATH`. Больше проекту знать ничего не нужно: компилятор, binutils, флаги,
+sysroot и пути ко всему остальному приходят вместе с ним. Нужен CMake 3.21
+или новее.
+
+Флаги те же, с которыми собраны все примеры: `-fomit-frame-pointer
+-ffunction-sections -fdata-sections`, при линковке `--gc-sections`, стандарт
+`gnu23`. Тип сборки по умолчанию — `RelWithDebInfo`, то есть `-O2 -g`;
+`NDEBUG` в нём намеренно не определяется, чтобы `assert()` оставался, а
+`Debug` — это `-Og -g`, а не `-O0`: на машине с 64 КБ адресного пространства
+`-O0` обходится дороже, чем стоит.
+
+Результат `add_executable` — `.sav`, плоский образ памяти RT-11. Поверх этого
+есть команды на то, чего в CMake нет:
+
+```cmake
+cmake_minimum_required(VERSION 3.21)
+project(gfour C)
+
+uknc_add_program(gfour gfour.c)
+target_link_libraries(gfour PRIVATE ppu pdp11)
+
+uknc_add_ppu_module(gfourppu gfourppu.c NAME gfppu LIBRARIES pdp11)
+
+uknc_add_disk(disk NAME gfour CONTENTS gfour gfourppu)
+uknc_add_run(gfour)
+```
+
+| Команда | Что делает |
+|---|---|
+| `uknc_add_program` | `.sav` плюс цель `<имя>-elf` с тем же кодом, но с символами и DWARF — её читает gdb. Линкуется из тех же объектных файлов, что и образ, так что разойтись они не могут. Заодно `.sav.map` |
+| `uknc_add_ppu_module` | `.ppu` — объектный модуль RT-11 для ПП, который ЦП грузит через `ppuc_load_code()`, и `.ppu.elf` рядом для отладки |
+| `uknc_add_disk` | образ диска: копия системного плюс перечисленное в `CONTENTS` (цели и файлы вперемешку) |
+| `uknc_add_run` | цель `run-<имя>`: запустить на машине через `uknc-run` |
+| `uknc_add_test` | то же самое как тест ctest |
+
+Дальше это обычные цели CMake: `target_link_libraries`, `target_sources`,
+`target_compile_options` работают как везде, и добавленное ими доходит и до
+`.elf` — он линкуется из тех же объектных файлов и наследует те же
+библиотеки.
+
+`NAME` есть там, где имя файла попадает на диск: RT-11 держит шесть символов
+и трёхсимвольный тип, `rt11dsk` молча обрежет что угодно длиннее, и программа
+потом не найдёт свой модуль. Если имя цели под это не подходит, CMake скажет
+об этом при конфигурации.
+
+Пути, которые тулчейн-файл выставляет проекту, если он захочет собрать
+что-нибудь своё: `UKNC_ROOT`, `UKNC_SYSROOT`, `UKNC_GCC`, `UKNC_GDB`,
+`UKNC_LD_PPU`, `UKNC_RT11DSK`, `UKNC_EMULATOR`, `UKNC_RUN`,
+`UKNC_SYSTEM_DISK`, `UKNC_FIRMWARE`, `UKNC_PPU_GDB_SCRIPT`.
+
+Готовые примеры — `examples/hello/CMakeLists.txt` (только ЦП) и
+`examples/gfour/CMakeLists.txt` (ЦП и ПП вместе). Собираются рядом с
+`Makefile`, который никуда не делся, и дают байт в байт то же самое: `.sav`,
+`.ppu` и код в `.elf` у обеих сборок совпадают.
+
+Одна оговорка: расширение VS Code по F5 запускает `make`, а не CMake, — для
+проекта на CMake сборку перед запуском оно не сделает.
+
 ### Формат объектных файлов — ELF
 
 Объектные файлы — ELF (`elf32-pdp11`). ELF-бэкенда для pdp11 нет ни в

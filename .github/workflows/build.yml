@@ -215,6 +215,9 @@ jobs:
           cp -R "${GITHUB_WORKSPACE}/resources" .
           cp -R "${GITHUB_WORKSPACE}/examples" .
           cp -R "${GITHUB_WORKSPACE}/libs" .
+          # The CMake toolchain file finds the rest of the package by
+          # sitting in it, so it has to come along.
+          cp -R "${GITHUB_WORKSPACE}/cmake" .
           cp "${GITHUB_WORKSPACE}/README.md" .
           # What this package actually contains, for anyone holding the
           # binary a year from now with no idea what went into it.
