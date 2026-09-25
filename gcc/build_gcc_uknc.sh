@@ -159,6 +159,29 @@ for prefix in /opt/local /opt/homebrew /usr/local; do
 	fi
 done
 
+# gdb's Python is not a nicety here: libs/libppu/ppu.gdb is written in
+# it, and that script is how the PPU side gets its symbols.  configure
+# switches Python off rather than stopping when the one it found cannot
+# be linked against, and the only sign is a line in config.log -- so a
+# rebuild loses PPU debugging without saying anything.  macOS is exactly
+# that case: /usr/bin/python3 is Apple's, and its python3-config reports
+# the framework as a relative path, which nothing can link.  Hence a
+# package manager's Python first, where there is one.  Where there is
+# not -- a distribution with python3-dev installed -- configure finds it
+# by itself and this adds nothing.
+GDB_PYTHON=""
+for python in \
+	/opt/homebrew/opt/python@3*/bin/python3 \
+	/opt/local/bin/python3 \
+	/usr/local/opt/python@3*/bin/python3
+do
+	if [ -x "${python}" ]; then
+		GDB_PYTHON="--with-python=${python}"
+		echo "gdb: building against ${python}"
+		break
+	fi
+done
+
 mkdir -p ${BUILDDIR}/build/gdb
 cd ${BUILDDIR}/build/gdb
 # CC/CXX are pinned to the platform's own cc/c++ rather than left to
@@ -167,9 +190,19 @@ cd ${BUILDDIR}/build/gdb
 # linker, and gdb is the one thing here that trips it: the link of the
 # Fortran expression parser fails with "invalid r_symbolnum ... in
 # f-exp.o".  On Linux cc and c++ are gcc and g++ anyway.
-CC="${CC:-cc}" CXX="${CXX:-c++}" ${SRCPREFIX}/gdb/configure --prefix "${BUILDDIR}/xgcc" --bindir "${BUILDDIR}/bin" --target pdp11-uknc-rt11 --disable-binutils --disable-gas --disable-ld --disable-gold --disable-gprof --disable-gprofng --disable-sim --disable-nls --disable-werror --disable-doc --with-system-zlib ${GDB_MATH}
+CC="${CC:-cc}" CXX="${CXX:-c++}" ${SRCPREFIX}/gdb/configure --prefix "${BUILDDIR}/xgcc" --bindir "${BUILDDIR}/bin" --target pdp11-uknc-rt11 --disable-binutils --disable-gas --disable-ld --disable-gold --disable-gprof --disable-gprofng --disable-sim --disable-nls --disable-werror --disable-doc --with-system-zlib ${GDB_MATH} ${GDB_PYTHON}
 make all-gdb -j4 MAKEINFO=true
 make install-gdb MAKEINFO=true
+
+# Said out loud, because the alternative is finding out when a
+# breakpoint in PPU code cannot be set.
+if "${BUILDDIR}/bin/pdp11-uknc-rt11-gdb" -batch -ex 'python pass' \
+		> /dev/null 2>&1; then
+	echo "gdb: Python is there, so ppu.gdb will load"
+else
+	echo "gdb: WARNING -- no Python; libs/libppu/ppu.gdb will not load," \
+		"and the PPU side has no symbols"
+fi
 
 # Download and patch gcc
 cd ${BUILDDIR}
