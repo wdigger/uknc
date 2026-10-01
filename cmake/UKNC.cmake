@@ -150,7 +150,10 @@ function(uknc_add_ppu_module target)
             $<TARGET_OBJECTS:${objects}>
             -L${UKNC_SYSROOT}/lib ${libraries}
     WORKING_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}"
-    DEPENDS ${objects}
+    # The object files by name as well as the target: a target alone is
+    # an ordering dependency, and make then keeps a module built from
+    # sources that have since changed.
+    DEPENDS ${objects} $<TARGET_OBJECTS:${objects}>
     COMMENT "Linking PPU module ${name}.ppu"
     COMMAND_EXPAND_LISTS VERBATIM)
   set(outputs "${module}")
@@ -165,7 +168,7 @@ function(uknc_add_ppu_module target)
               $<TARGET_OBJECTS:${objects}>
               -L${UKNC_SYSROOT}/lib ${libraries}
       WORKING_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}"
-      DEPENDS ${objects}
+      DEPENDS ${objects} $<TARGET_OBJECTS:${objects}>
       COMMENT "Linking PPU module ${name}.ppu.elf"
       COMMAND_EXPAND_LISTS VERBATIM)
     list(APPEND outputs "${twin}")
