@@ -1,0 +1,160 @@
+From 2f718d7f0290a628f5a0d8694cb53cae5516d9a4 Mon Sep 17 00:00:00 2001
+From: Yury Klushin <digger@live.ru>
+Date: Mon, 7 Sep 2026 10:45:48 +0300
+Subject: [PATCH] reload: revisit insns whose indirect-address pseudo is off
+ its initial elimination offset
+
+With -fdefer-pop (on at every -O level) pdp11 code like
+
+  int g (int *p, int a, int c)
+  { int r = f (a, c); int v = *p; if (r) *p = v + 4; return v & 15; }
+
+read *p through the wrong stack slot right after the call:
+
+  jsr pc,_f
+  mov @02(sp),r1     ; should be @06(sp): the two pushed args are still there
+  add $04,sp
+
+The pseudo holding p is spilled and has a REG_EQUIV to its argument
+slot.  When such a pseudo is used as an *indirect* address (pdp11 has
+@n(sp)), find_reloads_address takes the "the equivalent memory is itself
+a valid address, no reload needed" shortcut.  In the final pass that
+shortcut substitutes the equivalent computed at the *current*
+elimination offsets, which is right; but in the non-final passes it
+just returned 0 without flagging the insn, so reload_as_needed never
+looked at the insn again, the pseudo stayed in place, and reload's
+closing in-place pseudo-to-MEM substitution used reg_equiv_mem, whose
+address was computed once at the *initial* elimination offsets -- off
+by the size of the outstanding pushed arguments.
+
+Fix: when the equivalent differs from reg_equiv_mem (i.e. this insn is
+not at the initial offset) and this is not the final pass, push an
+*optional* reload of the address instead of returning silently.  An
+optional reload takes no part in the spill-register computation (so
+it costs nothing -- a required reload here made the prologue save a
+callee-saved register that was never actually used), but it marks the
+insn as needing reload, so the final pass revisits it and takes the
+substituting branch.
+
+Not reachable with -mlra, which does not use this code.
+
+gcc.target/pdp11: defer-pop-equiv-mem.c is the case above, checking
+that the read after the call is @06(sp) and never @02(sp).  pdp11.exp
+91 PASS / 0 FAIL; gcc.c-torture/compile FAILs unchanged in kind (16-bit
+object limits, no named sections, vector-dup-1's float-in-GPR asm).
+---
+ gcc/reload.cc                                 | 53 +++++++++++++++----
+ .../gcc.target/pdp11/defer-pop-equiv-mem.c    | 38 +++++++++++++
+ 2 files changed, 80 insertions(+), 11 deletions(-)
+ create mode 100644 gcc/testsuite/gcc.target/pdp11/defer-pop-equiv-mem.c
+
+diff --git a/gcc/reload.cc b/gcc/reload.cc
+index 31814d1e8e110..0b535a909b7b1 100644
+--- a/gcc/reload.cc
++++ b/gcc/reload.cc
+@@ -4943,19 +4943,50 @@ find_reloads_address (machine_mode mode, rtx *memrefloc, rtx ad,
+ 		  /* TEM is not the same as what we'll be replacing the
+ 		     pseudo with after reload, put a USE in front of INSN
+ 		     in the final reload pass.  */
+-		  if (replace_reloads
+-		      && num_not_at_initial_offset
++		  if (num_not_at_initial_offset
+ 		      && ! rtx_equal_p (tem, reg_equiv_mem (regno)))
+ 		    {
+-		      *loc = tem;
+-		      /* We mark the USE with QImode so that we
+-			 recognize it as one that can be safely
+-			 deleted at the end of reload.  */
+-		      PUT_MODE (emit_insn_before (gen_rtx_USE (VOIDmode, ad),
+-						  insn), QImode);
+-
+-		      /* This doesn't really count as replacing the address
+-			 as a whole, since it is still a memory access.  */
++		      if (replace_reloads)
++			{
++			  *loc = tem;
++			  /* We mark the USE with QImode so that we
++			     recognize it as one that can be safely
++			     deleted at the end of reload.  */
++			  PUT_MODE (emit_insn_before (gen_rtx_USE (VOIDmode,
++								   ad),
++						      insn), QImode);
++
++			  /* This doesn't really count as replacing the
++			     address as a whole, since it is still a memory
++			     access.  */
++			  return 0;
++			}
++
++		      /* Not the final pass, so the substitution above
++			 can't be done yet (the elimination offsets may
++			 still change while reload iterates) -- but it must
++			 be done eventually: reload () finishes by turning
++			 every spilled pseudo into its reg_equiv_mem in
++			 place, and that address was computed at the
++			 eliminable registers' *initial* offsets, which is
++			 exactly what TEM differs from here (e.g. a
++			 stack-pointer-relative argument slot read while
++			 pushed call arguments are still outstanding, with
++			 -fdefer-pop).  reload_as_needed only revisits insns
++			 that this pass flagged as needing a reload, an
++			 elimination, or an operand change; returning 0 here
++			 would flag none of those, the pseudo would be left
++			 in place, and the final substitution would silently
++			 use the wrong offset.  So push an *optional* reload
++			 of the address: it costs nothing here (optional
++			 reloads take no part in the spill-register
++			 computation), but it makes this an insn the final
++			 pass looks at again, where the branch above then
++			 does the substitution and no reload results.  */
++		      push_reload (ad, NULL_RTX, loc, (rtx*) 0,
++				   base_reg_class (mode, as, MEM, SCRATCH,
++						   insn),
++				   GET_MODE (ad), VOIDmode, 0, 1, opnum, type);
+ 		    }
+ 		  return 0;
+ 		}
+diff --git a/gcc/testsuite/gcc.target/pdp11/defer-pop-equiv-mem.c b/gcc/testsuite/gcc.target/pdp11/defer-pop-equiv-mem.c
+new file mode 100644
+index 0000000000000..29341917d9d53
+--- /dev/null
++++ b/gcc/testsuite/gcc.target/pdp11/defer-pop-equiv-mem.c
+@@ -0,0 +1,38 @@
++/* { dg-do compile { target pdp11-*-* } } */
++/* { dg-options "-O2 -fomit-frame-pointer" } */
++
++/* reload (not LRA) miscompiled a stack-passed pointer read right after
++   a call to an external function while the call's pushed arguments
++   were still outstanding (-fdefer-pop, on at every -O level): the
++   spilled pseudo holding the pointer has a REG_EQUIV to its argument
++   slot, and when that pseudo is used as an *indirect* address (pdp11
++   has @n(sp)), find_reloads_address's "no reload needed" shortcut left
++   it in place without flagging the insn for the final pass -- so the
++   final pseudo-to-MEM substitution used reg_equiv_mem's initial-offset
++   address, 2(sp), instead of the 6(sp) the two pushed words call for.
++   The load then dereferenced the second call argument, not the
++   pointer.  f must be external: a same-file definition changes
++   register allocation and hides the bug.  */
++
++extern int f (int a, int c);
++
++__attribute__ ((noinline)) int
++g (int *p, int a, int c)
++{
++  int r = f (a, c);
++  int v = *p;
++  if (r)
++    {
++      v += 4;
++      *p = v;
++    }
++  return v & 15;
++}
++
++/* Right after the call, with both arguments still pushed, p is at
++   6(sp) -- never at 2(sp), which is where the pushed c is.  */
++/* { dg-final { scan-assembler "jsr\tpc,_f\n\tmov\t@06\\(sp\\)," } } */
++/* { dg-final { scan-assembler-not "jsr\tpc,_f\n\tmov\t@02\\(sp\\)" } } */
++/* After the deferred pop, the same slot is 2(sp) again (the store).  */
++/* { dg-final { scan-assembler "add\t.04,sp" } } */
++/* { dg-final { scan-assembler "@02\\(sp\\)" } } */

@@ -1,0 +1,213 @@
+From 7d0a64e14effd6a8307e4da5fc8aedada1723269 Mon Sep 17 00:00:00 2001
+From: Yury Klushin <digger@live.ru>
+Date: Tue, 1 Sep 2026 21:06:10 +0300
+Subject: [PATCH] pdp11: default _printf_float stub to avoid 36KB float-printf
+ tax
+
+This backend doesn't support weak symbols at all ("warning: weak
+declaration of 'foo' not supported"), so newlib-nano's own weak
+_printf_float (libc/stdio/nano-vfprintf.c, meant to keep
+dtoa/mprec/soft-double arithmetic out of a program that never formats
+a float) resolves as an ordinary strong reference instead. The real
+implementation (libc/stdio/nano-vfprintf_float.c) then gets linked
+into EVERY program that calls printf/fprintf, even one using only
+%d -- measured at 36KB for this target (50608 bytes -> 14664 for a
+plain "printf("%d\n", 42)" once this stub is in effect).
+
+Fix: a small _printf_float stub (libgcc/config/pdp11/
+printf_float_stub.c, exactly mirroring nano-vfprintf.c's own
+"_printf_float == NULL" fallback path -- consume the vararg, print
+nothing for that conversion) is now injected via STARTFILE_SPEC
+(pdp11.h), right alongside crt0rt.o/parse_args.o, and built the same
+way via libgcc/config/pdp11/t-pdp11rt11 and listed in libgcc/
+config.host's extra_parts. Since it's an explicit object placed
+ahead of -lc on every link line, and static archives are searched
+lazily, the archive's own (large) _printf_float definition is simply
+never pulled in once this stub has already satisfied the reference --
+confirmed by comparing linker -Map output before and after, not just
+assumed.
+
+A `-Wl,--defsym=_printf_float=0` was tried first, hoping to exploit
+nano-vfprintf.c's own NULL check directly without needing a stub
+function at all -- measured to NOT prevent the archive's strong
+definition from still being linked, so this explicit stub-object
+approach is what's actually verified to work.
+
+Cost for a program that never calls printf at all (e.g. one using
+only puts()): +8 bytes (the stub itself; this backend doesn't support
+-ffunction-sections/--gc-sections at the per-symbol level so the tiny
+object is always linked, but never referenced/dead code).
+
+A program that genuinely needs %f/%e/%g can still get the real
+implementation by linking with -nostartfiles and supplying crt0rt.o/
+parse_args.o explicitly (omitting this stub), letting the archive's
+own _printf_float resolve normally -- see printf_float_stub.c's own
+header comment for the exact recipe.
+
+Verified via a full from-scratch toolchain rebuild and real .sav
+builds in the ukncbtl-debugger emulator: a printf() user with %d/%s
+only (no %f) dropped from 56440 to 20272 bytes, output unchanged.
+---
+ gcc/config/pdp11/pdp11.h                | 15 ++++-
+ libgcc/config.host                      |  2 +-
+ libgcc/config/pdp11/printf_float_stub.c | 81 +++++++++++++++++++++++++
+ libgcc/config/pdp11/t-pdp11rt11         | 19 ++++--
+ 4 files changed, 109 insertions(+), 8 deletions(-)
+ create mode 100644 libgcc/config/pdp11/printf_float_stub.c
+
+diff --git a/gcc/config/pdp11/pdp11.h b/gcc/config/pdp11/pdp11.h
+index c8f70571cf500..4f72d577ead62 100644
+--- a/gcc/config/pdp11/pdp11.h
++++ b/gcc/config/pdp11/pdp11.h
+@@ -672,7 +672,18 @@ extern int current_first_parm_offset;
+    as crt0rt.o/parse_args.o from libgcc/config/pdp11/{crt0rt.s,parse_args.c}
+    via libgcc/config/pdp11/t-pdp11rt11.  This overrides gcc.cc's generic
+    STARTFILE_SPEC, which looks for a "crt0.o" this target has never
+-   provided.  */
++   provided.
++
++   printf_float_stub.o rides along here too: this backend can't support
++   weak symbols, so newlib-nano's own weak _printf_float (meant to keep
++   dtoa/mprec/soft-double out of a program that never formats a float)
++   resolves as an ordinary strong reference instead, pulling in ~36KB of
++   float-formatting machinery into EVERY program that calls printf, even
++   with only %d in its format strings.  Placing this stub's own
++   _printf_float on the link line ahead of -lc satisfies that reference
++   before the archive is even scanned, so its real (large) implementation
++   is never pulled in -- see printf_float_stub.c's own header comment for
++   the full story and how to opt back into real %f/%e/%g support.  */
+ #undef STARTFILE_SPEC
+-#define STARTFILE_SPEC "crt0rt.o%s parse_args.o%s"
++#define STARTFILE_SPEC "crt0rt.o%s parse_args.o%s printf_float_stub.o%s"
+ #endif
+diff --git a/libgcc/config.host b/libgcc/config.host
+index 5b9eb7a15d886..0402bee0a3dc9 100644
+--- a/libgcc/config.host
++++ b/libgcc/config.host
+@@ -1207,7 +1207,7 @@ or1k-*-*)
+ 	;;
+ pdp11-uknc-rt11*)
+ 	tmake_file="pdp11/t-pdp11 pdp11/t-pdp11rt11 t-fdpbit"
+-	extra_parts="$extra_parts crt0rt.o parse_args.o"
++	extra_parts="$extra_parts crt0rt.o parse_args.o printf_float_stub.o"
+ 	;;
+ pdp11-*-*)
+ 	tmake_file="pdp11/t-pdp11 t-fdpbit"
+diff --git a/libgcc/config/pdp11/printf_float_stub.c b/libgcc/config/pdp11/printf_float_stub.c
+new file mode 100644
+index 0000000000000..0519bce7c9b86
+--- /dev/null
++++ b/libgcc/config/pdp11/printf_float_stub.c
+@@ -0,0 +1,81 @@
++/* printf_float_stub.c -- default _printf_float for pdp11-uknc-rt11
++ *
++ * newlib-nano's vfprintf (libc/stdio/nano-vfprintf.c) declares
++ * _printf_float weak and checks "if (_printf_float == NULL)" before
++ * calling it, so that a program never formatting a float doesn't pay
++ * for the real implementation (libc/stdio/nano-vfprintf_float.c, which
++ * pulls in dtoa/mprec and pdp11's soft double-precision arithmetic --
++ * measured at 36KB for this target).  GCC's pdp11 backend doesn't
++ * support weak symbols at all ("warning: weak declaration of 'foo' not
++ * supported"), so that reference silently becomes an ordinary strong
++ * one, and the real implementation gets linked into EVERY program that
++ * calls printf/fprintf, even one that only ever uses %d.
++ *
++ * Fix: provide this file's own _printf_float here, injected via
++ * STARTFILE_SPEC (see pdp11.h, right next to crt0rt.o/parse_args.o) so
++ * it appears on the link line before -lc is even scanned.  Static
++ * archives are searched lazily -- once _printf_float is already
++ * resolved by an object given explicitly on the command line, the
++ * archive's own nano-vfprintf_float.o is simply never pulled in, and
++ * dtoa.o/mprec.o/the soft-float routines go with it.  (A more surgical
++ * `-Wl,--defsym=_printf_float=0` was tried first -- exploiting
++ * nano-vfprintf.c's own NULL check directly, no stub function needed --
++ * but measured to NOT prevent the archive's strong definition from
++ * still being pulled in on this linker; an explicit object placed
++ * ahead of the archive is what actually works, confirmed by comparing
++ * the linker map before and after.)
++ *
++ * This body is exactly nano-vfprintf.c's own "_printf_float == NULL"
++ * fallback path (consume the varargs float argument so later format
++ * specifiers still read the right argument, print nothing for this
++ * one) -- i.e. any real target where the weak reference legitimately
++ * doesn't resolve behaves identically to this.
++ *
++ * A program that genuinely needs %f/%e/%g formatting can still get the
++ * real implementation: link with -nostartfiles and list crt0rt.o and
++ * parse_args.o (but not this file) explicitly, e.g.
++ *   pdp11-uknc-rt11-gcc -nostartfiles -o prog.sav \
++ *     `pdp11-uknc-rt11-gcc -print-file-name=crt0rt.o` \
++ *     `pdp11-uknc-rt11-gcc -print-file-name=parse_args.o` \
++ *     prog.o -lc -lgcc
++ * which omits this stub, so the archive's own real _printf_float
++ * resolves normally (at the usual ~36KB cost).
++ */
++
++#include <stdarg.h>
++#include <stdio.h>
++
++/* Opaque -- this file never dereferences a struct _reent *, only passes
++   the pointer through/ignores it, so an incomplete type is enough and
++   keeps this stub from depending on reent.h's own layout. */
++struct _reent;
++
++/* Mirrors nano-vfprintf_local.h's struct _prt_data_t: this file only
++   ever reads its first member (flags), so only that member needs to
++   line up -- guaranteed, since C never inserts padding before a
++   struct's first member.  Not #include-ing the real (private,
++   libc/stdio-internal) header to avoid depending on stdio's own build
++   layout from outside it.  */
++struct _prt_data_t_flags_only
++{
++  int flags;
++};
++
++#define LONGDBL 0x100 /* Must match nano-vfprintf_local.h's own value. */
++
++int
++_printf_float (struct _reent *data,
++	       struct _prt_data_t_flags_only *pdata,
++	       FILE *fp,
++	       int (*pfunc) (struct _reent *, FILE *, const char *, size_t len),
++	       va_list *ap)
++{
++  (void) data;
++  (void) fp;
++  (void) pfunc;
++  if (pdata->flags & LONGDBL)
++    (void) va_arg (*ap, long double);
++  else
++    (void) va_arg (*ap, double);
++  return 0;
++}
+diff --git a/libgcc/config/pdp11/t-pdp11rt11 b/libgcc/config/pdp11/t-pdp11rt11
+index ceadd6a7bf8c8..e9479024a2d23 100644
+--- a/libgcc/config/pdp11/t-pdp11rt11
++++ b/libgcc/config/pdp11/t-pdp11rt11
+@@ -1,8 +1,13 @@
+-# Build crt0rt.o and parse_args.o (see gcc/config/pdp11/pdp11.h's
+-# STARTFILE_SPEC, guarded by TARGET_RT11_DEFAULTS) for pdp11-uknc-rt11:
+-# the RT-11 startup that sets SP from the SAV header and builds argc/argv
+-# from RT-11's own command-line chain area (see crt0rt.s's own comments),
+-# plus the plain C command-line tokenizer it calls into.
++# Build crt0rt.o, parse_args.o, and printf_float_stub.o (see
++# gcc/config/pdp11/pdp11.h's STARTFILE_SPEC, guarded by
++# TARGET_RT11_DEFAULTS) for pdp11-uknc-rt11: the RT-11 startup that sets
++# SP from the SAV header and builds argc/argv from RT-11's own
++# command-line chain area (see crt0rt.s's own comments), the plain C
++# command-line tokenizer it calls into, and a default _printf_float
++# that keeps newlib-nano's dtoa/mprec/soft-double machinery out of a
++# program that never formats a float -- see printf_float_stub.c's own
++# header comment for why this is needed (weak symbols don't work on
++# this backend) and how to opt back into real %f/%e/%g support.
+ 
+ crt0rt.o: $(srcdir)/config/pdp11/crt0rt.s
+ 	$(GCC_FOR_TARGET) $(INCLUDES) $(CFLAGS) -Wa,-mno-fpu,-mlimited-eis,-pic \
+@@ -11,3 +16,7 @@ crt0rt.o: $(srcdir)/config/pdp11/crt0rt.s
+ parse_args.o: $(srcdir)/config/pdp11/parse_args.c
+ 	$(GCC_FOR_TARGET) $(INCLUDES) $(CFLAGS) -fomit-frame-pointer -msoft-float \
+ 		-O2 -c $(srcdir)/config/pdp11/parse_args.c -o parse_args.o
++
++printf_float_stub.o: $(srcdir)/config/pdp11/printf_float_stub.c
++	$(GCC_FOR_TARGET) $(INCLUDES) $(CFLAGS) -fomit-frame-pointer -msoft-float \
++		-O2 -c $(srcdir)/config/pdp11/printf_float_stub.c -o printf_float_stub.o

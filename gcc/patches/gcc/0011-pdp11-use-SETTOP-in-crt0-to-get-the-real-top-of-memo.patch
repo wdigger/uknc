@@ -1,0 +1,82 @@
+From 03e44cf1026bcb2a980f93faa6c6b32030334a5a Mon Sep 17 00:00:00 2001
+From: Yury Klushin <digger@live.ru>
+Date: Sun, 6 Sep 2026 18:24:52 +0300
+Subject: [PATCH] pdp11: use .SETTOP in crt0 to get the real top of memory, not
+ a link-time guess
+
+The initial SP crt0rt.s reads from the SAV header (word offset 042,
+`mov @$042, sp`) is only what sav-pdp11.c's own
+sav_pdp11_write_object_contents() could compute at link time:
+max(SAV_STACK_ADDRESS, program's own _end). That default
+(SAV_STACK_ADDRESS = 16896) assumes a specific resident-monitor
+footprint for one particular RT11SJ.SYS build; once a program's own
+_end exceeds it, the header value becomes exactly the program's own
+top -- zero headroom for stack or heap beyond newlib's own
+RT11_STACK_MARGIN (512 bytes, see libc/sys/rt11/sbrk.c), regardless of
+how much memory the machine this actually boots on has genuinely free.
+
+RT-11 has a real, documented way to ask for that instead: .SETTOP
+(EMT 354, per the RT-11 System Macro Library Manual). A program passes
+a requested top address in R0; the monitor returns in R0 the actual
+highest legal address for the job -- clamped down if the request
+exceeds what's free, never higher than requested. Requesting the
+theoretical maximum (0177776, the highest even address) and taking
+whatever comes back is the documented way to discover the monitor's
+real free-memory ceiling at runtime instead of relying on the
+link-time guess.
+
+Added right after the existing `mov @$042, sp`, guarded with a
+compare: only raise SP to .SETTOP's answer when it's actually higher
+than the header's own value, in case some future RT11SJ.SYS build
+(different resident driver selection -- SAV_STACK_ADDRESS's own
+comment already flags this as build-specific) leaves *less* free
+memory than the static link-time guess assumed; never move SP
+backwards into what could already be in-use stack.
+
+Verified on real hardware (ukncbtl-debugger emulator) against a real
+program that had outgrown its available memory: SP at main() entry
+went from 22142 (link-time header value, main()'s own malloc() for a
+paged-in RT-11 object file was failing with ENOMEM) to 45626 (.SETTOP
+answer) -- roughly double the headroom, and the same malloc() call
+that was failing now succeeds with room to spare.
+---
+ libgcc/config/pdp11/crt0rt.s | 26 ++++++++++++++++++++++++++
+ 1 file changed, 26 insertions(+)
+
+diff --git a/libgcc/config/pdp11/crt0rt.s b/libgcc/config/pdp11/crt0rt.s
+index cfc6a0096bc53..f85dd60ffe8bf 100644
+--- a/libgcc/config/pdp11/crt0rt.s
++++ b/libgcc/config/pdp11/crt0rt.s
+@@ -12,6 +12,32 @@ cmdbuf_max = 80
+ start:
+         mov   @$042, sp   // SP comes from the SAV header (RT-11 sets it before we start)
+ 
++        // That header value is only a link-time guess (max(16896, this
++        // program's own _end) -- see bfd/sav-pdp11.c's own
++        // sav_pdp11_write_object_contents(), which has no idea how much
++        // memory the resident monitor/drivers on the machine this actually
++        // boots on leave free). .SETTOP (EMT 354) asks the monitor for the
++        // *real* top of memory instead: R0 in is the requested address, R0
++        // out is the actual highest legal address for this job -- never
++        // higher than requested, silently clamped down if the request was
++        // too big (RT-11 System Macro Library Manual, .SETTOP: "the address
++        // returned will be the highest legal address for the job, not the
++        // requested address"). Requesting the theoretical maximum
++        // (0177776, the highest even address) and taking whatever comes
++        // back is the documented way to discover that ceiling at runtime.
++        //
++        // Guarded with a compare rather than trusting the EMT result
++        // outright: if .SETTOP's answer is somehow *not higher* than the
++        // header value already in SP (e.g. this ROM's own monitor/drivers
++        // turn out to leave less room than sav-pdp11.c assumed), keep the
++        // link-time SP instead of moving backwards.
++        mov   $0177776, r0
++        emt   0354
++        cmp   r0, sp
++        blos  6$          // r0 <= sp (unsigned): keep the link-time SP
++        mov   r0, sp
++6$:
++
+         // RT-11 doesn't clear memory between programs, so a previous job's
+         // leftovers can still be sitting in our .bss; zero it before touching
+         // any of our own statics (including cmdbuf/argv below).  __bss_start

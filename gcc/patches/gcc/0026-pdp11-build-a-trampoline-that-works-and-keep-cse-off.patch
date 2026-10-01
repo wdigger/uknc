@@ -1,0 +1,111 @@
+From 761aa7b9472da88fe2cb4b0b870ff71fca60f210 Mon Sep 17 00:00:00 2001
+From: Yury Klushin <digger@live.ru>
+Date: Mon, 14 Sep 2026 23:47:08 +0300
+Subject: [PATCH] pdp11: build a trampoline that works, and keep cse off it
+
+A nested function whose address escapes needs a trampoline, and this
+target built one that halted the machine.  Two separate faults.
+
+The function's address went to offset 4, over the jmp opcode that had
+just been written there, instead of to offset 6 where the operand
+belongs -- a missing adjust_address.  The trampoline therefore began
+with the function's address as its first instruction and ran whatever
+that decoded to.
+
+With that fixed it worked at -O0 and nowhere else, because cse replaced
+the call target with the constant 012704: a call is (call (mem:HI
+addr)), which is indistinguishable from a two-byte load of the
+trampoline's first word, and cse had just seen that word stored.  The
+call then went to a constant pool entry holding the number.  The
+trampoline's stores are volatile now -- this memory is executed rather
+than read, and cse cannot tell the difference.
+
+Nested functions work at every optimisation level, including ones that
+write to the enclosing frame through the trampoline.  A test goes with
+it; pdp11.exp on the emulated machine is 140 passes, 0 failures.
+---
+ gcc/config/pdp11/pdp11.cc                   | 17 +++++++++
+ gcc/testsuite/gcc.target/pdp11/trampoline.c | 40 +++++++++++++++++++++
+ 2 files changed, 57 insertions(+)
+ create mode 100644 gcc/testsuite/gcc.target/pdp11/trampoline.c
+
+diff --git a/gcc/config/pdp11/pdp11.cc b/gcc/config/pdp11/pdp11.cc
+index fbd08ced57b62..2d76b6d1a598f 100644
+--- a/gcc/config/pdp11/pdp11.cc
++++ b/gcc/config/pdp11/pdp11.cc
+@@ -2296,12 +2296,29 @@ pdp11_trampoline_init (rtx m_tramp, tree fndecl, rtx chain_value)
+ 
+   gcc_assert (!TARGET_SPLIT);
+ 
++  /* Volatile, because this memory is going to be executed rather than
++     read, and cse cannot tell the difference.  A call is
++     (call (mem:HI addr)), which looks exactly like a two-byte load from
++     the trampoline's first word -- so cse matched it against the store
++     below and replaced the call target with the value stored there,
++     012704.  The call then went to a constant pool entry holding that
++     number.  Marking the stores volatile keeps cse from knowing what is
++     in there.  */
+   mem = adjust_address (m_tramp, HImode, 0);
++  MEM_VOLATILE_P (mem) = 1;
+   emit_move_insn (mem, GEN_INT (012700+STATIC_CHAIN_REGNUM));
+   mem = adjust_address (m_tramp, HImode, 2);
++  MEM_VOLATILE_P (mem) = 1;
+   emit_move_insn (mem, chain_value);
+   mem = adjust_address (m_tramp, HImode, 4);
++  MEM_VOLATILE_P (mem) = 1;
+   emit_move_insn (mem, GEN_INT (000137));
++  /* Offset 6, not 4: the address is the jmp's operand word, and writing
++     it over the opcode left the trampoline with the function's address
++     as its first instruction.  Whatever that happened to decode to ran
++     instead of the function -- on the UKNC, a halt.  */
++  mem = adjust_address (m_tramp, HImode, 6);
++  MEM_VOLATILE_P (mem) = 1;
+   emit_move_insn (mem, fnaddr);
+ }
+ 
+diff --git a/gcc/testsuite/gcc.target/pdp11/trampoline.c b/gcc/testsuite/gcc.target/pdp11/trampoline.c
+new file mode 100644
+index 0000000000000..7d00e6f230bf9
+--- /dev/null
++++ b/gcc/testsuite/gcc.target/pdp11/trampoline.c
+@@ -0,0 +1,40 @@
++/* { dg-do run { target pdp11-*-rt11* } } */
++/* { dg-options "-O2" } */
++
++/* A nested function whose address escapes needs a trampoline, and this
++   target built a broken one twice over.  The function's address was
++   written over the jmp opcode rather than into the word after it, so
++   the trampoline began with the address itself and ran whatever that
++   decoded to.  And cse replaced the call target with the trampoline's
++   own first word, 012704, because a call is (call (mem:HI addr)) and
++   that is indistinguishable from a two-byte load of the same address --
++   the call then went to a constant pool entry holding that number.  */
++
++extern void abort (void);
++
++static int apply (int (*f) (int), int v) { return f (v); }
++
++static int outer (int n)
++{
++  int inner (int x) { return x + n; }
++  return apply (inner, 2);
++}
++
++static int counted (int n)
++{
++  int total = 0;
++  void add (int x) { total += x; }
++  int bump (int x) { add (x); return x; }
++  for (int i = 1; i <= n; i++)
++    apply (bump, i);
++  return total;
++}
++
++int main (void)
++{
++  if (outer (40) != 42)
++    abort ();
++  if (counted (5) != 15)
++    abort ();
++  return 0;
++}

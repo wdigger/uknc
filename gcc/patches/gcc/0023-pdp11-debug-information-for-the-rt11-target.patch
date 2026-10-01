@@ -1,0 +1,191 @@
+From 1e1e86e20bce98bd506e29ccd302ae9f7130e3e7 Mon Sep 17 00:00:00 2001
+From: Yury Klushin <digger@live.ru>
+Date: Mon, 14 Sep 2026 20:37:33 +0300
+Subject: [PATCH] pdp11: debug information for the rt11 target
+
+-g produced nothing here and said so: "target system does not support
+debug output".  It had no choice -- a.out has three sections and DWARF
+needs a dozen of its own.  With ELF objects there is somewhere to put
+it, so turn it on.
+
+Three things had to be supplied first, and each announced itself as an
+internal compiler error rather than a diagnostic:
+
+INCOMING_RETURN_ADDR_RTX, whose default is an unreachable.  `jsr pc,dst`
+pushes the return address, so on entry it is the word at (sp) and the
+caller's stack pointer -- the canonical frame address -- is two bytes
+above.
+
+A four-byte integer output.  DWARF is full of four-byte fields and this
+backend could emit one and two bytes only, so dwarf2out stopped in
+assemble_integer the first time it wanted four it could not split.  The
+seam to use is the "unaligned" integer ops, which is not the one
+ordinary data goes through: a C long here is two words with the high one
+first, and the aligned SI op stays NULL so varasm keeps splitting it
+into .word directives, while a four-byte field of an ELF file is plain
+little-endian and .long is exactly that.
+
+DWARF2_ADDR_SIZE 4, which is what msp430 does and not for the obvious
+reason.  Two bytes is the honest size of a pointer here and works, until
+dwarf2asm.cc's rule for -gdwarf64 on a 32-bit target -- treat a
+relocatable field of 2 * DWARF2_ADDR_SIZE as "relocate the low half,
+write 0 for the high one" -- starts catching every ordinary four-byte
+DWARF32 offset.  It then produces the right bytes for as long as the
+offset fits in sixteen bits and stops assembling, with "value too large
+for field of 2 bytes", once a debug section outgrows 64K.  Two tests in
+gcc.c-torture/compile failed exactly there.  Four sidesteps the rule and
+costs nothing that is loaded.
+
+Also drops the prune for "target system does not support debug output":
+the warning cannot happen on this branch any more, and a prune for a
+warning that cannot happen would only hide a regression.
+
+The result reads: readelf --debug-dump prints the compilation unit,
+objdump -S interleaves the source, addr2line answers with a function and
+a line.  The .sav image is byte-identical with and without -g, the debug
+sections not being allocated.  pdp11.exp is 138 passes, 0 failures, with
+a new test; gcc.c-torture/compile is 14168 passes and 74 failures, all
+of them the machine's own size limits and not one of them specific to
+-g.
+---
+ gcc/config/pdp11/pdp11.cc                    | 17 +++++++++
+ gcc/config/pdp11/pdp11.h                     | 39 ++++++++++++++++++++
+ gcc/testsuite/gcc.target/pdp11/debug-dwarf.c | 27 ++++++++++++++
+ gcc/testsuite/lib/prune.exp                  |  7 ----
+ 4 files changed, 83 insertions(+), 7 deletions(-)
+ create mode 100644 gcc/testsuite/gcc.target/pdp11/debug-dwarf.c
+
+diff --git a/gcc/config/pdp11/pdp11.cc b/gcc/config/pdp11/pdp11.cc
+index ec522060430b5..fbd08ced57b62 100644
+--- a/gcc/config/pdp11/pdp11.cc
++++ b/gcc/config/pdp11/pdp11.cc
+@@ -179,6 +179,23 @@ static bool pdp11_scalar_mode_supported_p (scalar_mode);
+ #define TARGET_ASM_ALIGNED_HI_OP NULL
+ #undef TARGET_ASM_ALIGNED_SI_OP
+ #define TARGET_ASM_ALIGNED_SI_OP NULL
++
++/* DWARF reaches for its four-byte fields -- unit lengths, offsets into
++   other debug sections -- through the "unaligned" integer ops, which is
++   a different seam from the one ordinary data goes through.  That
++   distinction is what makes debug information possible here at all: a C
++   long on this machine is two words with the high one first, which is
++   why the aligned SI op stays NULL and varasm splits it into .word
++   directives, while a four-byte field of an ELF file is a plain
++   little-endian four-byte field and .long is exactly that.  Without
++   these, a -g compile ends in an internal error the moment dwarf2out
++   asks for four bytes it cannot split -- a label difference, say.  */
++#if TARGET_RT11_ELF
++#undef TARGET_ASM_UNALIGNED_HI_OP
++#define TARGET_ASM_UNALIGNED_HI_OP "\t.word\t"
++#undef TARGET_ASM_UNALIGNED_SI_OP
++#define TARGET_ASM_UNALIGNED_SI_OP "\t.long\t"
++#endif
+ #undef TARGET_ASM_INTEGER
+ #define TARGET_ASM_INTEGER pdp11_assemble_integer
+ 
+diff --git a/gcc/config/pdp11/pdp11.h b/gcc/config/pdp11/pdp11.h
+index d0cc4c24f6cce..62d2ddc1c256c 100644
+--- a/gcc/config/pdp11/pdp11.h
++++ b/gcc/config/pdp11/pdp11.h
+@@ -344,6 +344,17 @@ extern int current_first_parm_offset;
+ /* Offset of first parameter from the argument pointer register value.  */
+ #define FIRST_PARM_OFFSET(FNDECL) 0
+ 
++/* Where the return address is when a function starts, and how far the
++   caller's stack pointer -- what DWARF calls the canonical frame
++   address -- is above it.  \`jsr pc,dst\` pushes the return address, so
++   on entry it is the word at (sp), and the caller's stack pointer was
++   the two bytes above.  Only the frame information uses these; without
++   them a -g compile stops with an internal error rather than a
++   diagnostic, since the default for the first of them is an
++   unreachable.  */
++#define INCOMING_RETURN_ADDR_RTX  gen_rtx_MEM (Pmode, stack_pointer_rtx)
++#define INCOMING_FRAME_SP_OFFSET  2
++
+ /* Define how to find the value returned by a function.
+    VALTYPE is the data type of the value (as a tree).
+    If the precise function being called is known, FUNC is its FUNCTION_DECL;
+@@ -704,4 +715,32 @@ extern int current_first_parm_offset;
+    the full story and how to opt back into real %f/%e/%g support.  */
+ #undef STARTFILE_SPEC
+ #define STARTFILE_SPEC "crt0rt.o%s parse_args.o%s printf_float_stub.o%s"
++
++/* Debug information, which needs somewhere to live and so was not
++   possible at all until this target's objects became ELF.  It costs
++   nothing in the program: the debug sections are not allocated, so the
++   SAV image the machine loads does not contain them.
++
++   Addresses in it are four bytes, not the two a pointer here actually
++   takes.  That is what msp430 does as well, and the reason is worth
++   writing down: dwarf2asm.cc treats a relocatable field of
++   2 * DWARF2_ADDR_SIZE as the -gdwarf64-on-a-32-bit-target case and
++   emits it as "<low half>, 0", relocating only the low half.  With a
++   two-byte address size that rule catches every ordinary four-byte
++   DWARF32 offset, which then quietly works only for as long as the
++   offset fits in sixteen bits -- and stops assembling with "value too
++   large for field of 2 bytes" once a debug section grows past 64K.
++   Four sidesteps it, and costs nothing that matters: the debug sections
++   are not loaded.
++
++   See include/elf/pdp11.h in binutils for why a four-byte field in an
++   ELF file is plain little-endian on this machine even though a C long
++   is not.
++
++   Tested with #ifdef, not for a value, so a.out must not see it at
++   all.  */
++#define DWARF2_DEBUGGING_INFO 1
++#define DWARF2_ADDR_SIZE 4
++#undef PREFERRED_DEBUGGING_TYPE
++#define PREFERRED_DEBUGGING_TYPE DWARF2_DEBUG
+ #endif
+diff --git a/gcc/testsuite/gcc.target/pdp11/debug-dwarf.c b/gcc/testsuite/gcc.target/pdp11/debug-dwarf.c
+new file mode 100644
+index 0000000000000..904c8ea963157
+--- /dev/null
++++ b/gcc/testsuite/gcc.target/pdp11/debug-dwarf.c
+@@ -0,0 +1,27 @@
++/* { dg-do compile { target pdp11-*-rt11* } } */
++/* { dg-options "-O1 -g -dA" } */
++
++/* Debug information, which this target could not produce at all while
++   its objects were a.out: there was nowhere to put it, and -g came back
++   as "target system does not support debug output".  Addresses in it
++   are two bytes, the size of a pointer here.
++
++   The four-byte fields DWARF is full of -- unit lengths, offsets into
++   other debug sections -- go out as .long, which in an ELF file is a
++   plain little-endian four-byte datum.  That is deliberately not the
++   order this machine stores a C long in (high word first); see
++   TARGET_ASM_UNALIGNED_SI_OP in pdp11.cc, and include/elf/pdp11.h in
++   binutils.  A C long still comes out as two .word directives, which is
++   what the second check here is about.  */
++
++long wide = 0x12345678L;
++
++int add (int a, int b)
++{
++  return a + b;
++}
++
++/* { dg-final { scan-assembler "\\.section\t\\.debug_info" } } */
++/* { dg-final { scan-assembler "\\.section\t\\.debug_line" } } */
++/* { dg-final { scan-assembler "\\.long" } } */
++/* { dg-final { scan-assembler-not "\\.long\t0x12345678" } } */
+diff --git a/gcc/testsuite/lib/prune.exp b/gcc/testsuite/lib/prune.exp
+index dd34640f16eb0..c60e98833d866 100644
+--- a/gcc/testsuite/lib/prune.exp
++++ b/gcc/testsuite/lib/prune.exp
+@@ -68,13 +68,6 @@ proc prune_gcc_output { text } {
+     regsub -all "(^|\n)\[^\n\]*: warning: -f(pic|PIC) ignored for target\[^\n\]*" $text "" text
+     regsub -all "(^|\n)\[^\n\]*: warning: -f(pic|PIC)( and -fpic are| is)? not supported\[^\n\]*" $text "" text
+ 
+-    # Ignore the driver/cc1 warning a target with no debug-info support
+-    # (pdp11 a.out) emits for every -g: torture runs -O3 -g and -Og -g
+-    # unconditionally, and dg-options of many tests carry -g too, so
+-    # without this every such run is an "excess errors" FAIL that hides
+-    # the real ones (~1300 of ~2000 FAILs on pdp11-uknc-rt11 were this).
+-    regsub -all "(^|\n)\[^\n\]*: warning: target system does not support debug output\[^\n\]*" $text "" text
+-
+     # Ignore errata warning from IA64 assembler.
+     regsub -all "(^|\n)\[^\n\]*: Additional NOP may be necessary to workaround Itanium processor A/B step errata" $text "" text
+     regsub -all "(^|\n)\[^\n*\]*: Assembler messages:\[^\n\]*" $text "" text

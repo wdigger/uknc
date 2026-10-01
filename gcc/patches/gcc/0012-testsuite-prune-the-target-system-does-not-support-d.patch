@@ -1,0 +1,41 @@
+From b31e58a565675e94bdba0564d6fee3aac0944e08 Mon Sep 17 00:00:00 2001
+From: Yury Klushin <digger@live.ru>
+Date: Mon, 7 Sep 2026 02:38:02 +0300
+Subject: [PATCH] testsuite: prune the "target system does not support debug
+ output" warning
+
+pdp11 a.out has no debug-info support, so every -g compile emits
+"warning: target system does not support debug output" from both the
+driver and cc1.  The torture suites run -O3 -g unconditionally and many
+individual tests carry -g in their own dg-options, so on
+pdp11-uknc-rt11 this one warning alone turned ~1300 of ~2000
+gcc.c-torture/compile FAILs into "excess errors" noise and buried the
+handful of real ones (16-bit object-size limits, one -flto ICE).
+
+Prune it in prune_gcc_output, next to the existing prunes for the
+equally harmless -fpic-ignored-for-target warnings.  Verified: with it,
+20000105-1.c's -O3 -g run and pr41679.c (-g in its own options) PASS,
+while 20080806-1.c still FAILs for its real "size of array is too
+large" error.
+---
+ gcc/testsuite/lib/prune.exp | 7 +++++++
+ 1 file changed, 7 insertions(+)
+
+diff --git a/gcc/testsuite/lib/prune.exp b/gcc/testsuite/lib/prune.exp
+index c60e98833d866..dd34640f16eb0 100644
+--- a/gcc/testsuite/lib/prune.exp
++++ b/gcc/testsuite/lib/prune.exp
+@@ -68,6 +68,13 @@ proc prune_gcc_output { text } {
+     regsub -all "(^|\n)\[^\n\]*: warning: -f(pic|PIC) ignored for target\[^\n\]*" $text "" text
+     regsub -all "(^|\n)\[^\n\]*: warning: -f(pic|PIC)( and -fpic are| is)? not supported\[^\n\]*" $text "" text
+ 
++    # Ignore the driver/cc1 warning a target with no debug-info support
++    # (pdp11 a.out) emits for every -g: torture runs -O3 -g and -Og -g
++    # unconditionally, and dg-options of many tests carry -g too, so
++    # without this every such run is an "excess errors" FAIL that hides
++    # the real ones (~1300 of ~2000 FAILs on pdp11-uknc-rt11 were this).
++    regsub -all "(^|\n)\[^\n\]*: warning: target system does not support debug output\[^\n\]*" $text "" text
++
+     # Ignore errata warning from IA64 assembler.
+     regsub -all "(^|\n)\[^\n\]*: Additional NOP may be necessary to workaround Itanium processor A/B step errata" $text "" text
+     regsub -all "(^|\n)\[^\n*\]*: Assembler messages:\[^\n\]*" $text "" text

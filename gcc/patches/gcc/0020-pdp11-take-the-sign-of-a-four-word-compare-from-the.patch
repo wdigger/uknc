@@ -1,0 +1,222 @@
+From 5c5960e93efb3533eaa1f539c75fd7cd378589d0 Mon Sep 17 00:00:00 2001
+From: Yury Klushin <digger@live.ru>
+Date: Sun, 13 Sep 2026 14:28:23 +0300
+Subject: [PATCH] pdp11: take the sign of a four-word compare from the right
+ word
+
+A multiword compare walks the words from the most significant down and
+stops at the first pair that differs, leaving that comparison's condition
+codes for the branch to read.  Only the most significant word carries a
+sign, though.  The words below it are plain magnitudes, so an unsigned
+comparison is what settles them, and it reports its answer in C, where a
+signed branch does not look.  cmpsi has always converted C into N for its
+one lower word; cmpdi never did, and its lower words' flags went to the
+branch unconverted.
+
+So a positive value whose most significant word was zero and whose next
+word had its top bit set -- 0x00000000d1cf7980, say -- tested as
+negative.  The soft float library felt it worst: fp-bit settles the sign
+of a subtraction by testing a 64-bit difference against zero, so
+subtracting two nearly equal doubles returned about minus one instead of
+the small positive number it should, which is what made expm1 and sinh
+wrong and, through them, anything built on them.
+
+Fixed by giving cmpdi a second label: the most significant word's branch
+goes past the fixup, keeping its own correct flags, and the three lower
+words land on it.  pdp11_cmp_length now counts the fixup as well, for
+cmpsi too, where it was already being emitted but never measured.
+
+gcc.target/pdp11 is 125 passes and no failures; gcc.c-torture/compile
+comes out with the same 10245 passes and 69 failures as before, the same
+failures file for file.
+---
+ gcc/config/pdp11/pdp11-protos.h             |  1 +
+ gcc/config/pdp11/pdp11.cc                   | 32 ++++++++++++++-
+ gcc/config/pdp11/pdp11.md                   | 45 ++++++++++++++++++---
+ gcc/testsuite/gcc.target/pdp11/cmpdi-sign.c | 42 +++++++++++++++++++
+ 4 files changed, 113 insertions(+), 7 deletions(-)
+ create mode 100644 gcc/testsuite/gcc.target/pdp11/cmpdi-sign.c
+
+diff --git a/gcc/config/pdp11/pdp11-protos.h b/gcc/config/pdp11/pdp11-protos.h
+index d0255b3155c40..ae5f9a76914e4 100644
+--- a/gcc/config/pdp11/pdp11-protos.h
++++ b/gcc/config/pdp11/pdp11-protos.h
+@@ -42,6 +42,7 @@ extern bool pdp11_expand_shift (rtx *, rtx (*) (rtx, rtx, rtx),
+ extern const char * pdp11_assemble_shift (rtx *, machine_mode, int);
+ extern int pdp11_shift_length (rtx *, machine_mode, int, bool);
+ extern int pdp11_cmp_length (rtx *, int);
++extern bool pdp11_cmp_lower_zero (rtx *, int);
+ extern bool pushpop_regeq (rtx, int);
+ extern bool pdp11_small_shift (int);
+ 
+diff --git a/gcc/config/pdp11/pdp11.cc b/gcc/config/pdp11/pdp11.cc
+index a20480ee588f0..9d099e250aa0f 100644
+--- a/gcc/config/pdp11/pdp11.cc
++++ b/gcc/config/pdp11/pdp11.cc
+@@ -2206,7 +2206,37 @@ pdp11_cmp_length (rtx *operands, int words)
+     }
+ 
+   /* Deduct one word because there is no branch at the end.  */
+-  return len - 2;
++  len -= 2;
++
++  /* Then add the fixup that turns the lower words' C into N, which both
++     the two-word and the four-word compare emit (see cmpsi and cmpdi):
++     one instruction when comparing against zero, four otherwise.  */
++  if (words > 1)
++    len += pdp11_cmp_lower_zero (operands, words) ? 2 : 8;
++
++  return len;
++}
++
++/* True if every word of OPERANDS[1] below the most significant one is the
++   constant zero.  Those are the words the C-to-N fixup looks at, and when
++   they are all zero the compare against them is a tst, which leaves C
++   clear, so clearing N is the whole of the fixup.  */
++bool
++pdp11_cmp_lower_zero (rtx *operands, int words)
++{
++  rtx inops[2];
++  rtx exops[4][2];
++  int i;
++
++  inops[0] = operands[0];
++  inops[1] = operands[1];
++  pdp11_expand_operands (inops, exops, 2, words, NULL, big);
++
++  for (i = 1; i < words; i++)
++    if (!CONST_INT_P (exops[i][1]) || INTVAL (exops[i][1]) != 0)
++      return false;
++
++  return true;
+ }
+ 
+ /* Prepend to CLOBBERS hard registers that are automatically clobbered
+diff --git a/gcc/config/pdp11/pdp11.md b/gcc/config/pdp11/pdp11.md
+index feb0fa77acd56..c5de6729e0eb0 100644
+--- a/gcc/config/pdp11/pdp11.md
++++ b/gcc/config/pdp11/pdp11.md
+@@ -289,9 +289,9 @@
+   else
+    output_asm_insn ("cmp\t%0,%1", exops[1]);
+    
+-  // Correct V/N flags so signed comparisons work
++  /* Correct V/N flags so signed comparisons work.  */
+   output_asm_insn ("cln", NULL);
+-  if (!CONST_INT_P (exops[1][1]) || INTVAL (exops[1][1]) != 0) {
++  if (!pdp11_cmp_lower_zero (operands, 2)) {
+    output_asm_insn ("clv", NULL);
+    output_asm_insn ("bcc\t%l0", lb);
+    output_asm_insn ("sen", NULL);
+@@ -315,26 +315,59 @@
+ {
+   rtx inops[4];
+   rtx exops[4][2];
+-  rtx lb[1];
++  rtx lb[2];
+   int i;
+   
+   inops[0] = operands[0];
+   inops[1] = operands[1];
+   pdp11_expand_operands (inops, exops, 2, 4, NULL, big);
+   lb[0] = gen_label_rtx ();
++  lb[1] = gen_label_rtx ();
+ 
+-  for (i = 0; i < 3; i++)
++  /* The most significant words carry the sign, so a signed comparison of
++     those is the comparison of the whole values and the condition codes
++     it leaves are the ones wanted.  The words below it are plain
++     magnitudes, and an unsigned comparison of them says which value is
++     the larger -- but it says so in C, where a signed branch will go
++     looking in N.  So every word but the first jumps to a fixup that
++     turns C into N, the same one cmpsi uses for its one lower word.
++     Without it, a positive value whose most significant word is zero and
++     whose next word has its top bit set, 0xd1cf7980 say, came out as
++     negative, which in turn made the soft float library get subtraction
++     of nearly equal numbers wrong.  */
++  if (CONST_INT_P (exops[0][1]) && INTVAL (exops[0][1]) == 0)
++    output_asm_insn ("tst\t%0", exops[0]);
++  else
++    output_asm_insn ("cmp\t%0,%1", exops[0]);
++  output_asm_insn ("bne\t%l0", lb);
++
++  for (i = 1; i < 3; i++)
+     {
+       if (CONST_INT_P (exops[i][1]) && INTVAL (exops[i][1]) == 0)
+         output_asm_insn ("tst\t%0", exops[i]);
+       else
+         output_asm_insn ("cmp\t%0,%1", exops[i]);
+-       output_asm_insn ("bne\t%l0", lb);
+-     }
++      output_asm_insn ("bne\t%l1", lb);
++    }
+   if (CONST_INT_P (exops[3][1]) && INTVAL (exops[3][1]) == 0)
+    output_asm_insn ("tst\t%0", exops[3]);
+   else
+    output_asm_insn ("cmp\t%0,%1", exops[3]);
++
++  output_asm_label (lb[1]);
++  fputs (":\n", asm_out_file);
++
++  /* Correct V/N flags so signed comparisons work.  Comparing against
++     zero needs no more than clearing N: tst leaves C clear, and a value
++     whose higher words are zero is positive.  */
++  output_asm_insn ("cln", NULL);
++  if (!pdp11_cmp_lower_zero (operands, 4))
++    {
++      output_asm_insn ("clv", NULL);
++      output_asm_insn ("bcc\t%l0", lb);
++      output_asm_insn ("sen", NULL);
++    }
++
+   output_asm_label (lb[0]);
+    fputs (":\n", asm_out_file);
+ 
+diff --git a/gcc/testsuite/gcc.target/pdp11/cmpdi-sign.c b/gcc/testsuite/gcc.target/pdp11/cmpdi-sign.c
+new file mode 100644
+index 0000000000000..2e8ccf760953a
+--- /dev/null
++++ b/gcc/testsuite/gcc.target/pdp11/cmpdi-sign.c
+@@ -0,0 +1,42 @@
++/* { dg-do compile { target pdp11-*-* } } */
++/* { dg-options "-O2 -fomit-frame-pointer" } */
++
++/* A four-word compare walks the words from the most significant down and
++   stops at the first one that differs.  Only that first word carries a
++   sign, though: the ones below it are magnitudes, and an unsigned
++   comparison of them reports its answer in C, where a signed branch does
++   not look.  cmpsi has always turned C into N for its one lower word;
++   cmpdi did not, so a positive value whose top word was zero and whose
++   next word had its top bit set -- 0xd1cf7980, for one -- tested as
++   negative.  That in turn made the soft float library get the subtraction
++   of two nearly equal numbers wrong, since fp-bit settles the sign of
++   such a result by testing a 64-bit difference against zero.
++
++   Each compare below should come out as three branches down the words,
++   the last three of them landing on the fixup and the first one going
++   past it, since the most significant word's own flags are already the
++   ones a signed branch wants.  */
++
++int
++gt (long long a)
++{
++  return a > 0;
++}
++
++int
++ge2 (long long a, long long b)
++{
++  return a >= b;
++}
++
++/* Three branches down the words in each of the two.  */
++/* { dg-final { scan-assembler-times "bne\t" 6 } } */
++/* The fixup, once in each: the words are walked, then a label, then the
++   clearing of N.  */
++/* { dg-final { scan-assembler-times "cln" 2 } } */
++/* { dg-final { scan-assembler "bne\t\[^\n\]*\n\ttst\t\[^\n\]*\n\tbne\t\[^\n\]*\n\ttst\t\[^\n\]*\n\tbne\t\[^\n\]*\n\ttst\t\[^\n\]*\n\[^\n\]*:\n\tcln" } } */
++/* Against zero there is nothing to convert, tst having left C clear, so
++   only the two-operand compare carries the rest of the fixup.  */
++/* { dg-final { scan-assembler-times "clv" 1 } } */
++/* { dg-final { scan-assembler-times "sen" 1 } } */
++/* { dg-final { scan-assembler "cln\n\tclv\n\tbcc\t\[^\n\]*\n\tsen" } } */

@@ -1,0 +1,226 @@
+From: Yury Klushin <digger@live.ru>
+Date: Mon, 7 Sep 2026 02:38:03 +0300
+Subject: [PATCH] pdp11 testsuite: scan mnemonics, not registers; add
+ lshr/mulhisi3 regression tests
+
+The mul-*.c tests added with the instruction-set macros scanned for exact
+register choices ("dec\tr2", "cmp\tr2,r1", "div\tr2,r0").  Later
+codegen changes on this branch (SOB-based shift loops, the general
+codegen corrections) legitimately changed register allocation, so 12 of
+those scans failed (61 PASS / 12 FAIL) while every instruction-level
+scan in the same files still passed.  Rewrite them to assert what the
+tests actually mean:
+
+  * constant multiply expands to shifts/adds, never a library call --
+    scan-assembler-times "__mulhi3" 1 (test_mul01's own call is the only
+    legitimate one) on the MUL-less models, scan-assembler-not where MUL
+    is there;
+  * variable shifts on SOB-capable models count down with SOB;
+  * equality compiles to a CMP, signed division to the hardware DIV --
+    mnemonic only, whichever operands the allocator picks.
+
+Add regression tests for three earlier fixes on this branch that had no
+coverage at all:
+
+  lshr-qi-neg-count.c   -- f2f0dea37: QImode lshr must emit ASH with a
+                           negative count (b >> 4 used to compile as b << 4)
+  lshr-var-count-zero.c -- 3b581bf2b: variable-count HI/SImode lshr guards
+                           count <= 0 with TST/BLE before the "count - 1" ASH
+  mulhisi3-even-reg.c   -- 83de41f66: 32-bit product's MUL destination is
+                           the even register, never the odd half of the pair
+
+pdp11.exp now: 86 PASS / 0 FAIL.
+---
+ .../gcc.target/pdp11/lshr-qi-neg-count.c      | 27 ++++++++++++++++
+ .../gcc.target/pdp11/lshr-var-count-zero.c    | 32 +++++++++++++++++++
+ gcc/testsuite/gcc.target/pdp11/mul-bis.c      |  8 +++--
+ gcc/testsuite/gcc.target/pdp11/mul-eis.c      |  6 ++--
+ gcc/testsuite/gcc.target/pdp11/mul-m10.c      |  8 +++--
+ .../gcc.target/pdp11/mulhisi3-even-reg.c      | 26 +++++++++++++++
+ 6 files changed, 99 insertions(+), 8 deletions(-)
+ create mode 100644 gcc/testsuite/gcc.target/pdp11/lshr-qi-neg-count.c
+ create mode 100644 gcc/testsuite/gcc.target/pdp11/lshr-var-count-zero.c
+ create mode 100644 gcc/testsuite/gcc.target/pdp11/mulhisi3-even-reg.c
+
+diff --git a/gcc/testsuite/gcc.target/pdp11/lshr-qi-neg-count.c b/gcc/testsuite/gcc.target/pdp11/lshr-qi-neg-count.c
+new file mode 100644
+index 0000000..cedea60
+--- /dev/null
++++ b/gcc/testsuite/gcc.target/pdp11/lshr-qi-neg-count.c
+@@ -0,0 +1,27 @@
++/* { dg-do compile { target pdp11-*-* } } */
++/* { dg-options "-O2 -m40" } */
++
++/* lshr<mode>3's QImode path (shift counts >= 4, i.e. past
++   pdp11_small_shift's inline fast path) zero-extends to HImode and emits
++   a single ASH.  ASH shifts left for a positive count and right for a
++   negative one, so a logical *right* shift must negate the count first
++   -- ashr<mode>3's own QImode case already did, lshr<mode>3's copy of it
++   didn't, and `b >> 4` silently compiled as `b << 4` (same instruction
++   shape, same operand count, no build error).  -m40: the 1801BM2 has
++   ASH (SUPP_INSN_ASH), which is what this path emits.  */
++
++unsigned char lshr_qi4 (unsigned char b)
++{
++  /* { dg-final { scan-assembler "ash\t.-04,r0" } } */
++  return b >> 4;
++}
++
++unsigned char lshr_qi7 (unsigned char b)
++{
++  /* { dg-final { scan-assembler "ash\t.-07,r0" } } */
++  return b >> 7;
++}
++
++/* Neither shift may come out as a left shift (positive ASH count).  */
++/* { dg-final { scan-assembler-not "ash\t.0?4,r0" } } */
++/* { dg-final { scan-assembler-not "ash\t.0?7,r0" } } */
+diff --git a/gcc/testsuite/gcc.target/pdp11/lshr-var-count-zero.c b/gcc/testsuite/gcc.target/pdp11/lshr-var-count-zero.c
+new file mode 100644
+index 0000000..ed3c430
+--- /dev/null
++++ b/gcc/testsuite/gcc.target/pdp11/lshr-var-count-zero.c
+@@ -0,0 +1,32 @@
++/* { dg-do compile { target pdp11-*-* } } */
++/* { dg-options "-O2 -m40" } */
++
++/* lshr<mode>3's HImode/SImode path for a *variable* count shifts right
++   by one bit first (a single logical shift, to clear the sign bit
++   safely), then does an arithmetic shift for the remaining "count - 1"
++   bits.  That "count - 1" used to be computed unconditionally: at a
++   runtime count of 0 it wraps to -1, and since ashr<mode>3 negates its
++   shift amount before handing it to ASH, -1 turned into ASH by +1 -- a
++   *left* shift by one bit, clearing the operand's low bit instead of
++   leaving it untouched.  The fix guards the two-step trick with a
++   runtime "count <= 0" compare-and-branch (cbranchhi4) that copies the
++   operand through unshifted, the same convention pdp11_expand_shift's
++   own base-machine loop path already used.  -m40 for ASH/ASHC.  */
++
++unsigned int lshr_hi_var (unsigned int x, int n)
++{
++  return x >> n;
++}
++
++unsigned long lshr_si_var (unsigned long x, int n)
++{
++  return x >> n;
++}
++
++/* The count <= 0 guard: a TST of the count and a BLE around the shift,
++   once per function above.  */
++/* { dg-final { scan-assembler-times "tst\t" 2 } } */
++/* { dg-final { scan-assembler-times "ble\t" 2 } } */
++/* The remaining-bits shift itself: ASH for HImode, ASHC for SImode.  */
++/* { dg-final { scan-assembler "ash\t" } } */
++/* { dg-final { scan-assembler "ashc\t" } } */
+diff --git a/gcc/testsuite/gcc.target/pdp11/mul-bis.c b/gcc/testsuite/gcc.target/pdp11/mul-bis.c
+index 4ec61bf..ef5409c 100644
+--- a/gcc/testsuite/gcc.target/pdp11/mul-bis.c
++++ b/gcc/testsuite/gcc.target/pdp11/mul-bis.c
+@@ -15,8 +15,10 @@ int test_mul01() {
+     m1 = m2 * m3 ;
+ }
+ int test_mul02() {
+-  /* { dg-final { scan-assembler "dec\tr2" } } */
+-    m3 = m1 * 1234 ;    
++  /* A constant multiply must expand to shifts/adds, never a library
++     call -- the only __mulhi3 in this file is test_mul01's own.  */
++  /* { dg-final { scan-assembler-times "__mulhi3" 1 } } */
++    m3 = m1 * 1234 ;
+ }
+ int test_mul06() {
+   /* { dg-final { scan-assembler "mov\tr0,_m3" } } */
+@@ -47,7 +49,7 @@ int test_ne14() {
+     m3 = (m3 != m1);
+ }
+ int test_eq15() {
+-  /* { dg-final { scan-assembler "cmp\tr2,r1" } } */
++  /* { dg-final { scan-assembler "cmp\t" } } */
+     return (m1 == m2);
+ }
+ 
+diff --git a/gcc/testsuite/gcc.target/pdp11/mul-eis.c b/gcc/testsuite/gcc.target/pdp11/mul-eis.c
+index 35eed42..c159040 100644
+--- a/gcc/testsuite/gcc.target/pdp11/mul-eis.c
++++ b/gcc/testsuite/gcc.target/pdp11/mul-eis.c
+@@ -35,7 +35,9 @@ int test_div11() {
+     m2 = m1 >> m3;
+ } 
+ int test_div12() {
+-  /* { dg-final { scan-assembler "div\tr2,r0" } } */
++  /* Signed division uses the hardware DIV instruction (mnemonic only:
++     "div\t" -- ___divhi3/___udivhi3 contain "div" but never "div<TAB>").  */
++  /* { dg-final { scan-assembler "div\t" } } */
+     m1 = m2 / m1;
+ }
+ int test_div13() {
+@@ -47,7 +49,7 @@ int test_ne14() {
+     m3 = (m3 != m1);
+ }
+ int test_eq15() {
+-  /* { dg-final { scan-assembler "cmp\tr2,r1" } } */
++  /* { dg-final { scan-assembler "cmp\t" } } */
+     return (m1 == m2);
+ }
+ 
+diff --git a/gcc/testsuite/gcc.target/pdp11/mul-m10.c b/gcc/testsuite/gcc.target/pdp11/mul-m10.c
+index 4ec61bf..ef5409c 100644
+--- a/gcc/testsuite/gcc.target/pdp11/mul-m10.c
++++ b/gcc/testsuite/gcc.target/pdp11/mul-m10.c
+@@ -15,8 +15,10 @@ int test_mul01() {
+     m1 = m2 * m3 ;
+ }
+ int test_mul02() {
+-  /* { dg-final { scan-assembler "dec\tr2" } } */
+-    m3 = m1 * 1234 ;    
++  /* A constant multiply must expand to shifts/adds, never a library
++     call -- the only __mulhi3 in this file is test_mul01's own.  */
++  /* { dg-final { scan-assembler-times "__mulhi3" 1 } } */
++    m3 = m1 * 1234 ;
+ }
+ int test_mul06() {
+   /* { dg-final { scan-assembler "mov\tr0,_m3" } } */
+@@ -47,7 +49,7 @@ int test_ne14() {
+     m3 = (m3 != m1);
+ }
+ int test_eq15() {
+-  /* { dg-final { scan-assembler "cmp\tr2,r1" } } */
++  /* { dg-final { scan-assembler "cmp\t" } } */
+     return (m1 == m2);
+ }
+ 
+diff --git a/gcc/testsuite/gcc.target/pdp11/mulhisi3-even-reg.c b/gcc/testsuite/gcc.target/pdp11/mulhisi3-even-reg.c
+new file mode 100644
+index 0000000..ccdfce3
+--- /dev/null
++++ b/gcc/testsuite/gcc.target/pdp11/mulhisi3-even-reg.c
+@@ -0,0 +1,26 @@
++/* { dg-do compile { target pdp11-*-* } } */
++/* { dg-options "-O2 -m40" } */
++
++/* The hardware MUL is "MUL src,Rn": Rn must be *even*, holds one 16-bit
++   multiplicand on entry, and receives the 32-bit product in Rn:Rn+1.
++   mulhisi3 used to express that by tying its HImode operand to its
++   SImode destination with a plain "%0,0" matching constraint; reload/LRA
++   does not reliably honor a digit-matching constraint between operands
++   of different sizes and could satisfy the tie by putting the operand
++   in Rn+1 (the odd half of the destination pair), leaving Rn -- the
++   register MUL actually reads -- uninitialized.  The product was then
++   silently wrong whenever an operand's halves differed (masked for -1 *
++   -1, where they don't).  The fix expands mulhisi3 explicitly: copy the
++   operand into the low word of a fresh SImode pseudo, then let the real
++   MUL reference that same register via match_dup/subreg.  -m40 for MUL
++   (SUPP_INSN_MUL).  */
++
++long mul_hisi (int a, int b)
++{
++  return (long) a * (long) b;
++}
++
++/* A 32-bit product must be produced into an even register (r0 in this
++   leaf function), never into the odd half of the pair.  */
++/* { dg-final { scan-assembler "mul\t\[^,\]*,r0" } } */
++/* { dg-final { scan-assembler-not "mul\t\[^,\]*,r1" } } */
+-- 
+2.54.0 (Apple Git-157)
+

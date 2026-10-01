@@ -1,0 +1,442 @@
+From 55bffd5194aa0c95453b0a09042a38bf5fc4a907 Mon Sep 17 00:00:00 2001
+From: Yury Klushin <digger@live.ru>
+Date: Mon, 14 Sep 2026 15:29:27 +0300
+Subject: [PATCH] Link ELF for pdp11-*-rt11*, and make the SAV image out of it
+
+elf32-pdp11 becomes the default target format, and the two emulations
+that produce a finished program -- pdp11rt11 and the default
+pdp11rt11sav -- link it.  The SAV converter needed almost nothing: it
+walks sections by flags and LMA and knows nothing about a.out, so only
+the format the after_close_output hook reopens the linked file with
+changes, and that now follows OUTPUT_FORMAT rather than being spelled
+out.
+
+Three things were not that simple.
+
+The emulations had to move to TEMPLATE_NAME=elf.  Built on the generic
+template, as they were for a.out, ld produced an ELF file with no
+program headers at all and warned that every allocated section was "not
+in segment" -- the segment-recording work lives in emultempl/elf.em.
+That in turn means ld/configure.tgt must stop clearing
+targ_extra_ofiles for this target, since an ELF emulation needs
+ldelf.o, and it lets pdp11rt11sav.em drop the copy of pdp11.em's option
+handling and script selection it was carrying: elf.em does all of it.
+The a.out-only --imagic goes with it.
+
+elf32-pdp11 gets elf_symbol_leading_char '_'.  The compiler prefixes an
+underscore here, the same as it did for a.out, and ld's --wrap and -u
+have to look for the same names -- the DejaGnu board that runs the
+execution tests on the machine links with --wrap=main.
+
+The linker script grew .text.*/.data.*/.bss.* wildcards.  Those sections
+cannot exist in a.out at all; they are the reason for this whole
+exercise.
+
+Checked by linking the same programs both ways and comparing the SAV
+images byte for byte: a single-object program with PC-relative and
+absolute references, a string constant and a word table, and a
+two-object one pulling the second in from an archive and using .bss and
+a COMMON symbol.  Identical both times.  The intermediate ELF is a
+proper executable now -- one PT_LOAD for text, one for bss, no warning.
+
+And the point of the exercise, working for the first time on this
+target: given three .text.* sections and --gc-sections, ld removes the
+unused one and the SAV image shrinks.  The compiler cannot produce such
+sections yet; that is a later patch.
+
+One thing this breaks until the next patch: -m pdp11rt11rel, which
+turns a relocatable link into an RT-11 REL object, still reads a.out.
+It now refuses with "relocatable linking with relocations from format
+elf32-pdp11 to format a.out-pdp11 is not supported" rather than doing
+something wrong, but it refuses -- so PPU-side programs cannot be built
+with this toolchain yet.
+---
+ bfd/config.bfd                |  12 +--
+ bfd/elf32-pdp11.c             |   3 +
+ ld/configure.tgt              |   3 +-
+ ld/emulparams/pdp11rt11.sh    |  13 ++-
+ ld/emulparams/pdp11rt11sav.sh |  13 +--
+ ld/emultempl/pdp11rt11sav.em  | 191 ++++++----------------------------
+ ld/scripttempl/pdp11rt11.sc   |  12 ++-
+ 7 files changed, 68 insertions(+), 179 deletions(-)
+
+diff --git a/bfd/config.bfd b/bfd/config.bfd
+index 378e2cc666b..bba7da98906 100644
+--- a/bfd/config.bfd
++++ b/bfd/config.bfd
+@@ -1077,13 +1077,11 @@ case "${targ}" in
+     ;;
+ 
+   pdp11-*-rt11*)
+-    targ_defvec=pdp11_aout_vec
+-    # elf32-pdp11 is selected but not the default: objects and
+-    # executables are still a.out, and this makes the ELF target
+-    # readable and writable (objcopy -O elf32-pdp11) while the ELF side
+-    # of the toolchain is being built out.  Only for the rt11 OS -- a
+-    # plain pdp11-*-aout build stays vanilla binutils.
+-    targ_selvecs=pdp11_elf32_vec
++    targ_defvec=pdp11_elf32_vec
++    # a.out stays selected so that objects from before the switch can
++    # still be read, and objcopy can convert either way.  Only for the
++    # rt11 OS -- a plain pdp11-*-aout build stays vanilla binutils.
++    targ_selvecs=pdp11_aout_vec
+     targ_underscore=yes
+     # Makes the sav-pdp11 (RT-11 SAV executable) target vector visible
+     # in bfd/targets.c -- see the #ifdef guard there.  Only meaningful
+diff --git a/bfd/elf32-pdp11.c b/bfd/elf32-pdp11.c
+index 8c2b10ab87b..c0d4c02bbc5 100644
+--- a/bfd/elf32-pdp11.c
++++ b/bfd/elf32-pdp11.c
+@@ -409,6 +409,9 @@ pdp11_elf_relocate_section (bfd *output_bfd,
+ 
+ #define TARGET_LITTLE_SYM	pdp11_elf32_vec
+ #define TARGET_LITTLE_NAME	"elf32-pdp11"
++/* The compiler prefixes an underscore, the same as it did for
++   a.out; ld's --wrap and -u have to look for the same names.  */
++#define elf_symbol_leading_char		'_'
+ 
+ #define elf_info_to_howto_rel			NULL
+ #define elf_info_to_howto			pdp11_elf_info_to_howto
+diff --git a/ld/configure.tgt b/ld/configure.tgt
+index e891e20a443..6e5ee757921 100644
+--- a/ld/configure.tgt
++++ b/ld/configure.tgt
+@@ -683,7 +683,8 @@ or1k-*-linux* | or1knd-*-linux*)	targ_emul=elf32or1k_linux
+ 			;;
+ pdp11-*-rt11*)		targ_emul=pdp11rt11sav
+ 			targ_extra_emuls="pdp11rt11 pdp11 pdp11rt11rel"
+-			targ_extra_ofiles=
++			# Keeps the default ldelf.o/ldelfgen.o: the rt11
++			# emulations are ELF ones now, and they need it.
+ 			;;
+ pdp11-*-*)		targ_emul=pdp11
+ 			targ_extra_ofiles=
+diff --git a/ld/emulparams/pdp11rt11.sh b/ld/emulparams/pdp11rt11.sh
+index dd35a5a2a19..509b9fde060 100644
+--- a/ld/emulparams/pdp11rt11.sh
++++ b/ld/emulparams/pdp11rt11.sh
+@@ -1,6 +1,15 @@
++# Emulation for pdp11-*-rt11*: an ELF object, laid out as the single
++# flat image RT-11 loads, by ld/scripttempl/pdp11rt11.sc.
++#
++# TEMPLATE_NAME is elf, not the generic template the a.out emulations
++# use: the ELF-specific work an emulation has to do -- recording program
++# headers among it -- lives in emultempl/elf.em, and without it the
++# linker produces an ELF file with no PT_LOAD at all and warns that every
++# allocated section is "not in segment".
+ SCRIPT_NAME=pdp11rt11
+-OUTPUT_FORMAT="a.out-pdp11"
++TEMPLATE_NAME=elf
++OUTPUT_FORMAT="elf32-pdp11"
+ TEXT_START_ADDR=512
+-EXTRA_EM_FILE=pdp11
+ ARCH=pdp11
+ ENTRY=start
++EMBEDDED=yes
+diff --git a/ld/emulparams/pdp11rt11sav.sh b/ld/emulparams/pdp11rt11sav.sh
+index 9d3a399f01c..d77ff764699 100644
+--- a/ld/emulparams/pdp11rt11sav.sh
++++ b/ld/emulparams/pdp11rt11sav.sh
+@@ -1,11 +1,10 @@
+ # Default emulation for pdp11-*-rt11* targets: produce an RT-11 SAV
+ # executable from a single `ld` invocation.
+ #
+-# OUTPUT_FORMAT is deliberately "a.out-pdp11", the same as plain
+-# pdp11rt11, not "sav-pdp11": linking goes through a.out-pdp11's own
+-# specialized, proven-correct relocation-resolution path
+-# (pdp11_aout_link_input_section in bfd/pdp11.c), producing exactly the
+-# file `ld -m pdp11rt11` would.  Once that file is fully written to disk,
++# OUTPUT_FORMAT is deliberately the ordinary object format, the same as
++# plain pdp11rt11, and not "sav-pdp11": linking goes through the real
++# backend's own relocation-resolution path, producing exactly the file
++# `ld -m pdp11rt11` would.  Once that file is fully written to disk,
+ # emultempl/pdp11rt11sav.em's after_close_output hook converts it to the
+ # RT-11 SAV format in place -- a relocation-free repack (the file's
+ # section contents are already final, absolute bytes at that point), the
+@@ -14,8 +13,10 @@
+ # full story, including why sav-pdp11 was not used as OUTPUT_FORMAT
+ # directly here.
+ SCRIPT_NAME=pdp11rt11
+-OUTPUT_FORMAT="a.out-pdp11"
++TEMPLATE_NAME=elf
++OUTPUT_FORMAT="elf32-pdp11"
+ TEXT_START_ADDR=512
+ EXTRA_EM_FILE=pdp11rt11sav
+ ARCH=pdp11
+ ENTRY=start
++EMBEDDED=yes
+diff --git a/ld/emultempl/pdp11rt11sav.em b/ld/emultempl/pdp11rt11sav.em
+index 40746536972..3240390b798 100644
+--- a/ld/emultempl/pdp11rt11sav.em
++++ b/ld/emultempl/pdp11rt11sav.em
+@@ -18,167 +18,43 @@
+ # Foundation, Inc., 51 Franklin Street - Fifth Floor, Boston,
+ # MA 02110-1301, USA.
+ #
+-# This is pdp11.em (same PDP11-Unix-compatible --omagic/--imagic option
+-# handling as the plain pdp11/pdp11rt11 emulations) plus one extra hook:
+-# after_close_output.  See the big comment on that function below for why
+-# it exists.
++# An EXTRA_EM_FILE on top of emultempl/elf.em: everything an ELF
++# emulation does, plus one hook, after_close_output.  See the comment on
++# that function for why it exists.  (It used to carry a copy of
++# emultempl/pdp11.em's option handling and script selection as well,
++# because the emulation was built on the generic template rather than
++# the ELF one; elf.em does all of that.)
+ 
+ fragment <<EOF
+ 
+ /* --- \begin{pdp11rt11sav.em} */
+ #include "libiberty.h"
+-#include "getopt.h"
+ #include <errno.h>
+ 
+-static void
+-gld${EMULATION_NAME}_before_parse (void)
+-{
+-  ldfile_set_output_arch ("`echo ${ARCH}`", bfd_arch_unknown);
+-  /* for PDP11 Unix compatibility, default to --omagic */
+-  config.magic_demand_paged = false;
+-  config.text_read_only = false;
+-}
+-
+-/* PDP11 specific options.  */
+-#define OPTION_IMAGIC 301
+-
+-static void
+-gld${EMULATION_NAME}_add_options
+-  (int ns ATTRIBUTE_UNUSED,
+-   char **shortopts,
+-   int nl,
+-   struct option **longopts,
+-   int nrl ATTRIBUTE_UNUSED,
+-   struct option **really_longopts ATTRIBUTE_UNUSED)
+-{
+-  static const char xtra_short[] = "z";
+-  static const struct option xtra_long[] =
+-  {
+-    {"imagic", no_argument, NULL, OPTION_IMAGIC},
+-    {NULL, no_argument, NULL, 0}
+-  };
+-
+-  *shortopts = (char *) xrealloc (*shortopts, ns + sizeof (xtra_short));
+-  memcpy (*shortopts + ns, &xtra_short, sizeof (xtra_short));
+-  *longopts
+-    = xrealloc (*longopts, nl * sizeof (struct option) + sizeof (xtra_long));
+-  memcpy (*longopts + nl, &xtra_long, sizeof (xtra_long));
+-}
+-
+-static void
+-gld${EMULATION_NAME}_list_options (FILE *file)
+-{
+-  fprintf (file, _("  -N, --omagic   Do not make text readonly, do not page align data (default)\n"));
+-  fprintf (file, _("  -n, --nmagic   Make text readonly, align data to next page\n"));
+-  fprintf (file, _("  -z, --imagic   Make text readonly, separate instruction and data spaces\n"));
+-  fprintf (file, _("  --no-omagic    Equivalent to --nmagic\n"));
+-}
+-
+-static bool
+-gld${EMULATION_NAME}_handle_option (int optc)
+-{
+-  switch (optc)
+-    {
+-    default:
+-      return false;
+-
+-    case 'z':
+-    case OPTION_IMAGIC:
+-      link_info.separate_code = 1;
+-      /* The --imagic format causes the .text and .data sections to occupy the
+-	 same memory addresses in separate spaces, so don't check overlap. */
+-      command_line.check_section_addresses = 0;
+-      break;
+-    }
+-
+-  return true;
+-}
+-
+-/* We need a special case to prepare an additional linker script for option
+- * --imagic where the .data section starts at address 0 rather than directly
+- * following the .text section or being aligned to the next page after the
+- * .text section. */
+-static char *
+-gld${EMULATION_NAME}_get_script (int *isfile)
+-EOF
+-
+-if test x"$COMPILE_IN" = xyes
+-then
+-# Scripts compiled in.
+-
+-# sed commands to quote an ld script as a C string.
+-sc="-f ${srcdir}/emultempl/stringify.sed"
+-
+-fragment <<EOF
+-{
+-  *isfile = 0;
+-
+-  if (bfd_link_relocatable (&link_info) && config.build_constructors)
+-    return
+-EOF
+-sed $sc ldscripts/${EMULATION_NAME}.xu			>> e${EMULATION_NAME}.c
+-echo '  ; else if (bfd_link_relocatable (&link_info)) return' >> e${EMULATION_NAME}.c
+-sed $sc ldscripts/${EMULATION_NAME}.xr			>> e${EMULATION_NAME}.c
+-echo '  ; else if (link_info.separate_code) return'	>> e${EMULATION_NAME}.c
+-sed $sc ldscripts/${EMULATION_NAME}.xe			>> e${EMULATION_NAME}.c
+-echo '  ; else if (!config.text_read_only) return'	>> e${EMULATION_NAME}.c
+-sed $sc ldscripts/${EMULATION_NAME}.xbn			>> e${EMULATION_NAME}.c
+-echo '  ; else if (!config.magic_demand_paged) return'	>> e${EMULATION_NAME}.c
+-sed $sc ldscripts/${EMULATION_NAME}.xn			>> e${EMULATION_NAME}.c
+-echo '  ; else return'					>> e${EMULATION_NAME}.c
+-sed $sc ldscripts/${EMULATION_NAME}.x			>> e${EMULATION_NAME}.c
+-echo '; }'						>> e${EMULATION_NAME}.c
+-
+-else
+-# Scripts read from the filesystem.
+-
+-fragment <<EOF
+-{
+-  *isfile = 1;
+-
+-  if (bfd_link_relocatable (&link_info) && config.build_constructors)
+-    return "ldscripts/${EMULATION_NAME}.xu";
+-  else if (bfd_link_relocatable (&link_info))
+-    return "ldscripts/${EMULATION_NAME}.xr";
+-  else if (link_info.separate_code)
+-    return "ldscripts/${EMULATION_NAME}.xe";
+-  else if (!config.text_read_only)
+-    return "ldscripts/${EMULATION_NAME}.xbn";
+-  else if (!config.magic_demand_paged)
+-    return "ldscripts/${EMULATION_NAME}.xn";
+-  else
+-    return "ldscripts/${EMULATION_NAME}.x";
+-}
+-EOF
+-fi
+-
+-fragment <<EOF
+-
+-/* This emulation's OUTPUT_FORMAT is "a.out-pdp11", same as plain
+-   pdp11rt11 -- deliberately.  a.out-pdp11 has its own specialized,
+-   proven-correct relocation-resolution path (pdp11_aout_link_input_section
+-   in bfd/pdp11.c); the generic BFD final-link path that a genuinely
+-   write-only format like sav-pdp11 would otherwise have to fall back to
+-   does not correctly reproduce it (confirmed on something as simple as a
+-   string-constant address reference).  So rather than link straight to
+-   sav-pdp11 and risk wrong relocated values, this emulation links a real,
+-   correct a.out-pdp11 file first -- exactly the same file
+-   \`ld -m pdp11rt11\` would produce -- and then, once that file is
+-   completely written to disk, converts it to the RT-11 SAV format in
+-   place.  That second step is relocation-free: everything in an a.out
+-   EXEC_P file's section contents is already final, absolute bytes, so
+-   converting it to sav-pdp11 is just a repack, the same one
+-   \`objcopy -O sav-pdp11\` already does correctly.  This hook runs from
+-   ldmain.c's ldemul_after_close_output(), right after ldwrite()'s
+-   bfd_close() finishes writing that a.out file to the user's requested
+-   output path.
++/* This emulation's OUTPUT_FORMAT is the ordinary object format, the same
++   as plain pdp11rt11, and not "sav-pdp11" -- deliberately.  That backend
++   has a real relocation-resolution path; the generic BFD final-link path
++   that a genuinely write-only format like sav-pdp11 would otherwise have
++   to fall back to does not correctly reproduce it (confirmed on
++   something as simple as a string-constant address reference).  So
++   rather than link straight to sav-pdp11 and risk wrong relocated
++   values, this emulation links a real, correct ${OUTPUT_FORMAT} file
++   first -- exactly the same file \`ld -m pdp11rt11\` would produce -- and
++   then, once that file is completely written to disk, converts it to the
++   RT-11 SAV format in place.  That second step is relocation-free:
++   everything in a linked executable's section contents is already final,
++   absolute bytes, so converting it to sav-pdp11 is just a repack, the
++   same one \`objcopy -O sav-pdp11\` already does correctly.  This hook
++   runs from ldmain.c's ldemul_after_close_output(), right after
++   ldwrite()'s bfd_close() finishes writing that file to the user's
++   requested output path.
+ 
+    Skipped entirely for -r/-Ur (bfd_link_relocatable): that output is a
+-   relocatable a.out-pdp11 object meant to be fed into a later link, not
+-   a finished program, and sav-pdp11 has no room for the symbols/relocs
+-   such an object needs to carry -- converting it here would silently
+-   produce a file that looks superficially like a SAV image but has lost
+-   everything a subsequent link depends on.  */
++   relocatable object meant to be fed into a later link, not a finished
++   program, and sav-pdp11 has no room for the symbols/relocs such an
++   object needs to carry -- converting it here would silently produce a
++   file that looks superficially like a SAV image but has lost everything
++   a subsequent link depends on.  */
+ 
+ static void
+ gld${EMULATION_NAME}_after_close_output (void)
+@@ -192,12 +68,12 @@ gld${EMULATION_NAME}_after_close_output (void)
+ 
+   tmp_filename = concat (output_filename, ".sav-tmp", (const char *) NULL);
+ 
+-  ibfd = bfd_openr (output_filename, "a.out-pdp11");
++  ibfd = bfd_openr (output_filename, "${OUTPUT_FORMAT}");
+   if (ibfd == NULL)
+-    fatal (_("%P: %s: cannot reopen linked a.out-pdp11 output "
++    fatal (_("%P: %s: cannot reopen linked ${OUTPUT_FORMAT} output "
+ 	     "for RT-11 SAV conversion: %E\n"), output_filename);
+   if (!bfd_check_format (ibfd, bfd_object))
+-    fatal (_("%P: %s: not recognized as a.out-pdp11 after linking: "
++    fatal (_("%P: %s: not recognized as ${OUTPUT_FORMAT} after linking: "
+ 	     "%E\n"), output_filename);
+ 
+   obfd = bfd_openw (tmp_filename, "sav-pdp11");
+@@ -274,9 +150,4 @@ gld${EMULATION_NAME}_after_close_output (void)
+ 
+ EOF
+ 
+-LDEMUL_BEFORE_PARSE=gld"$EMULATION_NAME"_before_parse
+-LDEMUL_ADD_OPTIONS=gld"$EMULATION_NAME"_add_options
+-LDEMUL_HANDLE_OPTION=gld"$EMULATION_NAME"_handle_option
+-LDEMUL_LIST_OPTIONS=gld"$EMULATION_NAME"_list_options
+-LDEMUL_GET_SCRIPT=gld"$EMULATION_NAME"_get_script
+ LDEMUL_AFTER_CLOSE_OUTPUT=gld"$EMULATION_NAME"_after_close_output
+diff --git a/ld/scripttempl/pdp11rt11.sc b/ld/scripttempl/pdp11rt11.sc
+index d0659c47846..3802faddb1c 100644
+--- a/ld/scripttempl/pdp11rt11.sc
++++ b/ld/scripttempl/pdp11rt11.sc
+@@ -7,7 +7,9 @@
+ # Default linker script for the pdp11rt11 emulation: a single flat
+ # image starting at ${TEXT_START_ADDR} (01000 octal by default), with
+ # .text/.rodata/.data merged into one output section rather than
+-# separate page-aligned segments -- this leaves the whole 64K PDP-11
++# separate page-aligned segments.  The .text.*/.data.*/.bss.* wildcards
++# are for -ffunction-sections and -fdata-sections, which only become
++# possible at all once the objects are ELF -- this leaves the whole 64K PDP-11
+ # address space usable and matches the memory layout RT-11 SAV
+ # executables need (address 0 through 0777 octal is reserved for the
+ # SAV file header; real code and data start right after it).  This is
+@@ -36,12 +38,14 @@ if test -z "${RELOCATING}"; then
+     *(.rodata)
+     *(.rodata.*)
+     *(.data)
++    *(.data.*)
+   }"
+ else
+   DATA_IN_TEXT="
+     *(.rodata)
+     *(.rodata.*)
+-    *(.data)"
++    *(.data)
++    *(.data.*)"
+   SEPARATE_DATA_SECTION=
+ fi
+ 
+@@ -65,7 +69,8 @@ SECTIONS
+   .text :
+   {
+     ${RELOCATING+PROVIDE (code = .);}
+-    *(.text)${DATA_IN_TEXT}
++    *(.text)
++    *(.text.*)${DATA_IN_TEXT}
+     ${CONSTRUCTING+CONSTRUCTORS}
+     ${RELOCATING+. = ALIGN(8);}
+     ${RELOCATING+_etext = .;}
+@@ -76,6 +81,7 @@ ${SEPARATE_DATA_SECTION}
+   {
+     ${RELOCATING+__bss_start = .;}
+     *(.bss)
++    *(.bss.*)
+     *(COMMON)
+     ${RELOCATING+. = ALIGN(2);}
+     ${RELOCATING+_end = .;}

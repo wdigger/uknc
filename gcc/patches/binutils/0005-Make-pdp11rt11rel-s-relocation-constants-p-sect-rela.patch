@@ -1,0 +1,46 @@
+From c3826bc61b812b776b95ac64a320ed4dfeaba492 Mon Sep 17 00:00:00 2001
+From: Yury Klushin <digger@live.ru>
+Date: Mon, 14 Sep 2026 09:48:05 +0300
+Subject: [PATCH] Make pdp11rt11rel's relocation constants p-sect-relative
+
+A REL relocation entry's constant is relative to the p-sect the entry
+names -- the RT-11 loader adds that p-sect's own base to it.  The
+value being written came straight out of the `-r` output's own
+layout (.text at 0, .data right after it, .bss after that), which is
+the same thing only for .text, whose start is 0.  A reference into
+.data was therefore relocated by .data's offset twice, and stayed
+unnoticed until the first PPU program with a jump table there.
+
+Take the target section's start back out.  Displaced (PC-relative)
+entries keep the raw self-relative word, which does not depend on
+where the module loads.
+---
+ ld/emultempl/pdp11rt11rel.em | 15 +++++++++++++++
+ 1 file changed, 15 insertions(+)
+
+diff --git a/ld/emultempl/pdp11rt11rel.em b/ld/emultempl/pdp11rt11rel.em
+index 8a7e691e177..fcb67d8ac1c 100644
+--- a/ld/emultempl/pdp11rt11rel.em
++++ b/ld/emultempl/pdp11rt11rel.em
+@@ -642,6 +642,21 @@ rel_write_section (FILE *f, bfd *ibfd, struct rel_psect_info *psect,
+ 	  sym = *rel->sym_ptr_ptr;
+ 	  kind = rel_classify_symbol (sym, psects);
+ 
++	  /* The raw word holds the target's address in this \`-r\` output's
++	     own layout (.text at 0, .data right after it, .bss after
++	     that), but a REL constant is relative to the *p-sect* the
++	     entry names -- the loader adds that p-sect's own base to it.
++	     Take the target section's start back out, or a reference
++	     into .data ends up relocated by .data's offset twice
++	     (harmless for .text, whose start is 0 -- which is how this
++	     went unnoticed until the first PPU program with a .data
++	     jump table).  Displaced (PC-relative) entries keep the raw
++	     self-relative word: nothing in it depends on where the
++	     module loads.  */
++	  if (!pcrel && kind != PSECT_NONE && kind != PSECT_ABS)
++	    constant = (constant - (unsigned int) psects[(int) kind].sec->vma)
++		       & 0xffff;
++
+ 	  if (kind == PSECT_NONE)
+ 	    {
+ 	      /* A real external symbol.  */

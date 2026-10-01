@@ -1,0 +1,55 @@
+From d7e5b14f25dc8d08b8f04e3c6bd517c2618b7073 Mon Sep 17 00:00:00 2001
+From: Yury Klushin <digger@live.ru>
+Date: Mon, 7 Sep 2026 02:38:03 +0300
+Subject: [PATCH] pdp11: report named sections as unsupported with GNU as
+ instead of ICEing
+
+pdp11_asm_named_section handled the GNU-assembler case (a.out has only
+.text/.data/.bss, no named sections) with gcc_assert (TARGET_DEC_ASM),
+so anything that asked for a named section anyway died with an internal
+compiler error and a "please submit a bug report".  -flto is the common
+trigger: it emits .gnu.lto_* sections for every function, so
+`-flto -c` on a one-line file ICEs at pdp11.cc:2359 -- exactly the one
+ICE gcc.c-torture/compile turned up on pdp11-uknc-rt11 (lto24400.c).
+
+Replace the assert with sorry(): an unsupported-feature diagnostic that
+names the section and says why, then return without emitting a bogus
+.psect.  Behaviour with the DEC assembler is unchanged.
+---
+ gcc/config/pdp11/pdp11.cc | 16 +++++++++++++++-
+ 1 file changed, 15 insertions(+), 1 deletion(-)
+
+diff --git a/gcc/config/pdp11/pdp11.cc b/gcc/config/pdp11/pdp11.cc
+index 38c47dfed77d2..f75f2d9129576 100644
+--- a/gcc/config/pdp11/pdp11.cc
++++ b/gcc/config/pdp11/pdp11.cc
+@@ -46,6 +46,7 @@ along with GCC; see the file COPYING3.  If not see
+ #include "builtins.h"
+ #include "explow.h"
+ #include "expmed.h"
++#include "diagnostic-core.h"
+ 
+ /* This file should be included last.  */
+ #include "target-def.h"
+@@ -2356,7 +2357,20 @@ pdp11_asm_named_section (const char *name, unsigned int flags,
+   const char *rwro = (flags & SECTION_WRITE) ? "rw" : "ro";
+   const char *insdat = (flags & SECTION_CODE) ? "i" : "d";
+ 
+-  gcc_assert (TARGET_DEC_ASM);
++  /* Only the DEC assembler has named sections (.psect); the GNU a.out
++     assembler has just .text/.data/.bss.  Anything that asks for a
++     named section anyway -- -flto's own .gnu.lto_* sections being the
++     common case, but __attribute__((section)) reaches here too via a
++     different diagnostic -- used to hit a gcc_assert here, i.e. an ICE
++     with a "please submit a bug report" for what is really an
++     unsupported-feature situation.  Report it as such instead.  */
++  if (!TARGET_DEC_ASM)
++    {
++      sorry ("named section %qs is not supported with the GNU assembler "
++	     "on this target (only the DEC assembler has %<.psect%>)",
++	     name);
++      return;
++    }
+   fprintf (asm_out_file, "\t.psect\t%s,con,%s,%s\n", name, insdat, rwro);
+ }
+ 

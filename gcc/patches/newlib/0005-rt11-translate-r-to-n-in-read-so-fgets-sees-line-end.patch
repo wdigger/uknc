@@ -1,0 +1,57 @@
+From d01a026f73060db90afc9af2ea986549da41a715 Mon Sep 17 00:00:00 2001
+From: Yury Klushin <digger@live.ru>
+Date: Thu, 3 Sep 2026 16:48:12 +0300
+Subject: [PATCH] rt11: translate '\r' to '\n' in _read() so fgets() sees line
+ endings
+
+RT-11's own console driver terminates an input line with '\r', never
+'\n'. newlib's fgets() (refill.c) looks for '\n' specifically via
+memchr() to decide a line is complete; the previous code stored '\r'
+as-is and only used it (ORed with '\n') as this loop's own terminator,
+so fgets() never actually saw a '\n' in the buffer and looped around
+for another refill() -- silently stalling past the Enter that had
+already terminated the line, then swallowing whatever key came next
+into the same buffer.
+
+Translate '\r' to '\n' as each character comes in, mirroring the
+LF->CRLF translation write.c already does symmetrically on output.
+Safe for any caller that still checks for '\r' too (e.g.
+strcspn(buf, "\r\n")) -- '\n' alone already satisfies that check.
+
+Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>
+---
+ newlib/libc/sys/rt11/read.c | 20 +++++++++++++++++++-
+ 1 file changed, 19 insertions(+), 1 deletion(-)
+
+diff --git a/newlib/libc/sys/rt11/read.c b/newlib/libc/sys/rt11/read.c
+index a200b4711..0cdee7695 100644
+--- a/newlib/libc/sys/rt11/read.c
++++ b/newlib/libc/sys/rt11/read.c
+@@ -29,8 +29,26 @@ _read (int file, void *ptr, size_t len)
+ 	{
+ 	  char c = rt11_ttyin ();
+ 
++	  /* RT-11's own console driver terminates a line with '\r', never
++	     '\n' -- but newlib's fgets() (refill.c/fgets.c) looks for '\n'
++	     specifically via memchr() to decide a line is complete.  Left
++	     untranslated, a line read back as "TEXT\r" (no '\n' anywhere)
++	     doesn't satisfy that search, so fgets() loops around for
++	     *another* refill(), blocking on one more real keystroke it
++	     will never get from this line -- confirmed directly: it stalls
++	     waiting past the Enter that already terminated the line,
++	     silently swallowing whatever key comes next into the same
++	     buffer.  Translating '\r' to '\n' here mirrors the LF->CRLF
++	     translation write.c already does symmetrically on output (the
++	     canonical terminal-driver "icrnl" behavior RT-11 itself
++	     doesn't provide) and fixes fgets() outright.  Safe for any
++	     caller that still checks for '\r' too (e.g. strcspn(buf,
++	     "\r\n")) -- '\n' alone already satisfies that check.  */
++	  if (c == '\r')
++	    c = '\n';
++
+ 	  p[i] = c;
+-	  if (c == '\r' || c == '\n')
++	  if (c == '\n')
+ 	    {
+ 	      i++;
+ 	      break;

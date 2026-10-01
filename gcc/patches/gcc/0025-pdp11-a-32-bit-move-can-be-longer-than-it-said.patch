@@ -1,0 +1,77 @@
+From 95168bc52dac315f438b441caa590d0a9332271e Mon Sep 17 00:00:00 2001
+From: Yury Klushin <digger@live.ru>
+Date: Mon, 14 Sep 2026 23:26:16 +0300
+Subject: [PATCH] pdp11: a 32-bit move can be longer than it said
+
+Branch shortening decides between br and jmp by adding up the length
+attributes between the branch and its target, so a length that is short
+makes the compiler believe a branch reaches when it does not.  Until
+now the assembler encoded such a branch anyway, silently, and what came
+out was a jump to somewhere else.
+
+movsi's attribute counted eight bytes for a constant stored to memory.
+That is right when both halves are zero -- clr, clr, four bytes each --
+and wrong as soon as one is not:
+
+	clr	10(r4)		; 4 bytes
+	mov	$1234,12(r4)	; 6 bytes
+
+newlib's libc/search/hash.c accumulated enough of those to put a branch
+five words past what a bne can reach.
+
+All four alternatives are now the worst case, which is what branch
+shortening wants: a word of the move is two bytes plus one word for
+each operand carrying an index, an absolute address or an immediate,
+and output_move_multiple can add a sub before or an add after for an
+auto-decrement or auto-increment operand.  Register to register stays
+4; small constant to register becomes 8, to memory 12; memory to memory
+becomes 20.
+
+The overestimate costs 192 bytes across this project's thirteen
+programs, 0.09%, which is the price of the branches being right.
+---
+ gcc/config/pdp11/pdp11.md | 19 +++++++++++++++++--
+ 1 file changed, 17 insertions(+), 2 deletions(-)
+
+diff --git a/gcc/config/pdp11/pdp11.md b/gcc/config/pdp11/pdp11.md
+index 2905a9b484417..5cfdc8418c381 100644
+--- a/gcc/config/pdp11/pdp11.md
++++ b/gcc/config/pdp11/pdp11.md
+@@ -586,12 +586,27 @@
+   "* return output_move_multiple (operands);"
+   [(set_attr "length" "16,32")])
+ 
++;; Lengths are the worst case, which is what branch shortening needs:
++;; an underestimate makes the compiler believe a branch reaches when it
++;; does not, and the assembler used to encode the too-far branch without
++;; a word of complaint.  A word of this move costs 2 bytes plus one word
++;; for each operand that carries an index, an absolute address or an
++;; immediate, and output_move_multiple may add a sub before or an add
++;; after for an auto-decrement or auto-increment operand.  So, per
++;; alternative: register to register 2+2; small constant to register
++;; 4+4; small constant to memory 6+6; memory to memory 6+6 with up to
++;; two 4-byte adjustments.
++;;
++;; What the old figures missed was a constant stored to an indexed
++;; address: "clr 10(r4)" is 4 bytes but "mov $1234,12(r4)" is 6, so the
++;; pair is 10 where the attribute said 8.  newlib's libc/search/hash.c
++;; accumulated enough of those to put a branch 5 words out of reach.
+ (define_insn "movsi"
+   [(set (match_operand:SI 0 "nonimmediate_operand" "=r,r,g,g")
+ 	(match_operand:SI 1 "general_operand" "rN,IJ,IJ,g"))]
+   ""
+   ""
+-  [(set_attr "length" "4,6,8,16")])
++  [(set_attr "length" "4,8,12,20")])
+ 
+ (define_insn "*movsi_nocc"
+   [(set (match_operand:SI 0 "nonimmediate_operand" "=r,r,g,g")
+@@ -599,7 +614,7 @@
+    (clobber (reg:CC CC_REGNUM))]
+   ""
+   "* return output_move_multiple (operands);"
+-  [(set_attr "length" "4,6,8,16")])
++  [(set_attr "length" "4,8,12,20")])
+ 
+ ;; That long string of "Z" constraints enforces the restriction that
+ ;; a register source and auto increment or decrement destination must

@@ -1,0 +1,38 @@
+From 22490744a2d7d368a7ad6ca32acb6b6b4a02161f Mon Sep 17 00:00:00 2001
+From: Yury Klushin <digger@live.ru>
+Date: Fri, 18 Sep 2026 21:40:32 +0300
+Subject: [PATCH] Fix the pdp11-uknc SAV writer failing to replace its own
+ output on Windows
+
+The image is written beside the linked file and renamed over it, and
+rename() on Windows will not write over a file that is already there:
+"cannot rename hello.sav.sav-tmp to hello.sav: File exists".  Every
+link of a .sav failed on a mingw-hosted toolchain, the very first one
+being the hello example.
+
+Removing the destination first is what rename() does for itself
+everywhere else, and costs nothing there.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+---
+ ld/emultempl/pdp11rt11sav.em | 7 +++++++
+ 1 file changed, 7 insertions(+)
+
+diff --git a/ld/emultempl/pdp11rt11sav.em b/ld/emultempl/pdp11rt11sav.em
+index 3240390b798..fbf8212cd09 100644
+--- a/ld/emultempl/pdp11rt11sav.em
++++ b/ld/emultempl/pdp11rt11sav.em
+@@ -139,6 +139,13 @@ gld${EMULATION_NAME}_after_close_output (void)
+   if (!bfd_close (ibfd))
+     fatal (_("%P: %s: final close failed: %E\n"), output_filename);
+ 
++  /* The linked file is still sitting there under the name the SAV image
++     is about to take, and on Windows rename() will not write over an
++     existing file the way it does everywhere else -- "cannot rename
++     hello.sav.sav-tmp to hello.sav: File exists".  Removing it first
++     costs nothing on a host where rename() would have done it.  */
++  unlink (output_filename);
++
+   if (rename (tmp_filename, output_filename) != 0)
+     fatal (_("%P: cannot rename %s to %s: %s\n"),
+ 	   tmp_filename, output_filename, strerror (errno));

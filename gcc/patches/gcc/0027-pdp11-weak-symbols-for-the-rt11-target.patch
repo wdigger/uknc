@@ -1,0 +1,82 @@
+From 8183b382d441ca97539b2fdd0975e2cc817f724d Mon Sep 17 00:00:00 2001
+From: Yury Klushin <digger@live.ru>
+Date: Tue, 15 Sep 2026 00:20:43 +0300
+Subject: [PATCH] pdp11: weak symbols for the rt11 target
+
+a.out has no way to represent a weak symbol, so this backend defined no
+ASM_WEAKEN_LABEL and SUPPORTS_WEAK came out 0: every weak declaration
+got "weak declaration of 'foo' not supported" and became an ordinary
+strong one.  ELF represents them, and the rest of the toolchain already
+handles them -- the assembler emits STB_WEAK, and the linker resolves an
+undefined weak reference to zero instead of failing the link while a
+strong definition anywhere overrides the weak one.  Both checked on the
+machine before this patch was written.
+
+So all that was missing was saying so, which is elfos.h's five-liner
+under the same guard as the other things only the rt11 OS has.
+
+This matters here beyond the language feature: newlib's nano printf
+declares _printf_float weak and tests it against NULL, precisely so that
+the arbitrary-precision machinery behind %f links only into a program
+that asks for it.  Without weak symbols that reference is strong and
+drags dtoa and mprec into every program that calls printf at all, which
+on a machine with 64K of address space is why this toolchain carries a
+stub for it.
+---
+ gcc/config/pdp11/pdp11.h              | 14 ++++++++++++++
+ gcc/testsuite/gcc.target/pdp11/weak.c | 21 +++++++++++++++++++++
+ 2 files changed, 35 insertions(+)
+ create mode 100644 gcc/testsuite/gcc.target/pdp11/weak.c
+
+diff --git a/gcc/config/pdp11/pdp11.h b/gcc/config/pdp11/pdp11.h
+index 76bf6dea1da7c..7b17d5bf0ba16 100644
+--- a/gcc/config/pdp11/pdp11.h
++++ b/gcc/config/pdp11/pdp11.h
+@@ -749,6 +749,20 @@ extern int current_first_parm_offset;
+    all.  */
+ #define DWARF2_DEBUGGING_INFO 1
+ #define DWARF2_ADDR_SIZE 4
++
++/* Weak symbols, which a.out has no way to represent and ELF does.  The
++   linker already does the rest: an undefined weak reference resolves to
++   zero instead of failing the link, and a strong definition anywhere
++   overrides the weak one.  Tested with #ifdef, so a.out must not see
++   it.  */
++#define ASM_WEAKEN_LABEL(FILE, NAME)	\
++  do					\
++    {					\
++      fputs ("\t.weak\t", (FILE));	\
++      assemble_name ((FILE), (NAME));	\
++      fputc ('\n', (FILE));		\
++    }					\
++  while (0)
+ #undef PREFERRED_DEBUGGING_TYPE
+ #define PREFERRED_DEBUGGING_TYPE DWARF2_DEBUG
+ #endif
+diff --git a/gcc/testsuite/gcc.target/pdp11/weak.c b/gcc/testsuite/gcc.target/pdp11/weak.c
+new file mode 100644
+index 0000000000000..ea4e5ea58857e
+--- /dev/null
++++ b/gcc/testsuite/gcc.target/pdp11/weak.c
+@@ -0,0 +1,21 @@
++/* { dg-do run { target pdp11-*-rt11* } } */
++/* { dg-options "-O2" } */
++
++/* Weak symbols, which a.out could not represent and ELF can.  The
++   linker does the rest: an undefined weak reference resolves to zero
++   rather than failing the link, and a strong definition overrides the
++   weak one.  newlib leans on exactly this for _printf_float.  */
++
++extern void abort (void);
++
++int __attribute__((weak)) pick (void) { return 1; }
++extern int absent (void) __attribute__((weak));
++
++int main (void)
++{
++  if (pick () != 1)
++    abort ();
++  if (absent != 0)
++    abort ();
++  return 0;
++}

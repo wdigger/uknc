@@ -1,0 +1,31 @@
+From 6a68da64eff59984f2a294beb0b64af540684ebf Mon Sep 17 00:00:00 2001
+From: Yury Klushin <digger@live.ru>
+Date: Thu, 26 Feb 2026 01:33:19 +0300
+Subject: [PATCH] Added: SOB usage for shift
+
+---
+ gcc/config/pdp11/pdp11.cc | 11 +++++++++--
+ 1 file changed, 9 insertions(+), 2 deletions(-)
+
+diff --git a/gcc/config/pdp11/pdp11.cc b/gcc/config/pdp11/pdp11.cc
+index ba5126a3aeb0f..e9490cd0d9d01 100644
+--- a/gcc/config/pdp11/pdp11.cc
++++ b/gcc/config/pdp11/pdp11.cc
+@@ -2085,8 +2085,15 @@ pdp11_assemble_shift (rtx *operands, machine_mode m, int code)
+   if (!small)
+     {
+       /* Loop case, emit the count-down and branch if not done.  */
+-      output_asm_insn ("dec\t%2", operands);
+-      output_asm_insn ("bne\t%l0", lb);
++      if (SUPP_INSN_SOB) {
++        rtx tmpops[2];
++        tmpops[0] = operands[2];
++        tmpops[1] = lb[0];
++        output_asm_insn ("sob\t%0, %l1", tmpops);
++      } else {
++        output_asm_insn ("dec\t%2", operands);
++        output_asm_insn ("bne\t%l0", lb);
++      }
+     }
+   return "";
+ }

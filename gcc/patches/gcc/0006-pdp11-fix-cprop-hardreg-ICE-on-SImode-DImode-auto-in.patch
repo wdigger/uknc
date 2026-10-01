@@ -1,0 +1,114 @@
+From 24515e85ed970c217555cf8f2d2c11fa1ffbfd25 Mon Sep 17 00:00:00 2001
+From: Yury Klushin <digger@live.ru>
+Date: Mon, 31 Aug 2026 02:05:40 +0300
+Subject: [PATCH] pdp11: fix cprop_hardreg ICE on SImode/DImode auto_inc_dec
+ compares
+
+GCC's pdp11 backend could ICE ("internal compiler error: in
+extract_constrain_insn, at recog.cc:2783", during the cprop_hardreg
+pass) on ordinary code like:
+
+    long *a;
+    void f(void) {
+      for (;; --a) {
+        if (*a) break;
+        *a = 1;
+      }
+    }
+
+cbranch<mode>4 shares one pattern across QI/HI/SI/DI (the QHSDint
+iterator) via the unrestricted "general_operand" predicate. That's
+correct for the single-word (QI/HI) cases, which really can use an
+auto-increment/decrement address directly in a compare. But the wide
+(SI/DI) cases get split into cmpsi/cmpdi, which emulate their
+multi-word compare by computing each word's address separately
+(pdp11_expand_operands) -- a side-effecting address, which adjusts the
+register by one word and applies only once, can't correctly supply two
+different word offsets, so cmpsi/cmpdi's own constraints ("D"/"Q")
+already exclude such addresses. Nothing enforced that same restriction
+on cbranch<mode>4 itself, though, so the auto_inc_dec pass -- which
+only backs off a fold when recognizing the consuming pattern actually
+fails -- could freely fold a decrement into a SImode/DImode compare's
+address. The resulting insn satisfied cbranch<mode>4's own match but
+violated cmpsi/cmpdi's stricter constraints once split, a mismatch
+that wasn't caught until cprop_hardreg, as an ICE instead of a clean
+rejection.
+
+Fix: add a new predicate, cmp_operand (predicates.md), identical to
+general_operand except it rejects PRE_DEC/POST_INC/PRE_MODIFY/
+POST_MODIFY memory addresses when the operand's mode is SImode or
+DImode, and use it for cbranch<mode>4's two compare operands. This
+stops the pattern from ever accepting the problematic fold, so
+auto_inc_dec correctly backs off and leaves the decrement as a
+separate instruction instead.
+
+Verified with a creduce-minimized reproducer and the real-world case
+that surfaced this (newlib's libc/stdlib/gdtoa-hexnan.c): both compile
+cleanly at -O1/-O2 with no ICE. Checked the generated assembly for the
+minimal reproducer to confirm this isn't just silencing the ICE: the
+decrement now emits as a separate "add $-04,r0" before a plain
+non-side-effecting two-word compare, which is correct. Confirmed no
+regression for the legitimate single-word case (the HImode analog of
+the same source still folds into a single "tst -(r0)" autodecrement
+instruction, unchanged), and that the DImode analog of the bug is
+fixed by the same predicate.
+---
+ gcc/config/pdp11/pdp11.md      |  4 ++--
+ gcc/config/pdp11/predicates.md | 32 ++++++++++++++++++++++++++++++++
+ 2 files changed, 34 insertions(+), 2 deletions(-)
+
+diff --git a/gcc/config/pdp11/pdp11.md b/gcc/config/pdp11/pdp11.md
+index e102e7b034ad8..554158591489b 100644
+--- a/gcc/config/pdp11/pdp11.md
++++ b/gcc/config/pdp11/pdp11.md
+@@ -446,8 +446,8 @@
+ (define_insn_and_split "cbranch<mode>4"
+   [(set (pc)
+ 	(if_then_else (match_operator 0 "ordered_comparison_operator"
+-		       [(match_operand:QHSDint 1 "general_operand" "g")
+-			(match_operand:QHSDint 2 "general_operand" "g")])
++		       [(match_operand:QHSDint 1 "cmp_operand" "g")
++			(match_operand:QHSDint 2 "cmp_operand" "g")])
+ 		      (label_ref (match_operand 3 "" ""))
+ 		      (pc)))]
+   ""
+diff --git a/gcc/config/pdp11/predicates.md b/gcc/config/pdp11/predicates.md
+index 062170d68df49..976b71f559a8d 100644
+--- a/gcc/config/pdp11/predicates.md
++++ b/gcc/config/pdp11/predicates.md
+@@ -59,3 +59,35 @@
+ ;; Accept any comparison valid for CCNZmode
+ (define_predicate "ccnz_operator"
+   (match_code "eq,ne,ge,lt"))
++
++;; Accept the same operands as general_operand, but for SImode/DImode
++;; reject any MEM whose address has a side effect (auto-increment or
++;; auto-decrement).  cmpsi/cmpdi emulate their multi-word compare by
++;; computing the address of each word separately (pdp11_expand_operands
++;; in pdp11.cc), so a side-effecting address -- which only adjusts the
++;; register by one word, applied once -- can't correctly supply two
++;; different word offsets; cmpsi/cmpdi's own constraints ("D"/"Q")
++;; already exclude such addresses for exactly this reason.  Without this
++;; predicate, cbranch<mode>4 (which shares one pattern across QI/HI/SI/DI
++;; via the QHSDint iterator) accepts these addresses too, via the same
++;; unrestricted "general_operand" used by the narrower single-word
++;; compares that legitimately do allow them.  That mismatch lets the
++;; auto_inc_dec pass fold an autoincrement candidate straight into a
++;; SImode/DImode compare -- auto_inc_dec only backs off when recognizing
++;; the consuming pattern actually fails, so as long as cbranch<mode>4
++;; itself accepts the fold, it goes through -- producing an insn that
++;; only fails cmpsi/cmpdi's stricter constraints much later, at
++;; cprop_hardreg, as an ICE in extract_constrain_insn instead of being
++;; rejected cleanly up front.
++(define_predicate "cmp_operand"
++  (match_operand 0 "general_operand")
++{
++  if ((mode == SImode || mode == DImode) && MEM_P (op))
++    {
++      enum rtx_code code = GET_CODE (XEXP (op, 0));
++      if (code == PRE_DEC || code == POST_INC
++	  || code == PRE_MODIFY || code == POST_MODIFY)
++	return false;
++    }
++  return true;
++})

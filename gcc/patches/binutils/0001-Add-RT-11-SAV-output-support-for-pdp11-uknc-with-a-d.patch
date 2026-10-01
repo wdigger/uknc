@@ -1,0 +1,1246 @@
+From: Yury Klushin <digger@live.ru>
+Date: Mon, 31 Aug 2026 16:00:34 +0300
+Subject: [PATCH] Add RT-11 SAV output support for pdp11-uknc, with a dedicated
+ rt11 OS
+
+Adds a self-contained pipeline for producing RT-11 ".sav" executables
+for UKNC (pdp11-uknc-*) directly from this toolchain, replacing the
+project's previous external bin2load/lda2sav conversion step:
+
+- bfd/sav-pdp11.c: a new write-only BFD target that emits RT-11 SAV
+  executables (512-byte header with start address, initial SP, and
+  high-limit fields, plus a block-usage bitmap) from a flat 64K PDP-11
+  memory image built up via the normal BFD section-content path.
+
+- config.sub: recognizes "uknc" as a vendor alias for pdp11-uknc-aout,
+  and "rt11*" as a valid OS component for the pdp11 target triple
+  (pdp11-uknc-rt11), alongside the existing aout-based triple.
+  gas/configure.tgt maps the rt11 OS to the aout object format, same
+  as plain aout targets.
+
+- ld/emulparams/pdp11rt11.sh + ld/scripttempl/pdp11rt11.sc: a built-in
+  default linker script/emulation (matching this project's previous
+  external pdp11-aout.ld) so pdp11-uknc-aout's `ld` no longer requires
+  an explicit -T. The script includes a .bss output section bracketed
+  by __bss_start before and _end/__end after (matching vanilla
+  pdp11.sc's exact pattern) -- without it bss fell through as an
+  orphan section placed *after* PROVIDE(end = .), so "end" never
+  actually marked the top of statically-allocated memory the way it
+  does for the generic pdp11.sc script, which breaks anything relying
+  on _end to find the start of free memory (e.g. a newlib-style _sbrk
+  heap, or zeroing .bss at startup before it's known where .bss
+  actually ends).
+
+- bfd/config.bfd / bfd/targets.c: sav-pdp11 is only compiled visible
+  (-DBFD_SUPPORTS_SAV_PDP11, gated via #ifdef in targets.c) for the
+  rt11 OS; pdp11-uknc-aout stays byte-for-byte identical to vanilla
+  binutils, with no sav-pdp11 target and no default script override.
+
+- ld/configure.tgt: pdp11-*-rt11* defaults to a new pdp11rt11sav
+  emulation (falling back to pdp11rt11, then pdp11).  Its
+  OUTPUT_FORMAT is deliberately still "a.out-pdp11", not "sav-pdp11":
+  linking straight to sav-pdp11 would go through BFD's generic
+  final-link path (sav-pdp11 has no relocation-resolution code of its
+  own), which does not correctly reproduce a.out-pdp11's own
+  specialized one (pdp11_aout_link_input_section in bfd/pdp11.c) --
+  confirmed wrong on something as simple as a string-constant address
+  reference.  Instead, pdp11rt11sav links a real, correct a.out-pdp11
+  file first, then converts it to RT-11 SAV format in place once that
+  file is fully written to disk -- a relocation-free repack, the same
+  conversion `objcopy -O sav-pdp11` already does correctly.  That
+  conversion runs from a new optional ld emulation hook,
+  after_close_output (ld/ldemul.h, ld/ldemul.c,
+  ld/emultempl/emulation.em, one call site in ld/ldmain.c added right
+  after ldwrite()'s bfd_close()); it defaults to NULL/no-op for every
+  other emulation.  ld/emultempl/pdp11rt11sav.em implements it for
+  pdp11rt11sav by reopening the just-written a.out-pdp11 file, copying
+  its sections into a sav-pdp11 bfd, and swapping it in for the
+  original output file.
+
+- The RT-11 SAV header's initial-SP field is set to the top of user
+  memory (the address immediately below the resident RT-11 monitor and
+  the fixed Unibus I/O page), not the program's entry point -- RT-11
+  copies this value into low memory before transferring control, so a
+  program's startup code can pick it up via `mov @$042,sp` instead of
+  hardcoding a stack address of its own.
+
+Verified: a fresh pdp11-uknc-aout build exposes only the pdp11
+emulation and no sav-pdp11 target (byte-identical to vanilla
+binutils); a fresh pdp11-uknc-rt11 build's single-command
+`ld -m pdp11rt11sav` produces output byte-identical to the two-step
+`ld -m pdp11rt11 && objcopy -O sav-pdp11` pipeline on a test program
+with a string-constant address relocation. The .bss fix was verified
+separately with a real rebuild of ld and a SIMH test program with a
+global .bss variable: __bss_start/_end now correctly bracket .bss.
+
+Includes what was a separate fix on top of this one, now part of it:
+
+Fix pdp11-uknc RT-11 SAV writer setting SP below the program's own size
+
+sav_pdp11_write_object_contents() always wrote the hardcoded
+SAV_STACK_ADDRESS (16896) as the SAV header's initial-SP word,
+regardless of how large the linked program actually was. RT-11 copies
+that word into low memory at address 042 before transferring control,
+and crt0 reads it back as a provisional SP -- used as-is until crt0's
+own `.SETTOP` EMT replaces it with the monitor's real answer a few
+instructions later.
+
+A program whose own code/data (including .bss) extends past 16896
+bytes -- easy once printf/rand pull in enough of libc/libgcc -- got a
+provisional SP that pointed *inside* its own already-loaded text. An
+EMT's trap entry pushes the return PC/PS onto whatever SP already
+holds, so that very first `.SETTOP` EMT silently corrupted the
+program's own code before a single instruction of its own body ran.
+
+Found via bisection on a real crash (`?MON-F-Trap to 10`) in a ~20KB
+UKNC C program: the corrupted byte sat exactly 20 bytes below the
+hardcoded 16896 boundary, inside __muldi3 (pulled in from libgcc),
+matching an EMT trap-frame push against a too-low provisional SP.
+Reproduced identically on SIMH (unrelated, non-UKNC PDP-11 emulator),
+which ruled out any UKNC-hardware-specific cause and pointed at the
+SAV file itself.
+
+Fix: compute the highest address used by any SEC_ALLOC section
+(including .bss, which carries no file content but is still live
+memory crt0 must not stack on top of) and write
+max(SAV_STACK_ADDRESS, that highest address) as the SP word instead.
+Small programs that already fit under the default are unaffected.
+
+Verified: rebuilt binutils, relinked a previously-crashing ~20KB
+program, confirmed the SP word now reflects the real top of memory,
+and ran the program to completion (many rounds of interactive I/O)
+without a single trap, both on SIMH and on the real UKNC emulator core
+(ukncbtl's emubase). All other example programs in the toolchain
+rebuild unchanged.
+
+Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>
+---
+ bfd/Makefile.am               |   4 +-
+ bfd/Makefile.in               |   8 +-
+ bfd/config.bfd                |   9 +
+ bfd/po/SRC-POTFILES.in        |   1 +
+ bfd/sav-pdp11.c               | 424 ++++++++++++++++++++++++++++++++++
+ bfd/targets.c                 |   7 +
+ config.sub                    |   5 +
+ gas/configure.tgt             |   1 +
+ ld/Makefile.am                |   2 +
+ ld/Makefile.in                |   4 +
+ ld/configure.tgt              |   4 +
+ ld/emulparams/pdp11rt11.sh    |   6 +
+ ld/emulparams/pdp11rt11sav.sh |  21 ++
+ ld/emultempl/emulation.em     |   3 +-
+ ld/emultempl/pdp11rt11sav.em  | 272 ++++++++++++++++++++++
+ ld/ldemul.c                   |   7 +
+ ld/ldemul.h                   |  10 +
+ ld/ldmain.c                   |   2 +
+ ld/po/BLD-POTFILES.in         |   2 +
+ ld/scripttempl/pdp11rt11.sc   |  60 +++++
+ 20 files changed, 846 insertions(+), 6 deletions(-)
+ create mode 100644 bfd/sav-pdp11.c
+ create mode 100644 ld/emulparams/pdp11rt11.sh
+ create mode 100644 ld/emulparams/pdp11rt11sav.sh
+ create mode 100644 ld/emultempl/pdp11rt11sav.em
+ create mode 100644 ld/scripttempl/pdp11rt11.sc
+
+diff --git a/bfd/Makefile.am b/bfd/Makefile.am
+index 4987ac9..a8388d8 100644
+--- a/bfd/Makefile.am
++++ b/bfd/Makefile.am
+@@ -79,7 +79,7 @@ BFD32_LIBS = \
+ 	coff-bfd.lo compress.lo corefile.lo elf-properties.lo format.lo \
+ 	hash.lo libbfd.lo linker.lo merge.lo opncls.lo reloc.lo \
+ 	section.lo simple.lo stab-syms.lo stabs.lo syms.lo targets.lo \
+-	binary.lo ihex.lo srec.lo tekhex.lo verilog.lo
++	binary.lo ihex.lo srec.lo tekhex.lo verilog.lo sav-pdp11.lo
+ 
+ BFD64_LIBS = archive64.lo
+ 
+@@ -88,7 +88,7 @@ BFD32_LIBS_CFILES = \
+ 	compress.c corefile.c elf-properties.c format.c hash.c \
+ 	libbfd.c linker.c merge.c opncls.c reloc.c \
+ 	section.c simple.c stab-syms.c stabs.c syms.c targets.c \
+-	binary.c ihex.c srec.c tekhex.c verilog.c
++	binary.c ihex.c srec.c tekhex.c verilog.c sav-pdp11.c
+ 
+ BFD64_LIBS_CFILES = archive64.c
+ 
+diff --git a/bfd/Makefile.in b/bfd/Makefile.in
+index 8a670ad..e934cd4 100644
+--- a/bfd/Makefile.in
++++ b/bfd/Makefile.in
+@@ -182,7 +182,8 @@ am__objects_1 = archive.lo archures.lo bfd.lo bfdio.lo cache.lo \
+ 	coff-bfd.lo compress.lo corefile.lo elf-properties.lo \
+ 	format.lo hash.lo libbfd.lo linker.lo merge.lo opncls.lo \
+ 	reloc.lo section.lo simple.lo stab-syms.lo stabs.lo syms.lo \
+-	targets.lo binary.lo ihex.lo srec.lo tekhex.lo verilog.lo
++	targets.lo binary.lo ihex.lo srec.lo tekhex.lo verilog.lo \
++	sav-pdp11.lo
+ am_libbfd_la_OBJECTS = $(am__objects_1)
+ libbfd_la_OBJECTS = $(am_libbfd_la_OBJECTS)
+ AM_V_lt = $(am__v_lt_@AM_V@)
+@@ -545,7 +546,7 @@ BFD32_LIBS = \
+ 	coff-bfd.lo compress.lo corefile.lo elf-properties.lo format.lo \
+ 	hash.lo libbfd.lo linker.lo merge.lo opncls.lo reloc.lo \
+ 	section.lo simple.lo stab-syms.lo stabs.lo syms.lo targets.lo \
+-	binary.lo ihex.lo srec.lo tekhex.lo verilog.lo
++	binary.lo ihex.lo srec.lo tekhex.lo verilog.lo sav-pdp11.lo
+ 
+ BFD64_LIBS = archive64.lo
+ BFD32_LIBS_CFILES = \
+@@ -553,7 +554,7 @@ BFD32_LIBS_CFILES = \
+ 	compress.c corefile.c elf-properties.c format.c hash.c \
+ 	libbfd.c linker.c merge.c opncls.c reloc.c \
+ 	section.c simple.c stab-syms.c stabs.c syms.c targets.c \
+-	binary.c ihex.c srec.c tekhex.c verilog.c
++	binary.c ihex.c srec.c tekhex.c verilog.c sav-pdp11.c
+ 
+ BFD64_LIBS_CFILES = archive64.c
+ 
+@@ -1720,6 +1721,7 @@ distclean-compile:
+ @AMDEP_TRUE@@am__include@ @am__quote@./$(DEPDIR)/reloc.Plo@am__quote@
+ @AMDEP_TRUE@@am__include@ @am__quote@./$(DEPDIR)/reloc16.Plo@am__quote@
+ @AMDEP_TRUE@@am__include@ @am__quote@./$(DEPDIR)/rs6000-core.Plo@am__quote@
++@AMDEP_TRUE@@am__include@ @am__quote@./$(DEPDIR)/sav-pdp11.Plo@am__quote@
+ @AMDEP_TRUE@@am__include@ @am__quote@./$(DEPDIR)/section.Plo@am__quote@
+ @AMDEP_TRUE@@am__include@ @am__quote@./$(DEPDIR)/simple.Plo@am__quote@
+ @AMDEP_TRUE@@am__include@ @am__quote@./$(DEPDIR)/som.Plo@am__quote@
+diff --git a/bfd/config.bfd b/bfd/config.bfd
+index 4e5a838..24a4a6e 100644
+--- a/bfd/config.bfd
++++ b/bfd/config.bfd
+@@ -1076,6 +1076,15 @@ case "${targ}" in
+     targ_defvec=or1k_elf32_vec
+     ;;
+ 
++  pdp11-*-rt11*)
++    targ_defvec=pdp11_aout_vec
++    targ_underscore=yes
++    # Makes the sav-pdp11 (RT-11 SAV executable) target vector visible
++    # in bfd/targets.c -- see the #ifdef guard there.  Only meaningful
++    # for the rt11 OS: aout builds stay identical to vanilla binutils.
++    targ_cflags=-DBFD_SUPPORTS_SAV_PDP11
++    ;;
++
+   pdp11-*-*)
+     targ_defvec=pdp11_aout_vec
+     targ_underscore=yes
+diff --git a/bfd/po/SRC-POTFILES.in b/bfd/po/SRC-POTFILES.in
+index 54b078b..4b90ac2 100644
+--- a/bfd/po/SRC-POTFILES.in
++++ b/bfd/po/SRC-POTFILES.in
+@@ -336,6 +336,7 @@ ppcboot.c
+ reloc.c
+ reloc16.c
+ rs6000-core.c
++sav-pdp11.c
+ section.c
+ simple.c
+ som.c
+diff --git a/bfd/sav-pdp11.c b/bfd/sav-pdp11.c
+new file mode 100644
+index 0000000..f366295
+--- /dev/null
++++ b/bfd/sav-pdp11.c
+@@ -0,0 +1,424 @@
++/* BFD back-end for RT-11 SAV executables (PDP-11).
++   Copyright (C) 2026 Free Software Foundation, Inc.
++
++   This file is part of BFD, the Binary File Descriptor library.
++
++   This program is free software; you can redistribute it and/or modify
++   it under the terms of the GNU General Public License as published by
++   the Free Software Foundation; either version 3 of the License, or
++   (at your option) any later version.
++
++   This program is distributed in the hope that it will be useful,
++   but WITHOUT ANY WARRANTY; without even the implied warranty of
++   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++   GNU General Public License for more details.
++
++   You should have received a copy of the GNU General Public License
++   along with this program; if not, write to the Free Software
++   Foundation, Inc., 51 Franklin Street - Fifth Floor, Boston,
++   MA 02110-1301, USA.  */
++
++/* This is a write-only BFD backend that produces RT-11 ".sav" executable
++   images directly from ld/objcopy, for the pdp11-aout target, in place of
++   the external pdp11-aout -> .lda (bin2load) -> .sav (lda2sav) pipeline.
++
++   A SAV file is a flat memory image of the loaded program: file offset 0
++   is PDP-11 address 0.  The first 512-byte block (addresses 0 through
++   0777 octal) is a fixed-format header; real program code/data occupies
++   the rest of the image, and by long-standing convention for this
++   toolchain always starts at address 01000 octal (matching the
++   pdp11-aout.ld linker script's `phys = 00001000;`).
++
++   Within that header block (all fields native PDP-11 byte order, i.e.
++   little-endian words):
++     - byte offset 0360 (octal): a per-512-byte-block "used" bitmap
++       covering the whole file, one bit per block, MSB first within each
++       byte -- used by RT-11 for core allocation.
++     - word index 020 (octal), byte offset 040: the program's start
++       (entry) address.
++     - word index 021 (octal), byte offset 042: initial SP -- the top
++       of memory available to a user job (SAV_STACK_ADDRESS below, or
++       the program's own top if that's higher -- see
++       sav_pdp11_write_object_contents), *not* the entry address.
++       RT-11 copies this word into low memory at address 042 before
++       transferring control, so a program's startup code can read it
++       back via `mov @$042,sp` instead of hardcoding a stack address of
++       its own.
++     - word index 024 (octal), byte offset 050: the program's "high
++       limit" -- total image size in bytes.
++   Everything else in the header is zero.
++
++   These field offsets were reverse-engineered from two known-working
++   reference tools already used by this toolchain,
++   pdp11-toolchain/hello-gcc/lda2sav.c and savbmap.c -- both of which
++   (incorrectly) set the initial-SP word to the entry address rather
++   than the top of user memory; this backend does not repeat that
++   mistake (see SAV_STACK_ADDRESS).
++
++   Modeled on bfd/binary.c and bfd/srec.c: like binary.c, the "address
++   space" is what defines file layout; like srec.c, we need to write a
++   trailer (here, a header) that depends on information -- the highest
++   address used, the true entry point -- only known once every section
++   has been written, so section data is buffered in memory and the whole
++   image is written out in bfd_close(), from the _bfd_write_contents
++   jump-table slot.  */
++
++#include "sysdep.h"
++#include "bfd.h"
++#include "libbfd.h"
++
++/* A PDP-11 address space is 64K.  */
++#define SAV_IMAGE_SIZE		65536
++#define SAV_HEADER_SIZE		  512
++
++/* The header block reserves addresses 0 through 0777 (octal); real
++   program content starts at 01000 (decimal 512).  */
++#define SAV_LOAD_ADDRESS	  512
++
++/* Default top of memory available to a user job under this project's
++   RT-11 configuration: the resident monitor (RT11SJ.SYS, currently
++   40448 bytes on disk, taken here as an upper bound on its resident
++   footprint) sits immediately below the fixed Unibus I/O page at
++   0160000, so 0160000 - 40448 = 041000 (16896 decimal) is the highest
++   address a *small* program can assume is safe without asking.  RT-11
++   itself copies this same value from word SAV_SP_WORD of the file we
++   write here into low memory at address 042 (octal) before
++   transferring control, so a program's startup code can pick it up via
++   `mov @$042,sp` instead of hardcoding it -- but only as a
++   *provisional* value: crt0 immediately asks the monitor for the real
++   answer via `.SETTOP` and replaces SP with that.  This constant is
++   necessarily specific to the RT11SJ.SYS build this project ships
++   (resident driver selection changes the monitor's footprint) --
++   revisit if that changes.
++
++   Provisional does not mean irrelevant, though: `.SETTOP` is itself an
++   EMT, and an EMT's trap entry pushes the return PC/PS onto whatever
++   SP already holds *before* crt0 gets to replace it -- so this value
++   must never be lower than the program's own top of used memory.  A
++   program larger than SAV_STACK_ADDRESS (e.g. once printf/rand pull in
++   enough of libc/libgcc) would otherwise get a provisional SP that
++   points *inside* its own already-loaded code, and that first EMT's
++   automatic push corrupts it before the program executes a single
++   instruction of its own.  sav_pdp11_write_object_contents() guards
++   against this by raising the written SP word to the program's real
++   top when that exceeds this default.  */
++#define SAV_STACK_ADDRESS	16896
++
++/* Byte offset of the block-usage bitmap within the header.  */
++#define SAV_BITMAP_OFFSET	 0360
++
++/* Word indices (not byte offsets) of the header's address/size fields.  */
++#define SAV_START_WORD		  020
++#define SAV_SP_WORD		  021
++#define SAV_HIGHLIMIT_WORD	  024
++
++/* Create a SAV object for writing: allocate the flat 64K memory image
++   that set_section_contents fills in and write_object_contents dumps to
++   the file.  */
++
++/* pdp11-aout has an odd quirk that matters here: a linked executable's
++   *entry point* is stored as an absolute address (matching the
++   toolchain-wide convention that programs load and run starting at
++   01000), but its *section* VMA/LMA are always reported relative to 0,
++   regardless of where the linker script actually placed them -- classic
++   a.out has no field to record a separate base load address, so the
++   format simply doesn't preserve it in section addresses.  That means
++   the address a section reports here can be either 0-based (reading an
++   already-linked a.out-pdp11 file, e.g. via objcopy) or already
++   01000-based (linking straight to sav-pdp11 with `ld --oformat`, where
++   the linker script's absolute addresses are still in effect).  Rather
++   than assume either convention, we find the *lowest* LMA among all
++   loaded sections on the first call and treat that as "the start of the
++   program", mapping it to image offset SAV_LOAD_ADDRESS -- this lines up
++   correctly either way.  */
++
++struct sav_pdp11_data
++{
++  bfd_byte *image;
++  bfd_vma base;
++  bool have_base;
++};
++
++static bool
++sav_pdp11_mkobject (bfd *abfd)
++{
++  struct sav_pdp11_data *tdata;
++
++  tdata = (struct sav_pdp11_data *) bfd_zalloc (abfd, sizeof (*tdata));
++  if (tdata == NULL)
++    return false;
++  tdata->image = (bfd_byte *) bfd_zalloc (abfd, SAV_IMAGE_SIZE);
++  if (tdata->image == NULL)
++    return false;
++  abfd->tdata.any = (void *) tdata;
++  return true;
++}
++
++#define sav_pdp11_close_and_cleanup	_bfd_generic_close_and_cleanup
++#define sav_pdp11_bfd_free_cached_info	_bfd_generic_bfd_free_cached_info
++#define sav_pdp11_new_section_hook	_bfd_generic_new_section_hook
++#define sav_pdp11_get_section_contents	_bfd_generic_get_section_contents
++
++/* Find the lowest LMA among all loaded sections; see the big comment
++   above struct sav_pdp11_data.  */
++
++static bfd_vma
++sav_pdp11_find_base (bfd *abfd)
++{
++  asection *s;
++  bfd_vma base = 0;
++  bool found = false;
++
++  for (s = abfd->sections; s != NULL; s = s->next)
++    {
++      if ((s->flags & (SEC_HAS_CONTENTS | SEC_LOAD | SEC_ALLOC
++			| SEC_NEVER_LOAD))
++	  != (SEC_HAS_CONTENTS | SEC_LOAD | SEC_ALLOC)
++	  || s->size == 0)
++	continue;
++
++      if (!found || s->lma < base)
++	{
++	  base = s->lma;
++	  found = true;
++	}
++    }
++
++  return base;
++}
++
++/* Copy section data straight into the flat memory image, mapping the
++   lowest section address found across the whole output to image offset
++   SAV_LOAD_ADDRESS (see sav_pdp11_find_base).  Sections beyond the 64K
++   PDP-11 address space cannot be represented and are reported as link
++   errors rather than silently truncated.  */
++
++static bool
++sav_pdp11_set_section_contents (bfd *abfd,
++				 asection *section,
++				 const void * location,
++				 file_ptr offset,
++				 bfd_size_type count)
++{
++  struct sav_pdp11_data *tdata = (struct sav_pdp11_data *) abfd->tdata.any;
++  bfd_vma addr;
++
++  if (count == 0)
++    return true;
++
++  if ((section->flags & (SEC_LOAD | SEC_ALLOC | SEC_NEVER_LOAD))
++      != (SEC_LOAD | SEC_ALLOC))
++    return true;
++
++  if (!tdata->have_base)
++    {
++      tdata->base = sav_pdp11_find_base (abfd);
++      tdata->have_base = true;
++    }
++
++  if (section->lma < tdata->base)
++    {
++      _bfd_error_handler
++	/* xgettext:c-format */
++	(_("%pB: section `%pA' starts below the lowest section address "
++	   "seen for this output"),
++	 abfd, section);
++      bfd_set_error (bfd_error_bad_value);
++      return false;
++    }
++
++  addr = SAV_LOAD_ADDRESS + (section->lma - tdata->base) + offset;
++  if (addr + count > SAV_IMAGE_SIZE)
++    {
++      _bfd_error_handler
++	/* xgettext:c-format */
++	(_("%pB: section `%pA' does not fit in the 64K PDP-11 address "
++	   "space"),
++	 abfd, section);
++      bfd_set_error (bfd_error_bad_value);
++      return false;
++    }
++
++  memcpy (tdata->image + addr, location, (size_t) count);
++  return true;
++}
++
++#define sav_pdp11_set_arch_mach  _bfd_generic_set_arch_mach
++
++/* Finalize and write out the file: locate the highest address used by
++   any loaded section, build the 512-byte header in place at the front
++   of the image (block-usage bitmap plus the three address/size words),
++   then write the whole image out in one go.  This runs once from
++   bfd_close(), after all section data has been deposited by
++   sav_pdp11_set_section_contents.  */
++
++static bool
++sav_pdp11_write_object_contents (bfd *abfd)
++{
++  struct sav_pdp11_data *tdata = (struct sav_pdp11_data *) abfd->tdata.any;
++  bfd_byte *image = tdata->image;
++  bfd_vma highest = SAV_LOAD_ADDRESS;
++  bfd_vma highest_alloc = SAV_LOAD_ADDRESS;
++  asection *s;
++  bfd_size_type image_size;
++  unsigned int blocks, full_bytes, rem_bits;
++  bfd_vma start, sp;
++
++  if (!tdata->have_base)
++    {
++      tdata->base = sav_pdp11_find_base (abfd);
++      tdata->have_base = true;
++    }
++
++  for (s = abfd->sections; s != NULL; s = s->next)
++    {
++      bfd_vma end;
++
++      if ((s->flags & (SEC_ALLOC | SEC_NEVER_LOAD)) != SEC_ALLOC
++	  || s->size == 0)
++	continue;
++
++      end = SAV_LOAD_ADDRESS + (s->lma - tdata->base) + s->size;
++
++      /* .bss and similar zero-initialized sections carry no file
++	 content, so they never move `highest` (the file image's own
++	 length) -- but they are still real, live memory that crt0's
++	 stack must not land on top of, so they always move
++	 `highest_alloc` below.  */
++      if ((s->flags & (SEC_HAS_CONTENTS | SEC_LOAD)) == (SEC_HAS_CONTENTS | SEC_LOAD)
++	  && end > highest)
++	highest = end;
++      if (end > highest_alloc)
++	highest_alloc = end;
++    }
++
++  /* The file itself is written at its exact byte length -- it is *not*
++     padded out to a block boundary (matching the reference lda2sav.c
++     tool this backend replaces).  Only the block-usage bitmap below
++     rounds up, since it has to describe whole blocks.  */
++  image_size = highest;
++  if (image_size > SAV_IMAGE_SIZE)
++    image_size = SAV_IMAGE_SIZE;
++
++  /* Block-usage bitmap: mark every 512-byte block from 0 up to and
++     including the last one actually used.  */
++  blocks = (unsigned int) ((image_size + SAV_HEADER_SIZE - 1)
++			    / SAV_HEADER_SIZE);
++  full_bytes = blocks / 8;
++  rem_bits = blocks % 8;
++  memset (image + SAV_BITMAP_OFFSET, 0xff, full_bytes);
++  if (rem_bits != 0)
++    image[SAV_BITMAP_OFFSET + full_bytes]
++      = (bfd_byte) (0xff ^ ((1 << (8 - rem_bits)) - 1));
++
++  start = bfd_get_start_address (abfd);
++  if (start == 0)
++    start = SAV_LOAD_ADDRESS;
++
++  /* SAV_STACK_ADDRESS is only a *default* -- it assumes a program small
++     enough to fit entirely below the resident monitor's footprint.  A
++     program whose own code/data (including .bss) extends past that
++     point needs a provisional SP at least as high as its own top,
++     otherwise crt0's very first EMT (`.SETTOP`, before `mov r0,sp`
++     replaces this value with the monitor's real answer) pushes PC/PS
++     onto a stack that starts inside the program's own already-loaded
++     text, silently corrupting it.  (Found via a real crash: a program
++     linked to ~20KB had this word set to the hardcoded 16896, and its
++     first EMT clobbered code just below that boundary.)  */
++  sp = SAV_STACK_ADDRESS;
++  if (highest_alloc > sp)
++    sp = highest_alloc;
++
++  bfd_putl16 (start, image + SAV_START_WORD * 2);
++  bfd_putl16 (sp, image + SAV_SP_WORD * 2);
++  bfd_putl16 ((bfd_vma) image_size, image + SAV_HIGHLIMIT_WORD * 2);
++
++  if (bfd_seek (abfd, (file_ptr) 0, SEEK_SET) != 0)
++    return false;
++
++  return bfd_write (image, image_size, abfd) == image_size;
++}
++
++#define sav_pdp11_sizeof_headers  _bfd_nolink_sizeof_headers
++
++#define sav_pdp11_bfd_get_relocated_section_contents \
++  bfd_generic_get_relocated_section_contents
++#define sav_pdp11_bfd_relax_section		bfd_generic_relax_section
++#define sav_pdp11_bfd_gc_sections		bfd_generic_gc_sections
++#define sav_pdp11_bfd_lookup_section_flags \
++  bfd_generic_lookup_section_flags
++#define sav_pdp11_bfd_merge_sections		bfd_generic_merge_sections
++#define sav_pdp11_bfd_is_group_section		bfd_generic_is_group_section
++#define sav_pdp11_bfd_group_name		bfd_generic_group_name
++#define sav_pdp11_bfd_discard_group		bfd_generic_discard_group
++#define sav_pdp11_section_already_linked \
++  _bfd_generic_section_already_linked
++#define sav_pdp11_bfd_define_common_symbol \
++  bfd_generic_define_common_symbol
++#define sav_pdp11_bfd_link_hide_symbol	_bfd_generic_link_hide_symbol
++#define sav_pdp11_bfd_define_start_stop	bfd_generic_define_start_stop
++#define sav_pdp11_bfd_link_hash_table_create \
++  _bfd_generic_link_hash_table_create
++#define sav_pdp11_bfd_link_just_syms		_bfd_generic_link_just_syms
++#define sav_pdp11_bfd_copy_link_hash_symbol_type \
++  _bfd_generic_copy_link_hash_symbol_type
++#define sav_pdp11_bfd_link_add_symbols	_bfd_generic_link_add_symbols
++#define sav_pdp11_bfd_final_link		_bfd_generic_final_link
++#define sav_pdp11_bfd_link_split_section \
++  _bfd_generic_link_split_section
++#define sav_pdp11_bfd_link_check_relocs	_bfd_generic_link_check_relocs
++
++const bfd_target sav_pdp11_vec =
++{
++  "sav-pdp11",			/* Name.  */
++  bfd_target_unknown_flavour,
++  BFD_ENDIAN_LITTLE,		/* Target byte order.  */
++  BFD_ENDIAN_LITTLE,		/* Target headers byte order.  */
++  EXEC_P,			/* Object flags.  */
++  (SEC_CODE | SEC_DATA | SEC_ROM | SEC_HAS_CONTENTS
++   | SEC_ALLOC | SEC_LOAD),	/* Section flags.  */
++  0,				/* Leading underscore.  */
++  ' ',				/* AR_pad_char.  */
++  16,				/* AR_max_namelen.  */
++  0,				/* Match priority.  */
++  TARGET_KEEP_UNUSED_SECTION_SYMBOLS, /* Keep unused section symbols.  */
++  bfd_getl64, bfd_getl_signed_64, bfd_putl64,
++  bfd_getl32, bfd_getl_signed_32, bfd_putl32,
++  bfd_getl16, bfd_getl_signed_16, bfd_putl16,	/* Data.  */
++  bfd_getl64, bfd_getl_signed_64, bfd_putl64,
++  bfd_getl32, bfd_getl_signed_32, bfd_putl32,
++  bfd_getl16, bfd_getl_signed_16, bfd_putl16,	/* Hdrs.  */
++
++  {				/* bfd_check_format.  */
++    _bfd_dummy_target,
++    _bfd_dummy_target,		/* No read support.  */
++    _bfd_dummy_target,
++    _bfd_dummy_target,
++  },
++  {				/* bfd_set_format.  */
++    _bfd_bool_bfd_false_error,
++    sav_pdp11_mkobject,
++    _bfd_bool_bfd_false_error,
++    _bfd_bool_bfd_false_error,
++  },
++  {				/* bfd_write_contents.  */
++    _bfd_bool_bfd_false_error,
++    sav_pdp11_write_object_contents,
++    _bfd_bool_bfd_false_error,
++    _bfd_bool_bfd_false_error,
++  },
++
++  BFD_JUMP_TABLE_GENERIC (sav_pdp11),
++  BFD_JUMP_TABLE_COPY (_bfd_generic),
++  BFD_JUMP_TABLE_CORE (_bfd_nocore),
++  BFD_JUMP_TABLE_ARCHIVE (_bfd_noarchive),
++  BFD_JUMP_TABLE_SYMBOLS (_bfd_nosymbols),
++  BFD_JUMP_TABLE_RELOCS (_bfd_norelocs),
++  BFD_JUMP_TABLE_WRITE (sav_pdp11),
++  BFD_JUMP_TABLE_LINK (sav_pdp11),
++  BFD_JUMP_TABLE_DYNAMIC (_bfd_nodynamic),
++
++  NULL,
++
++  NULL
++};
+diff --git a/bfd/targets.c b/bfd/targets.c
+index 2333370..79c97e8 100644
+--- a/bfd/targets.c
++++ b/bfd/targets.c
+@@ -953,6 +953,9 @@ extern const bfd_target verilog_vec;
+ extern const bfd_target tekhex_vec;
+ extern const bfd_target binary_vec;
+ extern const bfd_target ihex_vec;
++#ifdef BFD_SUPPORTS_SAV_PDP11
++extern const bfd_target sav_pdp11_vec;
++#endif
+ 
+ /* All of the xvecs for core files.  */
+ extern const bfd_target core_cisco_be_vec;
+@@ -1383,6 +1386,10 @@ static const bfd_target * const _bfd_target_vector[] =
+ 	&binary_vec,
+ /* Likewise for ihex.  */
+ 	&ihex_vec,
++#ifdef BFD_SUPPORTS_SAV_PDP11
++/* Likewise for RT-11 SAV executables.  */
++	&sav_pdp11_vec,
++#endif
+ 
+ #if BFD_SUPPORTS_PLUGINS
+ 	&plugin_vec,
+diff --git a/config.sub b/config.sub
+index 4aaae46..9be4582 100755
+--- a/config.sub
++++ b/config.sub
+@@ -661,6 +661,10 @@ case $1 in
+ 				basic_machine=a29k-amd
+ 				basic_os=udi
+ 				;;
++			uknc)
++				basic_machine=pdp11-uknc
++				basic_os=aout
++				;;
+ 			ultra3)
+ 				basic_machine=a29k-nyu
+ 				basic_os=sym1
+@@ -2097,6 +2101,7 @@ case $os in
+ 	| rhapsody* \
+ 	| riscix* \
+ 	| riscos* \
++	| rt11* \
+ 	| rtems* \
+ 	| rtmk* \
+ 	| rtu* \
+diff --git a/gas/configure.tgt b/gas/configure.tgt
+index 7c81bff..8233419 100644
+--- a/gas/configure.tgt
++++ b/gas/configure.tgt
+@@ -436,6 +436,7 @@ case ${generic_target} in
+   z8k-*-coff | z8k-*-sim)		fmt=coff ;;
+ 
+   *-*-aout | *-*-scout)			fmt=aout ;;
++  *-*-rt11*)				fmt=aout ;;
+   *-*-cloudabi*)			fmt=elf em=cloudabi ;;
+   *-*-dragonfly*)			fmt=elf em=dragonfly ;;
+   *-*-freebsd* | *-*-kfreebsd*-gnu)	fmt=elf em=freebsd ;;
+diff --git a/ld/Makefile.am b/ld/Makefile.am
+index ccff928..a2b9636 100644
+--- a/ld/Makefile.am
++++ b/ld/Makefile.am
+@@ -336,6 +336,8 @@ ALL_EMULATION_SOURCES = \
+ 	ens32knbsd.c \
+ 	epc532macha.c \
+ 	epdp11.c \
++	epdp11rt11.c \
++	epdp11rt11sav.c \
+ 	epjelf.c \
+ 	epjlelf.c \
+ 	eppcmacos.c \
+diff --git a/ld/Makefile.in b/ld/Makefile.in
+index 3e24bd4..065d030 100644
+--- a/ld/Makefile.in
++++ b/ld/Makefile.in
+@@ -847,6 +847,8 @@ ALL_EMULATION_SOURCES = \
+ 	ens32knbsd.c \
+ 	epc532macha.c \
+ 	epdp11.c \
++	epdp11rt11.c \
++	epdp11rt11sav.c \
+ 	epjelf.c \
+ 	epjlelf.c \
+ 	eppcmacos.c \
+@@ -1544,6 +1546,8 @@ distclean-compile:
+ @AMDEP_TRUE@@am__include@ @am__quote@./$(DEPDIR)/ens32knbsd.Po@am__quote@
+ @AMDEP_TRUE@@am__include@ @am__quote@./$(DEPDIR)/epc532macha.Po@am__quote@
+ @AMDEP_TRUE@@am__include@ @am__quote@./$(DEPDIR)/epdp11.Po@am__quote@
++@AMDEP_TRUE@@am__include@ @am__quote@./$(DEPDIR)/epdp11rt11.Po@am__quote@
++@AMDEP_TRUE@@am__include@ @am__quote@./$(DEPDIR)/epdp11rt11sav.Po@am__quote@
+ @AMDEP_TRUE@@am__include@ @am__quote@./$(DEPDIR)/epjelf.Po@am__quote@
+ @AMDEP_TRUE@@am__include@ @am__quote@./$(DEPDIR)/epjlelf.Po@am__quote@
+ @AMDEP_TRUE@@am__include@ @am__quote@./$(DEPDIR)/eppcmacos.Po@am__quote@
+diff --git a/ld/configure.tgt b/ld/configure.tgt
+index ea01ccf..089fb56 100644
+--- a/ld/configure.tgt
++++ b/ld/configure.tgt
+@@ -681,6 +681,10 @@ or1k-*-elf | or1knd-*-elf | or1k-*-rtems* | or1knd-*-rtems*)
+ 			;;
+ or1k-*-linux* | or1knd-*-linux*)	targ_emul=elf32or1k_linux
+ 			;;
++pdp11-*-rt11*)		targ_emul=pdp11rt11sav
++			targ_extra_emuls="pdp11rt11 pdp11"
++			targ_extra_ofiles=
++			;;
+ pdp11-*-*)		targ_emul=pdp11
+ 			targ_extra_ofiles=
+ 			;;
+diff --git a/ld/emulparams/pdp11rt11.sh b/ld/emulparams/pdp11rt11.sh
+new file mode 100644
+index 0000000..dd35a5a
+--- /dev/null
++++ b/ld/emulparams/pdp11rt11.sh
+@@ -0,0 +1,6 @@
++SCRIPT_NAME=pdp11rt11
++OUTPUT_FORMAT="a.out-pdp11"
++TEXT_START_ADDR=512
++EXTRA_EM_FILE=pdp11
++ARCH=pdp11
++ENTRY=start
+diff --git a/ld/emulparams/pdp11rt11sav.sh b/ld/emulparams/pdp11rt11sav.sh
+new file mode 100644
+index 0000000..9d3a399
+--- /dev/null
++++ b/ld/emulparams/pdp11rt11sav.sh
+@@ -0,0 +1,21 @@
++# Default emulation for pdp11-*-rt11* targets: produce an RT-11 SAV
++# executable from a single `ld` invocation.
++#
++# OUTPUT_FORMAT is deliberately "a.out-pdp11", the same as plain
++# pdp11rt11, not "sav-pdp11": linking goes through a.out-pdp11's own
++# specialized, proven-correct relocation-resolution path
++# (pdp11_aout_link_input_section in bfd/pdp11.c), producing exactly the
++# file `ld -m pdp11rt11` would.  Once that file is fully written to disk,
++# emultempl/pdp11rt11sav.em's after_close_output hook converts it to the
++# RT-11 SAV format in place -- a relocation-free repack (the file's
++# section contents are already final, absolute bytes at that point), the
++# same conversion `objcopy -O sav-pdp11` already does correctly.  See the
++# comment on gld${EMULATION_NAME}_after_close_output in that file for the
++# full story, including why sav-pdp11 was not used as OUTPUT_FORMAT
++# directly here.
++SCRIPT_NAME=pdp11rt11
++OUTPUT_FORMAT="a.out-pdp11"
++TEXT_START_ADDR=512
++EXTRA_EM_FILE=pdp11rt11sav
++ARCH=pdp11
++ENTRY=start
+diff --git a/ld/emultempl/emulation.em b/ld/emultempl/emulation.em
+index 8ff71d6..4867a88 100644
+--- a/ld/emultempl/emulation.em
++++ b/ld/emultempl/emulation.em
+@@ -37,6 +37,7 @@ struct ld_emulation_xfer_struct ld_${EMULATION_NAME}_emulation =
+   ${LDEMUL_ACQUIRE_STRINGS_FOR_CTF-NULL},
+   ${LDEMUL_NEW_DYNSYM_FOR_CTF-NULL},
+   ${LDEMUL_PRINT_SYMBOL-NULL},
+-  ${LDEMUL_FIND_START_SYMBOL-NULL}
++  ${LDEMUL_FIND_START_SYMBOL-NULL},
++  ${LDEMUL_AFTER_CLOSE_OUTPUT-NULL}
+ };
+ EOF
+diff --git a/ld/emultempl/pdp11rt11sav.em b/ld/emultempl/pdp11rt11sav.em
+new file mode 100644
+index 0000000..1fce8d7
+--- /dev/null
++++ b/ld/emultempl/pdp11rt11sav.em
+@@ -0,0 +1,272 @@
++# This shell script emits a C file. -*- C -*-
++#   Copyright (C) 2006-2026 Free Software Foundation, Inc.
++#
++# This file is part of the GNU Binutils.
++#
++# This program is free software; you can redistribute it and/or modify
++# it under the terms of the GNU General Public License as published by
++# the Free Software Foundation; either version 3 of the License, or
++# (at your option) any later version.
++#
++# This program is distributed in the hope that it will be useful,
++# but WITHOUT ANY WARRANTY; without even the implied warranty of
++# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++# GNU General Public License for more details.
++#
++# You should have received a copy of the GNU General Public License
++# along with this program; if not, write to the Free Software
++# Foundation, Inc., 51 Franklin Street - Fifth Floor, Boston,
++# MA 02110-1301, USA.
++#
++# This is pdp11.em (same PDP11-Unix-compatible --omagic/--imagic option
++# handling as the plain pdp11/pdp11rt11 emulations) plus one extra hook:
++# after_close_output.  See the big comment on that function below for why
++# it exists.
++
++fragment <<EOF
++
++/* --- \begin{pdp11rt11sav.em} */
++#include "libiberty.h"
++#include "getopt.h"
++#include <errno.h>
++
++static void
++gld${EMULATION_NAME}_before_parse (void)
++{
++  ldfile_set_output_arch ("`echo ${ARCH}`", bfd_arch_unknown);
++  /* for PDP11 Unix compatibility, default to --omagic */
++  config.magic_demand_paged = false;
++  config.text_read_only = false;
++}
++
++/* PDP11 specific options.  */
++#define OPTION_IMAGIC 301
++
++static void
++gld${EMULATION_NAME}_add_options
++  (int ns ATTRIBUTE_UNUSED,
++   char **shortopts,
++   int nl,
++   struct option **longopts,
++   int nrl ATTRIBUTE_UNUSED,
++   struct option **really_longopts ATTRIBUTE_UNUSED)
++{
++  static const char xtra_short[] = "z";
++  static const struct option xtra_long[] =
++  {
++    {"imagic", no_argument, NULL, OPTION_IMAGIC},
++    {NULL, no_argument, NULL, 0}
++  };
++
++  *shortopts = (char *) xrealloc (*shortopts, ns + sizeof (xtra_short));
++  memcpy (*shortopts + ns, &xtra_short, sizeof (xtra_short));
++  *longopts
++    = xrealloc (*longopts, nl * sizeof (struct option) + sizeof (xtra_long));
++  memcpy (*longopts + nl, &xtra_long, sizeof (xtra_long));
++}
++
++static void
++gld${EMULATION_NAME}_list_options (FILE *file)
++{
++  fprintf (file, _("  -N, --omagic   Do not make text readonly, do not page align data (default)\n"));
++  fprintf (file, _("  -n, --nmagic   Make text readonly, align data to next page\n"));
++  fprintf (file, _("  -z, --imagic   Make text readonly, separate instruction and data spaces\n"));
++  fprintf (file, _("  --no-omagic    Equivalent to --nmagic\n"));
++}
++
++static bool
++gld${EMULATION_NAME}_handle_option (int optc)
++{
++  switch (optc)
++    {
++    default:
++      return false;
++
++    case 'z':
++    case OPTION_IMAGIC:
++      link_info.separate_code = 1;
++      /* The --imagic format causes the .text and .data sections to occupy the
++	 same memory addresses in separate spaces, so don't check overlap. */
++      command_line.check_section_addresses = 0;
++      break;
++    }
++
++  return true;
++}
++
++/* We need a special case to prepare an additional linker script for option
++ * --imagic where the .data section starts at address 0 rather than directly
++ * following the .text section or being aligned to the next page after the
++ * .text section. */
++static char *
++gld${EMULATION_NAME}_get_script (int *isfile)
++EOF
++
++if test x"$COMPILE_IN" = xyes
++then
++# Scripts compiled in.
++
++# sed commands to quote an ld script as a C string.
++sc="-f ${srcdir}/emultempl/stringify.sed"
++
++fragment <<EOF
++{
++  *isfile = 0;
++
++  if (bfd_link_relocatable (&link_info) && config.build_constructors)
++    return
++EOF
++sed $sc ldscripts/${EMULATION_NAME}.xu			>> e${EMULATION_NAME}.c
++echo '  ; else if (bfd_link_relocatable (&link_info)) return' >> e${EMULATION_NAME}.c
++sed $sc ldscripts/${EMULATION_NAME}.xr			>> e${EMULATION_NAME}.c
++echo '  ; else if (link_info.separate_code) return'	>> e${EMULATION_NAME}.c
++sed $sc ldscripts/${EMULATION_NAME}.xe			>> e${EMULATION_NAME}.c
++echo '  ; else if (!config.text_read_only) return'	>> e${EMULATION_NAME}.c
++sed $sc ldscripts/${EMULATION_NAME}.xbn			>> e${EMULATION_NAME}.c
++echo '  ; else if (!config.magic_demand_paged) return'	>> e${EMULATION_NAME}.c
++sed $sc ldscripts/${EMULATION_NAME}.xn			>> e${EMULATION_NAME}.c
++echo '  ; else return'					>> e${EMULATION_NAME}.c
++sed $sc ldscripts/${EMULATION_NAME}.x			>> e${EMULATION_NAME}.c
++echo '; }'						>> e${EMULATION_NAME}.c
++
++else
++# Scripts read from the filesystem.
++
++fragment <<EOF
++{
++  *isfile = 1;
++
++  if (bfd_link_relocatable (&link_info) && config.build_constructors)
++    return "ldscripts/${EMULATION_NAME}.xu";
++  else if (bfd_link_relocatable (&link_info))
++    return "ldscripts/${EMULATION_NAME}.xr";
++  else if (link_info.separate_code)
++    return "ldscripts/${EMULATION_NAME}.xe";
++  else if (!config.text_read_only)
++    return "ldscripts/${EMULATION_NAME}.xbn";
++  else if (!config.magic_demand_paged)
++    return "ldscripts/${EMULATION_NAME}.xn";
++  else
++    return "ldscripts/${EMULATION_NAME}.x";
++}
++EOF
++fi
++
++fragment <<EOF
++
++/* This emulation's OUTPUT_FORMAT is "a.out-pdp11", same as plain
++   pdp11rt11 -- deliberately.  a.out-pdp11 has its own specialized,
++   proven-correct relocation-resolution path (pdp11_aout_link_input_section
++   in bfd/pdp11.c); the generic BFD final-link path that a genuinely
++   write-only format like sav-pdp11 would otherwise have to fall back to
++   does not correctly reproduce it (confirmed on something as simple as a
++   string-constant address reference).  So rather than link straight to
++   sav-pdp11 and risk wrong relocated values, this emulation links a real,
++   correct a.out-pdp11 file first -- exactly the same file
++   \`ld -m pdp11rt11\` would produce -- and then, once that file is
++   completely written to disk, converts it to the RT-11 SAV format in
++   place.  That second step is relocation-free: everything in an a.out
++   EXEC_P file's section contents is already final, absolute bytes, so
++   converting it to sav-pdp11 is just a repack, the same one
++   \`objcopy -O sav-pdp11\` already does correctly.  This hook runs from
++   ldmain.c's ldemul_after_close_output(), right after ldwrite()'s
++   bfd_close() finishes writing that a.out file to the user's requested
++   output path.  */
++
++static void
++gld${EMULATION_NAME}_after_close_output (void)
++{
++  bfd *ibfd, *obfd;
++  asection *is;
++  char *tmp_filename;
++
++  tmp_filename = concat (output_filename, ".sav-tmp", (const char *) NULL);
++
++  ibfd = bfd_openr (output_filename, "a.out-pdp11");
++  if (ibfd == NULL)
++    fatal (_("%P: %s: cannot reopen linked a.out-pdp11 output "
++	     "for RT-11 SAV conversion: %E\n"), output_filename);
++  if (!bfd_check_format (ibfd, bfd_object))
++    fatal (_("%P: %s: not recognized as a.out-pdp11 after linking: "
++	     "%E\n"), output_filename);
++
++  obfd = bfd_openw (tmp_filename, "sav-pdp11");
++  if (obfd == NULL)
++    fatal (_("%P: %s: cannot create RT-11 SAV output: %E\n"), tmp_filename);
++
++  bfd_set_format (obfd, bfd_object);
++  bfd_set_arch_mach (obfd, bfd_get_arch (ibfd), bfd_get_mach (ibfd));
++  bfd_set_start_address (obfd, bfd_get_start_address (ibfd));
++
++  /* Two passes: bfd_set_section_contents() below marks the output bfd's
++     output_has_begun once the first byte is written, and every
++     bfd_make_section_*() call refuses to run after that point.  So every
++     output section has to exist before any contents get written at
++     all.  */
++  for (is = ibfd->sections; is != NULL; is = is->next)
++    {
++      asection *os;
++
++      if ((is->flags & SEC_ALLOC) == 0)
++	continue;
++
++      os = bfd_make_section_anyway_with_flags (obfd,
++						bfd_section_name (is),
++						is->flags);
++      if (os == NULL)
++	fatal (_("%P: %s: cannot create section \`%pA' in RT-11 SAV "
++		 "output: %E\n"), tmp_filename, is);
++
++      if (!bfd_set_section_size (os, is->size))
++	fatal (_("%P: %s: cannot size section \`%pA' in RT-11 SAV "
++		 "output: %E\n"), tmp_filename, is);
++      os->vma = is->vma;
++      os->lma = is->lma;
++    }
++
++  for (is = ibfd->sections; is != NULL; is = is->next)
++    {
++      asection *os;
++
++      if ((is->flags & SEC_HAS_CONTENTS) == 0 || is->size == 0)
++	continue;
++
++      os = bfd_get_section_by_name (obfd, bfd_section_name (is));
++      if (os != NULL)
++	{
++	  void *contents = xmalloc (is->size);
++
++	  if (!bfd_get_section_contents (ibfd, is, contents, 0, is->size))
++	    fatal (_("%P: %s: cannot read section \`%pA': %E\n"),
++		   output_filename, is);
++	  if (!bfd_set_section_contents (obfd, os, contents, 0, is->size))
++	    fatal (_("%P: %s: cannot write section \`%pA' to RT-11 "
++		     "SAV output: %E\n"), tmp_filename, is);
++	  free (contents);
++	}
++    }
++
++  if (!bfd_close (obfd))
++    fatal (_("%P: %s: final close of RT-11 SAV output failed: %E\n"),
++	   tmp_filename);
++
++  if (!bfd_close (ibfd))
++    fatal (_("%P: %s: final close failed: %E\n"), output_filename);
++
++  if (rename (tmp_filename, output_filename) != 0)
++    fatal (_("%P: cannot rename %s to %s: %s\n"),
++	   tmp_filename, output_filename, strerror (errno));
++
++  free (tmp_filename);
++}
++
++/* --- \end{pdp11rt11sav.em} */
++
++EOF
++
++LDEMUL_BEFORE_PARSE=gld"$EMULATION_NAME"_before_parse
++LDEMUL_ADD_OPTIONS=gld"$EMULATION_NAME"_add_options
++LDEMUL_HANDLE_OPTION=gld"$EMULATION_NAME"_handle_option
++LDEMUL_LIST_OPTIONS=gld"$EMULATION_NAME"_list_options
++LDEMUL_GET_SCRIPT=gld"$EMULATION_NAME"_get_script
++LDEMUL_AFTER_CLOSE_OUTPUT=gld"$EMULATION_NAME"_after_close_output
+diff --git a/ld/ldemul.c b/ld/ldemul.c
+index 35f91a2..983bfbb 100644
+--- a/ld/ldemul.c
++++ b/ld/ldemul.c
+@@ -457,3 +457,10 @@ ldemul_print_symbol (struct bfd_link_hash_entry *hash_entry, void *ptr)
+     return ld_emulation->print_symbol (hash_entry, ptr);
+   return print_one_symbol (hash_entry, ptr);
+ }
++
++void
++ldemul_after_close_output (void)
++{
++  if (ld_emulation->after_close_output)
++    ld_emulation->after_close_output ();
++}
+diff --git a/ld/ldemul.h b/ld/ldemul.h
+index c58d4c2..2911baf 100644
+--- a/ld/ldemul.h
++++ b/ld/ldemul.h
+@@ -119,6 +119,8 @@ extern bool ldemul_print_symbol
+   (struct bfd_link_hash_entry *hash_entry, void *ptr);
+ extern struct bfd_link_hash_entry * ldemul_find_alt_start_symbol
+   (struct bfd_sym_chain *);
++extern void ldemul_after_close_output
++  (void);
+ 
+ typedef struct ld_emulation_xfer_struct {
+   /* Run before parsing the command line and script file.
+@@ -265,6 +267,14 @@ typedef struct ld_emulation_xfer_struct {
+   struct bfd_link_hash_entry * (*find_alt_start_symbol)
+     (struct bfd_sym_chain *entry);
+ 
++  /* Run after the output file has been finally closed and fully
++     written to disk (i.e. after ldwrite()'s bfd_close() succeeds).
++     For targets whose on-disk format differs from what was used
++     during linking (see pdp11rt11sav, which links as a.out-pdp11
++     but wants a differently-shaped RT-11 SAV file on disk), this is
++     where the finished file gets translated in place.  May be NULL.  */
++  void (*after_close_output) (void);
++
+ } ld_emulation_xfer_type;
+ 
+ typedef enum {
+diff --git a/ld/ldmain.c b/ld/ldmain.c
+index 67c60c3..ef30845 100644
+--- a/ld/ldmain.c
++++ b/ld/ldmain.c
+@@ -956,6 +956,8 @@ main (int argc, char **argv)
+ 
+       link_info.output_bfd = NULL;
+ 
++      ldemul_after_close_output ();
++
+       /* If the --force-exe-suffix is enabled, and we're making an
+ 	 executable file and it doesn't end in .exe, copy it to one
+ 	 which does.  */
+diff --git a/ld/po/BLD-POTFILES.in b/ld/po/BLD-POTFILES.in
+index 10cef15..1bea9b0 100644
+--- a/ld/po/BLD-POTFILES.in
++++ b/ld/po/BLD-POTFILES.in
+@@ -273,6 +273,8 @@ ends32elf_linux.c
+ ens32knbsd.c
+ epc532macha.c
+ epdp11.c
++epdp11rt11.c
++epdp11rt11sav.c
+ epjelf.c
+ epjlelf.c
+ eppcmacos.c
+diff --git a/ld/scripttempl/pdp11rt11.sc b/ld/scripttempl/pdp11rt11.sc
+new file mode 100644
+index 0000000..ce42608
+--- /dev/null
++++ b/ld/scripttempl/pdp11rt11.sc
+@@ -0,0 +1,60 @@
++# Copyright (C) 2026 Free Software Foundation, Inc.
++#
++# Copying and distribution of this file, with or without modification,
++# are permitted in any medium without royalty provided the copyright
++# notice and this notice are preserved.
++#
++# Default linker script for the pdp11rt11 emulation: a single flat
++# image starting at ${TEXT_START_ADDR} (01000 octal by default), with
++# .text/.rodata/.data merged into one output section rather than
++# separate page-aligned segments -- this leaves the whole 64K PDP-11
++# address space usable and matches the memory layout RT-11 SAV
++# executables need (address 0 through 0777 octal is reserved for the
++# SAV file header; real code and data start right after it).  This is
++# the built-in equivalent of the pdp11-aout.ld script used by the UKNC
++# toolchain, so a plain `ld -o out foo.o` no longer needs `-T`.
++
++test -z "${BIG_OUTPUT_FORMAT}" && BIG_OUTPUT_FORMAT=${OUTPUT_FORMAT}
++test -z "${LITTLE_OUTPUT_FORMAT}" && LITTLE_OUTPUT_FORMAT=${OUTPUT_FORMAT}
++
++cat <<EOF
++/* Copyright (C) 2026 Free Software Foundation, Inc.
++
++   Copying and distribution of this script, with or without modification,
++   are permitted in any medium without royalty provided the copyright
++   notice and this notice are preserved.  */
++
++OUTPUT_FORMAT("${OUTPUT_FORMAT}", "${BIG_OUTPUT_FORMAT}",
++	      "${LITTLE_OUTPUT_FORMAT}")
++OUTPUT_ARCH(${ARCH})
++${RELOCATING+ENTRY(${ENTRY})}
++
++${RELOCATING+${LIB_SEARCH_DIRS}}
++${RELOCATING+${EXECUTABLE_SYMBOLS}}
++SECTIONS
++{
++  ${RELOCATING+. = ${TEXT_START_ADDR};}
++  .text :
++  {
++    ${RELOCATING+PROVIDE (code = .);}
++    *(.text)
++    *(.rodata)
++    *(.rodata.*)
++    *(.data)
++    ${CONSTRUCTING+CONSTRUCTORS}
++    ${RELOCATING+. = ALIGN(8);}
++    ${RELOCATING+_etext = .;}
++    ${RELOCATING+__etext = .;}
++  }
++  .bss :
++  {
++    ${RELOCATING+__bss_start = .;}
++    *(.bss)
++    *(COMMON)
++    ${RELOCATING+. = ALIGN(2);}
++    ${RELOCATING+_end = .;}
++    ${RELOCATING+__end = .;}
++  }
++  ${RELOCATING+PROVIDE (end = .);}
++}
++EOF
+-- 
+2.54.0 (Apple Git-157)
+

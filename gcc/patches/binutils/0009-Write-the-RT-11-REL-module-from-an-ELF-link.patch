@@ -1,0 +1,498 @@
+From 309a34cbb12e0dd70eccd957c7153b8e9c55cd1c Mon Sep 17 00:00:00 2001
+From: Yury Klushin <digger@live.ru>
+Date: Mon, 14 Sep 2026 16:35:59 +0300
+Subject: [PATCH] Write the RT-11 REL module from an ELF link
+
+The last emulation still reading a.out.  Most of the writer did not
+care what the object format was -- it works through
+bfd_canonicalize_symtab/reloc and bfd_get_section_contents -- but two
+things did.
+
+The relocated words were empty.  a.out keeps a relocation's addend in
+the word itself, so the writer could read the value straight out of the
+section content; ELF keeps it in a field of its own and leaves the word
+alone.  Nobody else was going to fill those in: of the RLD entry types
+this writer emits, a loader patches only the direct ones and treats a
+displaced (PC-relative) entry as already correct, which it can, since a
+displacement inside one module does not depend on where the module
+lands.  So rel_apply_relocs now writes every word itself, as the module
+would look loaded at 0 with the p-sects laid end to end -- which is
+exactly how it is loaded, see layout() in this project's libppu.  That
+also makes explicit what a.out only ever arrived at by accident, and
+the p-sect bases the writer needs are now stated rather than taken from
+whatever addresses the linker happened to give the sections.
+
+References to globals defined in the same module had to be resolved
+here.  a.out's `-r` link reduced them to section-relative relocations by
+itself; ELF keeps them against the symbol, and the loader on the other
+end cannot resolve anything by name -- libppu's ppuc_rel.c rejects the
+Global entry types outright.  rel_classify_symbol therefore asks which
+p-sect a symbol's *section* is, rather than whether it is a section
+symbol, and a reference to a defined global comes out as the p-sect
+entry the loader can use.
+
+With that, the emulation moves to TEMPLATE_NAME=elf like the other two,
+which lets it drop its copy of pdp11.em's option handling and script
+selection.
+
+Checked against the module the a.out toolchain builds from the same
+source, examples/gfour's PPU side, compared block by block: every TXT
+block identical -- the code and data of the module are the same bytes --
+and the GSD entries identical as a set.  Two differences, both expected:
+the order the global symbols come out of the symbol table, which is the
+object format's business, and one extra displaced RLD entry for the
+same-module global reference a.out had folded away, which the loader
+skips.
+
+Then run: the ELF-built .ppu loaded into the PPU by the a.out-built
+gfour.sav draws gfour's screen correctly on the emulated machine.
+---
+ ld/emulparams/pdp11rt11rel.sh |  21 +--
+ ld/emultempl/pdp11rt11rel.em  | 302 ++++++++++++++--------------------
+ 2 files changed, 137 insertions(+), 186 deletions(-)
+
+diff --git a/ld/emulparams/pdp11rt11rel.sh b/ld/emulparams/pdp11rt11rel.sh
+index 823bdbc0ffd..4948c26fbed 100644
+--- a/ld/emulparams/pdp11rt11rel.sh
++++ b/ld/emulparams/pdp11rt11rel.sh
+@@ -2,22 +2,23 @@
+ # `-m pdp11rt11rel`: produce a relocatable RT-11 object module (the
+ # native DEC "Relocatable Object Language" format documented in the
+ # RT-11 Volume and File Formats Manual -- GSD/TXT/RLD/ENDMOD blocks,
+-# RADIX-50 names) instead of an a.out-pdp11 object.
++# RADIX-50 names) instead of an ordinary object.
+ #
+-# Like pdp11rt11sav, OUTPUT_FORMAT is deliberately "a.out-pdp11", not a
+-# format of its own: linking goes through a.out-pdp11's own specialized,
+-# proven-correct relocatable-link path (pdp11_aout_link_input_section in
+-# bfd/pdp11.c, in its `if (relocatable)` branch -- this emulation is
+-# meant to be used with `-r`), producing exactly the file
+-# `ld -r -m pdp11rt11` would.  Once that file is fully written to disk,
++# Like pdp11rt11sav, OUTPUT_FORMAT is deliberately the ordinary object
++# format and not one of its own: linking goes through that backend's own
++# relocatable-link path (this emulation is meant to be used with `-r`),
++# producing exactly the file `ld -r -m pdp11rt11` would.  Once that file
++# is fully written to disk,
+ # emultempl/pdp11rt11rel.em's after_close_output hook reads its symbols,
+-# relocations and section contents back with ordinary a.out-pdp11 BFD
+-# calls and repacks them into the RT-11 object format in place.  See the
++# relocations and section contents back with ordinary BFD calls and
++# repacks them into the RT-11 object format in place.  See the
+ # comment on gld${EMULATION_NAME}_after_close_output in that file for
+ # the full story.
+ SCRIPT_NAME=pdp11rt11
+-OUTPUT_FORMAT="a.out-pdp11"
++TEMPLATE_NAME=elf
++OUTPUT_FORMAT="elf32-pdp11"
+ TEXT_START_ADDR=512
+ EXTRA_EM_FILE=pdp11rt11rel
+ ARCH=pdp11
+ ENTRY=start
++EMBEDDED=yes
+diff --git a/ld/emultempl/pdp11rt11rel.em b/ld/emultempl/pdp11rt11rel.em
+index a17233ddc11..016c0ed1012 100644
+--- a/ld/emultempl/pdp11rt11rel.em
++++ b/ld/emultempl/pdp11rt11rel.em
+@@ -18,136 +18,18 @@
+ # Foundation, Inc., 51 Franklin Street - Fifth Floor, Boston,
+ # MA 02110-1301, USA.
+ #
+-# This is pdp11.em (same PDP11-Unix-compatible --omagic/--imagic option
+-# handling as the plain pdp11/pdp11rt11 emulations) plus one extra hook:
+-# after_close_output, which converts a `-r` link's a.out-pdp11 output
+-# into the native RT-11 relocatable object format ("REL": GSD/TXT/RLD/
+-# ENDMOD blocks -- see the big comment on that function below).
++# An EXTRA_EM_FILE on top of emultempl/elf.em: everything an ELF
++# emulation does, plus one hook, after_close_output, and the REL
++# writer it calls.  (It used to carry a copy of emultempl/pdp11.em's
++# option handling and script selection as well, because the emulation
++# was built on the generic template rather than the ELF one; elf.em
++# does all of that.)
+ 
+ fragment <<EOF
+ 
+-/* --- \begin{pdp11rt11rel.em} */
+ #include "libiberty.h"
+-#include "getopt.h"
+ #include <errno.h>
+ 
+-static void
+-gld${EMULATION_NAME}_before_parse (void)
+-{
+-  ldfile_set_output_arch ("`echo ${ARCH}`", bfd_arch_unknown);
+-  /* for PDP11 Unix compatibility, default to --omagic */
+-  config.magic_demand_paged = false;
+-  config.text_read_only = false;
+-}
+-
+-/* PDP11 specific options.  */
+-#define OPTION_IMAGIC 301
+-
+-static void
+-gld${EMULATION_NAME}_add_options
+-  (int ns ATTRIBUTE_UNUSED,
+-   char **shortopts,
+-   int nl,
+-   struct option **longopts,
+-   int nrl ATTRIBUTE_UNUSED,
+-   struct option **really_longopts ATTRIBUTE_UNUSED)
+-{
+-  static const char xtra_short[] = "z";
+-  static const struct option xtra_long[] =
+-  {
+-    {"imagic", no_argument, NULL, OPTION_IMAGIC},
+-    {NULL, no_argument, NULL, 0}
+-  };
+-
+-  *shortopts = (char *) xrealloc (*shortopts, ns + sizeof (xtra_short));
+-  memcpy (*shortopts + ns, &xtra_short, sizeof (xtra_short));
+-  *longopts
+-    = xrealloc (*longopts, nl * sizeof (struct option) + sizeof (xtra_long));
+-  memcpy (*longopts + nl, &xtra_long, sizeof (xtra_long));
+-}
+-
+-static void
+-gld${EMULATION_NAME}_list_options (FILE *file)
+-{
+-  fprintf (file, _("  -N, --omagic   Do not make text readonly, do not page align data (default)\n"));
+-  fprintf (file, _("  -n, --nmagic   Make text readonly, align data to next page\n"));
+-  fprintf (file, _("  -z, --imagic   Make text readonly, separate instruction and data spaces\n"));
+-  fprintf (file, _("  --no-omagic    Equivalent to --nmagic\n"));
+-}
+-
+-static bool
+-gld${EMULATION_NAME}_handle_option (int optc)
+-{
+-  switch (optc)
+-    {
+-    default:
+-      return false;
+-
+-    case 'z':
+-    case OPTION_IMAGIC:
+-      link_info.separate_code = 1;
+-      command_line.check_section_addresses = 0;
+-      break;
+-    }
+-
+-  return true;
+-}
+-
+-static char *
+-gld${EMULATION_NAME}_get_script (int *isfile)
+-EOF
+-
+-if test x"$COMPILE_IN" = xyes
+-then
+-# Scripts compiled in.
+-
+-sc="-f ${srcdir}/emultempl/stringify.sed"
+-
+-fragment <<EOF
+-{
+-  *isfile = 0;
+-
+-  if (bfd_link_relocatable (&link_info) && config.build_constructors)
+-    return
+-EOF
+-sed $sc ldscripts/${EMULATION_NAME}.xu			>> e${EMULATION_NAME}.c
+-echo '  ; else if (bfd_link_relocatable (&link_info)) return' >> e${EMULATION_NAME}.c
+-sed $sc ldscripts/${EMULATION_NAME}.xr			>> e${EMULATION_NAME}.c
+-echo '  ; else if (link_info.separate_code) return'	>> e${EMULATION_NAME}.c
+-sed $sc ldscripts/${EMULATION_NAME}.xe			>> e${EMULATION_NAME}.c
+-echo '  ; else if (!config.text_read_only) return'	>> e${EMULATION_NAME}.c
+-sed $sc ldscripts/${EMULATION_NAME}.xbn			>> e${EMULATION_NAME}.c
+-echo '  ; else if (!config.magic_demand_paged) return'	>> e${EMULATION_NAME}.c
+-sed $sc ldscripts/${EMULATION_NAME}.xn			>> e${EMULATION_NAME}.c
+-echo '  ; else return'					>> e${EMULATION_NAME}.c
+-sed $sc ldscripts/${EMULATION_NAME}.x			>> e${EMULATION_NAME}.c
+-echo '; }'						>> e${EMULATION_NAME}.c
+-
+-else
+-# Scripts read from the filesystem.
+-
+-fragment <<EOF
+-{
+-  *isfile = 1;
+-
+-  if (bfd_link_relocatable (&link_info) && config.build_constructors)
+-    return "ldscripts/${EMULATION_NAME}.xu";
+-  else if (bfd_link_relocatable (&link_info))
+-    return "ldscripts/${EMULATION_NAME}.xr";
+-  else if (link_info.separate_code)
+-    return "ldscripts/${EMULATION_NAME}.xe";
+-  else if (!config.text_read_only)
+-    return "ldscripts/${EMULATION_NAME}.xbn";
+-  else if (!config.magic_demand_paged)
+-    return "ldscripts/${EMULATION_NAME}.xn";
+-  else
+-    return "ldscripts/${EMULATION_NAME}.x";
+-}
+-EOF
+-fi
+-
+-fragment <<EOF
+-
+ /* ==================================================================
+    RT-11 native relocatable object format ("REL": GSD/TXT/RLD/ENDMOD
+    blocks, RADIX-50 names) writer.
+@@ -159,13 +41,12 @@ fragment <<EOF
+    ${EMULATION_NAME}\` can emit a module in RT-11's own native
+    relocatable object representation, mirroring how pdp11rt11sav emits
+    RT-11's native *executable* representation (SAV).  Both work the
+-   same way: link for real through a.out-pdp11's own proven relocation
+-   code first (final link for SAV, \`-r\` link for this), then repack
+-   the result -- here, by reading it back with ordinary a.out-pdp11 BFD
+-   calls (bfd_canonicalize_symtab/reloc, bfd_get_section_contents; all
+-   already fully working on the read side) and re-emitting it block by
+-   block, rather than trying to make a from-scratch BFD target
+-   understand this format on both ends.
++   same way: link for real through the object format's own proven
++   relocation code first (final link for SAV, \`-r\` link for this),
++   then repack the result -- here, by reading it back with ordinary BFD
++   calls (bfd_canonicalize_symtab/reloc, bfd_get_section_contents) and
++   re-emitting it block by block, rather than trying to make a
++   from-scratch BFD target understand this format on both ends.
+ 
+    RADIX-50: 6-character, uppercase-only symbol names (space=0, A-Z=1-
+    26, $=27, .=28, 0-9=36-45; two characters -- 29,30,31,35 -- unused),
+@@ -200,11 +81,11 @@ fragment <<EOF
+    the one currently being written: plain 12/14 if the offset is zero,
+    additive 15/16 with an explicit constant otherwise), and Global (an
+    external symbol: plain 2/4 if zero offset, additive 5/6 otherwise).
+-   Since a.out-pdp11 relocations carry their addend as the raw word
+-   already sitting in the section content at that position (there is no
+-   separate stored-addend field -- the same implicit-addend convention
+-   pdp11_aout_link_input_section itself relies on), that raw word is
+-   exactly what decides plain-vs-additive and supplies the constant.
++   What decides plain-vs-additive, and supplies the constant, is the
++   word this writer puts into the section content itself -- see
++   rel_apply_relocs, which has to fill those words in because ELF
++   relocations keep their addend in a field of their own and leave the
++   content empty.
+ 
+    TXT block chunking: an RLD entry's displacement byte is only one
+    byte (0-255), relative to the *immediately preceding* TXT block's own
+@@ -448,32 +329,95 @@ struct rel_psect_info
+   const char *name;
+   asection *sec;	/* NULL for .ABS.  */
+   unsigned int flags;
++  /* Where this p-sect starts once the module is loaded.  A loader lays
++     the three out end to end in this order, each rounded up to a word
++     -- see layout() in this project's own libppu/ppuc_rel.c -- and a
++     PC-relative word inside the module has to be right for that
++     layout, because nothing patches it afterwards.  */
++  bfd_vma base;
+ };
+ 
+-/* Classify a relocation's target symbol: which of our own p-sects (if
+-   any) it is a section-relative reference to, matching the special
+-   per-section dummy symbols a.out-pdp11's own reloc reader
+-   (pdp11_aout_swap_reloc_in / MOVE_ADDRESS in bfd/pdp11.c) hands back
+-   for section-relative relocs, versus a real external symbol.  */
++/* Which p-sect a relocation's target symbol lives in, or PSECT_NONE for
++   a symbol this module does not define.
++
++   Note that this asks about the symbol's *section*, not about whether
++   it is a section symbol.  It has to: ELF keeps a relocation against a
++   global symbol even when the definition is right there in the same
++   module, and the loader on the other end cannot resolve a reference by
++   name (libppu's ppuc_rel.c rejects the Global entry types outright).
++   Resolving it here to the p-sect it actually falls in is both what the
++   loader can use and what a.out used to arrive at by itself, since its
++   \`-r\` link reduced those references to section-relative ones.  */
+ 
+ static enum rel_psect_kind
+ rel_classify_symbol (asymbol *sym, struct rel_psect_info *psects)
+ {
++  asection *sec = bfd_asymbol_section (sym);
+   int i;
+ 
+-  if ((sym->flags & BSF_SECTION_SYM) == 0)
+-    return PSECT_NONE;
+-
+   for (i = 0; i < 3; i++)
+-    if (psects[i].sec != NULL && bfd_asymbol_section (sym) == psects[i].sec)
++    if (psects[i].sec != NULL && sec == psects[i].sec)
+       return (enum rel_psect_kind) i;
+ 
+-  if (bfd_is_abs_section (bfd_asymbol_section (sym)))
++  if (bfd_is_abs_section (sec))
+     return PSECT_ABS;
+ 
+   return PSECT_NONE;
+ }
+ 
++/* Put the value of each relocation into the section content.
++
++   ELF relocations keep their addend in a field of their own and leave
++   the relocated word empty, so somebody has to write it, and here that
++   somebody is this writer: of the RLD entry types it emits, a loader
++   patches only the direct ones, and treats a displaced (PC-relative)
++   entry as already correct -- which it can, since a displacement
++   between two points of the same module does not depend on where the
++   module lands.  The value is the one the module would have if it were
++   loaded at 0, with the p-sects laid out as rel_psect_info::base says,
++   which is exactly how it will be loaded.
++
++   The word also decides how the RLD entry itself comes out: zero means
++   the plain entry type, anything else the additive one with the
++   constant spelled out.  */
++
++static void
++rel_apply_relocs (bfd_byte *contents, bfd_size_type size,
++		  arelent **relpp, long relcount,
++		  struct rel_psect_info *psect,
++		  struct rel_psect_info *psects)
++{
++  long r;
++
++  for (r = 0; r < relcount; r++)
++    {
++      arelent *rel = relpp[r];
++      asymbol *sym = *rel->sym_ptr_ptr;
++      enum rel_psect_kind kind = rel_classify_symbol (sym, psects);
++      bool pcrel = rel->howto != NULL && rel->howto->pc_relative;
++      bfd_vma target = sym->value + rel->addend;
++      bfd_vma word;
++
++      if (rel->address + 2 > size)
++	continue;
++
++      if (kind != PSECT_NONE && kind != PSECT_ABS)
++	target += psects[(int) kind].base;
++
++      if (pcrel)
++	/* A PC-relative addend already carries the -2 for this machine's
++	   habit of reaching such an operand from the word after it (see
++	   include/elf/pdp11.h), and the displacement is measured from
++	   that same following word -- so the two cancel and what is left
++	   is the distance between the two words.  */
++	word = target - (psect->base + rel->address);
++      else
++	word = target;
++
++      bfd_putl16 (word & 0xffff, contents + rel->address);
++    }
++}
++
+ /* Emit the GSD block(s): module name, then each p-sect immediately
+    followed by the global symbols defined within it (manual: "all
+    global symbol definitions pertaining to [a p-sect] must appear ...
+@@ -603,6 +547,8 @@ rel_write_section (FILE *f, bfd *ibfd, struct rel_psect_info *psect,
+ 	}
+     }
+ 
++  rel_apply_relocs (contents, size, relpp, relcount, psect, psects);
++
+   for (chunk_start = 0; chunk_start < size; chunk_start += REL_TXT_CHUNK)
+     {
+       bfd_size_type chunk_len = size - chunk_start;
+@@ -642,19 +588,19 @@ rel_write_section (FILE *f, bfd *ibfd, struct rel_psect_info *psect,
+ 	  sym = *rel->sym_ptr_ptr;
+ 	  kind = rel_classify_symbol (sym, psects);
+ 
+-	  /* The raw word holds the target's address in this \`-r\` output's
+-	     own layout (.text at 0, .data right after it, .bss after
+-	     that), but a REL constant is relative to the *p-sect* the
+-	     entry names -- the loader adds that p-sect's own base to it.
+-	     Take the target section's start back out, or a reference
+-	     into .data ends up relocated by .data's offset twice
+-	     (harmless for .text, whose start is 0 -- which is how this
+-	     went unnoticed until the first PPU program with a .data
+-	     jump table).  Displaced (PC-relative) entries keep the raw
+-	     self-relative word: nothing in it depends on where the
+-	     module loads.  */
++	  /* rel_apply_relocs wrote the target's address in the loaded
++	     layout (.text at 0, .data right after it, .bss after that),
++	     but a REL constant is relative to the *p-sect* the entry
++	     names -- the loader adds that p-sect's own base to it.  Take
++	     the target p-sect's start back out, or a reference into
++	     .data ends up relocated by .data's offset twice (harmless
++	     for .text, whose start is 0 -- which is how this went
++	     unnoticed until the first PPU program with a .data jump
++	     table).  Displaced (PC-relative) entries keep the word as
++	     written: it is a distance within the module, and the loader
++	     leaves it alone.  */
+ 	  if (!pcrel && kind != PSECT_NONE && kind != PSECT_ABS)
+-	    constant = (constant - (unsigned int) psects[(int) kind].sec->vma)
++	    constant = (constant - (unsigned int) psects[(int) kind].base)
+ 		       & 0xffff;
+ 
+ 	  if (kind == PSECT_NONE)
+@@ -723,7 +669,7 @@ rel_write_section (FILE *f, bfd *ibfd, struct rel_psect_info *psect,
+   return ok;
+ }
+ 
+-/* Read the just-linked (\`-r\`) a.out-pdp11 file back with ordinary BFD
++/* Read the just-linked (\`-r\`) file back with ordinary BFD
+    calls and write it out as an RT-11 native relocatable object module
+    (GSD/TXT/RLD/ENDMOD).  See the big block comment above for the full
+    design.  */
+@@ -756,6 +702,16 @@ pdp11rel_write (bfd *ibfd, const char *filename)
+       fatal (_("%P: %s: missing \`%s' section after linking\n"),
+ 	     filename, psects[i].name);
+ 
++  /* The layout the module will be loaded at, which the words this
++     writer puts in the content have to agree with; see
++     rel_psect_info::base.  */
++  psects[PSECT_TEXT].base = 0;
++  psects[PSECT_DATA].base
++    = (psects[PSECT_TEXT].sec->size + 1) & ~(bfd_vma) 1;
++  psects[PSECT_BSS].base
++    = psects[PSECT_DATA].base + ((psects[PSECT_DATA].sec->size + 1)
++				 & ~(bfd_vma) 1);
++
+   {
+     long storage = bfd_get_symtab_upper_bound (ibfd);
+ 
+@@ -818,15 +774,14 @@ pdp11rel_write (bfd *ibfd, const char *filename)
+   return ok;
+ }
+ 
+-/* This emulation's OUTPUT_FORMAT is "a.out-pdp11", same as plain
+-   pdp11rt11 -- deliberately, and meant to be used with \`-r\`.  Linking
+-   goes through a.out-pdp11's own specialized, proven-correct
+-   relocatable-link path (pdp11_aout_link_input_section's \`if
+-   (relocatable)\` branch in bfd/pdp11.c), producing exactly the file
+-   \`ld -r -m pdp11rt11\` would.  Once that file is fully written to
+-   disk, this hook reopens it, reads its symbols/relocations/contents
+-   back with ordinary a.out-pdp11 BFD calls, and repacks all of that
+-   into the RT-11 native relocatable object format in place -- see
++/* This emulation's OUTPUT_FORMAT is the ordinary object format, same as
++   plain pdp11rt11 -- deliberately, and meant to be used with \`-r\`.
++   Linking goes through that backend's own relocatable-link path,
++   producing exactly the file \`ld -r -m pdp11rt11\` would.  Once that
++   file is fully written to disk, this hook reopens it, reads its
++   symbols/relocations/contents back with ordinary BFD calls, and
++   repacks all of that into the RT-11 native relocatable object format
++   in place -- see
+    pdp11rel_write above.  This hook runs from ldmain.c's
+    ldemul_after_close_output(), right after ldwrite()'s bfd_close()
+    finishes writing that a.out file to the user's requested output
+@@ -846,12 +801,12 @@ gld${EMULATION_NAME}_after_close_output (void)
+   if (!bfd_link_relocatable (&link_info))
+     return;
+ 
+-  ibfd = bfd_openr (output_filename, "a.out-pdp11");
++  ibfd = bfd_openr (output_filename, "${OUTPUT_FORMAT}");
+   if (ibfd == NULL)
+-    fatal (_("%P: %s: cannot reopen linked a.out-pdp11 output "
++    fatal (_("%P: %s: cannot reopen linked ${OUTPUT_FORMAT} output "
+ 	     "for RT-11 REL conversion: %E\n"), output_filename);
+   if (!bfd_check_format (ibfd, bfd_object))
+-    fatal (_("%P: %s: not recognized as a.out-pdp11 after linking: "
++    fatal (_("%P: %s: not recognized as ${OUTPUT_FORMAT} after linking: "
+ 	     "%E\n"), output_filename);
+ 
+   if (!pdp11rel_write (ibfd, output_filename))
+@@ -866,9 +821,4 @@ gld${EMULATION_NAME}_after_close_output (void)
+ 
+ EOF
+ 
+-LDEMUL_BEFORE_PARSE=gld"$EMULATION_NAME"_before_parse
+-LDEMUL_ADD_OPTIONS=gld"$EMULATION_NAME"_add_options
+-LDEMUL_HANDLE_OPTION=gld"$EMULATION_NAME"_handle_option
+-LDEMUL_LIST_OPTIONS=gld"$EMULATION_NAME"_list_options
+-LDEMUL_GET_SCRIPT=gld"$EMULATION_NAME"_get_script
+ LDEMUL_AFTER_CLOSE_OUTPUT=gld"$EMULATION_NAME"_after_close_output

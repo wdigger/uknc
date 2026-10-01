@@ -1,0 +1,615 @@
+From 94e56e9b8984c979b77df483a6f1ac7feda81d9a Mon Sep 17 00:00:00 2001
+From: Yury Klushin <digger@live.ru>
+Date: Sun, 13 Sep 2026 10:44:56 +0300
+Subject: [PATCH] pdp11: DEC-format conversions and comparisons for single
+ precision
+
+This target's float modes are the DEC formats, not IEEE -- see
+pdp11_f_format and pdp11_d_format in gcc/config/pdp11/pdp11.cc -- but
+libgcc's generic soft float in fp-bit.c is hardwired to IEEE: fp-bit.h
+gives single precision an exponent bias of 127.  The shape of the two
+formats is the same, so one bit pattern simply stands for a value four
+times smaller in the DEC reading than in the IEEE one.
+
+In a linear operation that factor cancels, which is why fp-bit's addition
+and subtraction come out right anyway.  Conversions do not get away with
+it: they build an exponent from scratch or take one apart, so every one of
+them was wrong by that factor, in both directions.  Confirmed by running
+code on a UKNC: (float)3 gave 0.75 and (int)3.0f gave 12.  The 64-bit
+conversions were wrong twice over, since libgcc2.c reaches single
+precision by way of double, which on this target is the D format and so is
+served by the same IEEE soft float -- and there, the exponent being 8 bits
+wide against IEEE's 11, nothing cancels and nothing survives.
+
+Comparisons had a narrower version of the same problem: an exponent field
+of 255 is an ordinary value near 1.7e38 in this format, while fp-bit reads
+it as a NaN and then answers false to every question asked about it.
+
+So: fpconv-si.c and fpconv-di.c convert by hand, agreeing with the
+compiler's own constant folding bit for bit, rounding to nearest with ties
+to even included; fpconv-cmp.c compares sign and magnitude, which is all
+the ordering of this format amounts to, and since it has neither NaN nor
+infinity there is no unordered answer to give and all seven comparison
+entry points are one function.  The 64-bit conversions sit in their own
+file so that an ordinary int to float conversion does not drag in 64-bit
+shift helpers; _sf_to_usi is dropped in favour of libgcc2's own
+__fixunssfsi, which follows along on top of __fixsfsi and a float add, and
+which until now was a second definition of the same name in the archive.
+
+Verified on real runs in the ukncbtl emulator against compiler-folded
+constants: 16-, 32- and 64-bit integers, both signs, the range extremes, a
+round-to-even tie, and comparisons at the top of the exponent range.
+---
+ libgcc/config/pdp11/fpconv-cmp.c |  89 ++++++++++++++++
+ libgcc/config/pdp11/fpconv-di.c  | 174 +++++++++++++++++++++++++++++++
+ libgcc/config/pdp11/fpconv-si.c  | 141 +++++++++++++++++++++++++
+ libgcc/config/pdp11/fpconv.h     |  91 ++++++++++++++++
+ libgcc/config/pdp11/t-pdp11      |  32 +++++-
+ 5 files changed, 526 insertions(+), 1 deletion(-)
+ create mode 100644 libgcc/config/pdp11/fpconv-cmp.c
+ create mode 100644 libgcc/config/pdp11/fpconv-di.c
+ create mode 100644 libgcc/config/pdp11/fpconv-si.c
+ create mode 100644 libgcc/config/pdp11/fpconv.h
+
+diff --git a/libgcc/config/pdp11/fpconv-cmp.c b/libgcc/config/pdp11/fpconv-cmp.c
+new file mode 100644
+index 0000000000000..ae1fff98f1c61
+--- /dev/null
++++ b/libgcc/config/pdp11/fpconv-cmp.c
+@@ -0,0 +1,89 @@
++/* Comparisons of PDP-11 single precision values.
++   Copyright (C) 2000-2025 Free Software Foundation, Inc.
++
++This file is part of GCC.
++
++GCC is free software; you can redistribute it and/or modify it under
++the terms of the GNU General Public License as published by the Free
++Software Foundation; either version 3, or (at your option) any later
++version.
++
++GCC is distributed in the hope that it will be useful, but WITHOUT ANY
++WARRANTY; without even the implied warranty of MERCHANTABILITY or
++FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
++for more details.
++
++Under Section 7 of GPL version 3, you are granted additional
++permissions described in the GCC Runtime Library Exception, version
++3.1, as published by the Free Software Foundation.
++
++You should have received a copy of the GNU General Public License and
++a copy of the GCC Runtime Library Exception along with this program;
++see the files COPYING3 and COPYING.RUNTIME respectively.  If not, see
++<http://www.gnu.org/licenses/>.  */
++
++/* See fpconv.h for the general story.  fp-bit's comparisons get ordinary
++   values right, since both formats order values the same way, but not the
++   top octave of the range: an exponent field of 255 is a perfectly
++   ordinary value near 1.7e38 in the DEC format, while fp-bit reads it as
++   a NaN and then answers false to every question asked about it.  The
++   format has no NaN and no infinity at all, so a comparison here is
++   nothing more than sign and magnitude.  */
++
++#include "fpconv.h"
++
++/* Minus one, zero or one as X is less than, equal to or greater than Y.
++
++   Every comparison entry point GCC can call is satisfied by this one
++   answer: each asks its own question of the sign or the zeroness of the
++   result, and with no unordered case to report there is nothing to tell
++   them apart.  So they are aliases rather than six more copies.  */
++
++CMPtype
++__cmpsf2 (float x, float y)
++{
++  union fbits ux, uy;
++  USItype a, b;
++
++  ux.f = x;
++  uy.f = y;
++  a = ux.i;
++  b = uy.i;
++
++  /* A zero exponent is a zero whatever the rest of the word holds.  This
++     format has no negative zero, and the one pattern the hardware would
++     call a reserved operand is not worth inventing an answer for.  */
++  if ((a & ((USItype) 0xff << FRAC_BITS)) == 0)
++    a = 0;
++  if ((b & ((USItype) 0xff << FRAC_BITS)) == 0)
++    b = 0;
++
++  if (a == b)
++    return 0;
++
++  /* Differing signs settle it.  */
++  if ((a ^ b) >> 31)
++    return (a >> 31) ? -1 : 1;
++
++  /* Same sign, so the pattern runs with the magnitude, which for two
++     negative values runs against the value.  */
++  if (a >> 31)
++    return (a > b) ? -1 : 1;
++  return (a < b) ? -1 : 1;
++}
++
++CMPtype __eqsf2 (float, float) __attribute__ ((alias ("__cmpsf2")));
++CMPtype __nesf2 (float, float) __attribute__ ((alias ("__cmpsf2")));
++CMPtype __ltsf2 (float, float) __attribute__ ((alias ("__cmpsf2")));
++CMPtype __lesf2 (float, float) __attribute__ ((alias ("__cmpsf2")));
++CMPtype __gtsf2 (float, float) __attribute__ ((alias ("__cmpsf2")));
++CMPtype __gesf2 (float, float) __attribute__ ((alias ("__cmpsf2")));
++
++/* Nothing is ever unordered: there is no value in this format that is
++   not a number.  */
++
++CMPtype
++__unordsf2 (float x __attribute__ ((unused)), float y __attribute__ ((unused)))
++{
++  return 0;
++}
+diff --git a/libgcc/config/pdp11/fpconv-di.c b/libgcc/config/pdp11/fpconv-di.c
+new file mode 100644
+index 0000000000000..52a4129d90498
+--- /dev/null
++++ b/libgcc/config/pdp11/fpconv-di.c
+@@ -0,0 +1,174 @@
++/* Conversions between 64-bit integers and PDP-11 single precision.
++   Copyright (C) 2000-2025 Free Software Foundation, Inc.
++
++This file is part of GCC.
++
++GCC is free software; you can redistribute it and/or modify it under
++the terms of the GNU General Public License as published by the Free
++Software Foundation; either version 3, or (at your option) any later
++version.
++
++GCC is distributed in the hope that it will be useful, but WITHOUT ANY
++WARRANTY; without even the implied warranty of MERCHANTABILITY or
++FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
++for more details.
++
++Under Section 7 of GPL version 3, you are granted additional
++permissions described in the GCC Runtime Library Exception, version
++3.1, as published by the Free Software Foundation.
++
++You should have received a copy of the GNU General Public License and
++a copy of the GCC Runtime Library Exception along with this program;
++see the files COPYING3 and COPYING.RUNTIME respectively.  If not, see
++<http://www.gnu.org/licenses/>.  */
++
++/* See fpconv.h for why these exist at all.  libgcc2.c has its own
++   versions, but they reach single precision by way of double, which on
++   this target is the DEC D format and so is served by the same IEEE
++   soft float that gets single precision wrong -- except that for D
++   format, whose exponent is 8 bits wide against IEEE's 11, nothing
++   cancels and the results are not merely scaled but meaningless.  These
++   work on the integer directly and owe double nothing.  */
++
++#include "fpconv.h"
++
++/* Reduce M to 32 bits, storing into *SCALE how far it was shifted.  Any
++   bits dropped set the low bit of the result, which is what lets the
++   rounding in __pdp11_pack_f stand for the rounding the whole value
++   calls for: a tie can only be a tie if nothing was lost below it.  */
++
++static USItype
++squash (UDItype m, int *scale)
++{
++  USItype hi = (USItype) (m >> 32);
++  USItype lo = (USItype) m;
++  USItype t, lost, r;
++  int n;
++
++  if (hi == 0)
++    {
++      *scale = 0;
++      return lo;
++    }
++
++  /* N is the number of significant bits in the high word, and so also
++     the shift that brings the whole value down to 32 bits.  */
++  t = hi;
++  n = 1;
++  if (t >> 16)
++    {
++      n += 16;
++      t >>= 16;
++    }
++  if (t >> 8)
++    {
++      n += 8;
++      t >>= 8;
++    }
++  if (t >> 4)
++    {
++      n += 4;
++      t >>= 4;
++    }
++  if (t >> 2)
++    {
++      n += 2;
++      t >>= 2;
++    }
++  if (t >> 1)
++    n += 1;
++
++  lost = (n >= 32) ? lo : (lo & (((USItype) 1 << n) - 1));
++  r = (USItype) (m >> n);
++  if (lost)
++    r |= 1;
++
++  *scale = n;
++  return r;
++}
++
++float
++__floatdisf (DItype a)
++{
++  USItype m;
++  int scale;
++
++  if (a == 0)
++    return 0.0f;
++  if (a < 0)
++    {
++      m = squash (- (UDItype) a, &scale);
++      return __pdp11_pack_f (1, m, scale);
++    }
++  m = squash ((UDItype) a, &scale);
++  return __pdp11_pack_f (0, m, scale);
++}
++
++float
++__floatundisf (UDItype a)
++{
++  USItype m;
++  int scale;
++
++  if (a == 0)
++    return 0.0f;
++  m = squash (a, &scale);
++  return __pdp11_pack_f (0, m, scale);
++}
++
++/* Magnitude of X as a 64-bit integer, truncated towards zero.  Returns
++   zero for anything below one, and saturates above the range, both of
++   which C leaves undefined anyway.  */
++
++static UDItype
++unpack_di (float x, int *sign)
++{
++  union fbits u;
++  USItype m;
++  int e, shift;
++
++  u.f = x;
++  *sign = (int) (u.i >> 31);
++  e = (int) ((u.i >> FRAC_BITS) & 0xff);
++
++  if (e < EXP_BIAS)
++    return 0;
++
++  m = (u.i & (((USItype) 1 << FRAC_BITS) - 1)) | ((USItype) 1 << FRAC_BITS);
++  shift = e - (EXP_BIAS + FRAC_BITS);
++
++  if (shift > 40)
++    return ~ (UDItype) 0;
++
++  if (shift > 0)
++    return (UDItype) m << shift;
++  return (UDItype) m >> -shift;
++}
++
++DItype
++__fixsfdi (float x)
++{
++  int sign;
++  UDItype m = unpack_di (x, &sign);
++
++  if (m >> 63)
++    {
++      /* Out of the signed range, or else exactly the most negative
++	 integer, whose magnitude is the one this saturates to anyway.  */
++      if (sign)
++	return (DItype) ((UDItype) 1 << 63);
++      return (DItype) (~ (UDItype) 0 >> 1);
++    }
++  return sign ? - (DItype) m : (DItype) m;
++}
++
++UDItype
++__fixunssfdi (float x)
++{
++  int sign;
++  UDItype m = unpack_di (x, &sign);
++
++  if (sign)
++    return 0;
++  return m;
++}
+diff --git a/libgcc/config/pdp11/fpconv-si.c b/libgcc/config/pdp11/fpconv-si.c
+new file mode 100644
+index 0000000000000..23409d232f4e4
+--- /dev/null
++++ b/libgcc/config/pdp11/fpconv-si.c
+@@ -0,0 +1,141 @@
++/* Conversions between 32-bit integers and PDP-11 single precision.
++   Copyright (C) 2000-2025 Free Software Foundation, Inc.
++
++This file is part of GCC.
++
++GCC is free software; you can redistribute it and/or modify it under
++the terms of the GNU General Public License as published by the Free
++Software Foundation; either version 3, or (at your option) any later
++version.
++
++GCC is distributed in the hope that it will be useful, but WITHOUT ANY
++WARRANTY; without even the implied warranty of MERCHANTABILITY or
++FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
++for more details.
++
++Under Section 7 of GPL version 3, you are granted additional
++permissions described in the GCC Runtime Library Exception, version
++3.1, as published by the Free Software Foundation.
++
++You should have received a copy of the GNU General Public License and
++a copy of the GCC Runtime Library Exception along with this program;
++see the files COPYING3 and COPYING.RUNTIME respectively.  If not, see
++<http://www.gnu.org/licenses/>.  */
++
++/* See fpconv.h for why these exist at all.  */
++
++#include "fpconv.h"
++
++float
++__pdp11_pack_f (int sign, USItype m, int scale)
++{
++  union fbits u;
++  USItype t, q;
++  int n, e;
++
++  /* N is the number of significant bits in M, so that M is M / 2**N,
++     which lies in [0.5, 1), times 2**N.  */
++  t = m;
++  n = 1;
++  if (t >> 16)
++    {
++      n += 16;
++      t >>= 16;
++    }
++  if (t >> 8)
++    {
++      n += 8;
++      t >>= 8;
++    }
++  if (t >> 4)
++    {
++      n += 4;
++      t >>= 4;
++    }
++  if (t >> 2)
++    {
++      n += 2;
++      t >>= 2;
++    }
++  if (t >> 1)
++    n += 1;
++
++  e = n + scale + EXP_BIAS - 1;
++
++  /* Line the value up so that the hidden one is bit 23.  */
++  if (n <= FRAC_BITS + 1)
++    q = m << (FRAC_BITS + 1 - n);
++  else
++    {
++      int shift = n - (FRAC_BITS + 1);
++      USItype half = (USItype) 1 << (shift - 1);
++      USItype rem = m & ((half << 1) - 1);
++
++      q = m >> shift;
++      if (rem > half || (rem == half && (q & 1) != 0))
++	{
++	  q++;
++	  /* The carry can reach a 25th bit, which means the value rounded
++	     up to the next power of two.  */
++	  if (q >> (FRAC_BITS + 1))
++	    {
++	      q >>= 1;
++	      e++;
++	    }
++	}
++    }
++
++  u.i = ((USItype) (sign != 0) << 31) | ((USItype) e << FRAC_BITS)
++	| (q & (((USItype) 1 << FRAC_BITS) - 1));
++  return u.f;
++}
++
++float
++__floatsisf (SItype a)
++{
++  if (a == 0)
++    return 0.0f;
++  if (a < 0)
++    return __pdp11_pack_f (1, - (USItype) a, 0);
++  return __pdp11_pack_f (0, (USItype) a, 0);
++}
++
++float
++__floatunsisf (USItype a)
++{
++  if (a == 0)
++    return 0.0f;
++  return __pdp11_pack_f (0, a, 0);
++}
++
++SItype
++__fixsfsi (float x)
++{
++  union fbits u;
++  USItype m;
++  int e, shift;
++
++  u.f = x;
++  e = (int) ((u.i >> FRAC_BITS) & 0xff);
++
++  /* A zero, a reserved operand, and anything of magnitude below one all
++     truncate to zero.  */
++  if (e < EXP_BIAS)
++    return 0;
++
++  m = (u.i & (((USItype) 1 << FRAC_BITS) - 1)) | ((USItype) 1 << FRAC_BITS);
++  shift = e - (EXP_BIAS + FRAC_BITS);
++
++  /* Out of range, which C leaves undefined; saturate.  The one value
++     this rejects that is in fact representable, the most negative
++     integer, saturates to itself.  */
++  if (shift >= 8)
++    return (u.i >> 31) ? (SItype) (USItype) 0x80000000 : (SItype) 0x7fffffff;
++
++  if (shift > 0)
++    m <<= shift;
++  else
++    m >>= -shift;
++
++  return (u.i >> 31) ? - (SItype) m : (SItype) m;
++}
+diff --git a/libgcc/config/pdp11/fpconv.h b/libgcc/config/pdp11/fpconv.h
+new file mode 100644
+index 0000000000000..8c54ba1310456
+--- /dev/null
++++ b/libgcc/config/pdp11/fpconv.h
+@@ -0,0 +1,91 @@
++/* Shared declarations for the PDP-11 single precision conversions.
++   Copyright (C) 2000-2025 Free Software Foundation, Inc.
++
++This file is part of GCC.
++
++GCC is free software; you can redistribute it and/or modify it under
++the terms of the GNU General Public License as published by the Free
++Software Foundation; either version 3, or (at your option) any later
++version.
++
++GCC is distributed in the hope that it will be useful, but WITHOUT ANY
++WARRANTY; without even the implied warranty of MERCHANTABILITY or
++FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
++for more details.
++
++Under Section 7 of GPL version 3, you are granted additional
++permissions described in the GCC Runtime Library Exception, version
++3.1, as published by the Free Software Foundation.
++
++You should have received a copy of the GNU General Public License and
++a copy of the GCC Runtime Library Exception along with this program;
++see the files COPYING3 and COPYING.RUNTIME respectively.  If not, see
++<http://www.gnu.org/licenses/>.  */
++
++/* The generic soft float in fp-bit.c is hardwired to IEEE: fp-bit.h
++   gives single precision an exponent bias of 127.  This target's float
++   modes are the DEC formats instead (see pdp11_f_format in
++   gcc/config/pdp11/pdp11.cc), where the bias is 128 over a fraction
++   normalized to [0.5, 1), so one bit pattern stands for a value four
++   times smaller than IEEE would read it as.
++
++   In a linear operation that factor cancels, which is why fp-bit's
++   addition and subtraction come out right anyway, and comparisons are
++   fine because the ordering is the same in both formats.  Conversions do
++   not get away with it: they build an exponent from scratch or take one
++   apart, so fp-bit's versions are wrong by that factor of four in both
++   directions and are replaced here.  libgcc/config/pdp11/t-pdp11
++   excludes them from the fp-bit build.
++
++   The compiler folds constants using the real format, so these routines
++   have to agree with it bit for bit, rounding included: to nearest, ties
++   to even.
++
++   Comparisons have a narrower version of the same problem, described in
++   fpconv-cmp.c.
++
++   The 64-bit conversions live in their own file so that a program doing
++   no more than an ordinary int to float conversion does not drag in
++   64-bit shift and compare helpers along with them.  */
++
++typedef int CMPtype __attribute__ ((mode (__libgcc_cmp_return__)));
++typedef int SItype __attribute__ ((mode (SI)));
++typedef unsigned int USItype __attribute__ ((mode (SI)));
++typedef int DItype __attribute__ ((mode (DI)));
++typedef unsigned int UDItype __attribute__ ((mode (DI)));
++
++/* A float and its bits.  The word holding the sign and the exponent is
++   at the lower address in an F format value, and so is the high word of
++   a 32-bit integer on this machine, so the exponent lands in the high
++   bits here.  */
++union fbits
++{
++  float f;
++  USItype i;
++};
++
++/* Bits of fraction actually stored; the leading one is hidden.  */
++#define FRAC_BITS 23
++
++/* Exponent of a value whose significand is read as being in [1, 2).  The
++   format's own bias is 128 over a fraction in [0.5, 1), which is the
++   same statement differently phrased.  So 1.0 has exponent 129.  */
++#define EXP_BIAS 129
++
++/* Assemble the float for (-1)**SIGN * M * 2**SCALE.  M must not be zero.
++   If bits were dropped on the way to M, its low bit must be set, which
++   keeps the rounding decision here the one the full value calls for.  */
++extern float __pdp11_pack_f (int, USItype, int);
++
++/* fp-bit.c and libgcc2.c declare these through machinery of their own,
++   which is not in play here, so declare them to keep
++   -Wmissing-prototypes quiet.  */
++extern float __floatsisf (SItype);
++extern float __floatunsisf (USItype);
++extern SItype __fixsfsi (float);
++extern float __floatdisf (DItype);
++extern float __floatundisf (UDItype);
++extern DItype __fixsfdi (float);
++extern UDItype __fixunssfdi (float);
++extern CMPtype __cmpsf2 (float, float);
++extern CMPtype __unordsf2 (float, float);
+diff --git a/libgcc/config/pdp11/t-pdp11 b/libgcc/config/pdp11/t-pdp11
+index a2e4287f2b4d9..ec162802f7b2b 100644
+--- a/libgcc/config/pdp11/t-pdp11
++++ b/libgcc/config/pdp11/t-pdp11
+@@ -6,7 +6,37 @@ LIB2ADD = $(srcdir)/divmod.c \
+ 	  $(srcdir)/memcmp.c \
+ 	  $(srcdir)/memcpy.c \
+ 	  $(srcdir)/memmove.c \
+-	  $(srcdir)/memset.c
++	  $(srcdir)/memset.c \
++	  $(srcdir)/config/pdp11/fpconv-si.c \
++	  $(srcdir)/config/pdp11/fpconv-di.c \
++	  $(srcdir)/config/pdp11/fpconv-cmp.c
++
++# This target's float modes are the DEC formats, not IEEE, but fp-bit.c
++# is hardwired to IEEE.  Conversions between integers and single
++# precision build or take apart an exponent, so fp-bit's are wrong here
++# by the factor of four the two biases differ by; the two fpconv files
++# above have replacements, and fpconv.h explains the whole business.
++# _sf_to_usi goes too: its job is done by libgcc2's own __fixunssfsi,
++# which is built on top of __fixsfsi and a float add and so follows
++# along, and which until now was a second definition of the same name in
++# the archive.  Everything else fp-bit provides for single precision is
++# either right by accident (add and subtract, where the factor cancels)
++# or format-independent (negation).
++#
++# The 64-bit conversions come from libgcc2.c, which reaches single
++# precision by way of double and so inherits the much worse breakage of
++# the D format; fpconv-di.c replaces those as well, hence the four
++# _float/_fix names below.
++#
++# The comparisons go too, for a narrower reason: fp-bit reads an exponent
++# field of 255 as a NaN, where this format has an ordinary large value,
++# and then answers false to everything asked about it.  fpconv-cmp.c has
++# them.  _fpcmp_parts_sf stays: it is fp-bit's own helper, and with no
++# caller left nothing pulls it out of the archive.
++LIB2FUNCS_EXCLUDE = _si_to_sf _usi_to_sf _sf_to_si _sf_to_usi \
++		    _floatdisf _floatundisf _fixsfdi _fixunssfdi \
++		    _compare_sf _eq_sf _ne_sf _gt_sf _ge_sf _lt_sf _le_sf \
++		    _unord_sf
+ 
+ # Small machine, optimize for size
+ HOST_LIBGCC2_CFLAGS += -Os

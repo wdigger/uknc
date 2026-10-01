@@ -1,0 +1,162 @@
+From 3ba9daebb25ee1304a03965b8ddf4bf39ce37579 Mon Sep 17 00:00:00 2001
+From: Yury Klushin <digger@live.ru>
+Date: Sun, 13 Sep 2026 12:11:41 +0300
+Subject: [PATCH] pdp11: turn the FIS instructions on by default for the uknc
+ vendor
+
+A UKNC has no FIS hardware, but its own system software emulates the four
+instruction codes in a HALT-mode trap handler, so they work there, and
+going through that trap is still 2.8 times faster than calling the
+library -- 4602 CPU ticks against 13038 for a single precision addition,
+measured with the emulator's cycle profiler.  That is worth having without
+asking for it, so the vendor's default target flags carry MASK_FIS, next
+to the MASK_FPU they already drop for having no FP11.
+
+-mno-fis turns it off again, which is what to use for a machine whose
+monitor does not handle these codes.  -mfpu now quietly wins over the
+default rather than colliding with it: a default is not a request, so the
+mutual-exclusion error is reported only when -mfis was asked for
+explicitly.
+
+Correctness does not depend on any of this -- the library is right for
+these formats too as of the previous patches -- so what the default buys
+is speed.  It does buy two changes in behaviour worth knowing about:
+division by zero traps and ends the program instead of returning a very
+large number, and three functions in libgcc that do single precision
+arithmetic of their own (__fixunssfsi, __mulsc3, __powisf2) now contain
+FIS instructions, so -mno-fis in a program of one's own no longer makes
+the whole binary free of them.
+
+gcc.target/pdp11 is 118 passes and no failures; the two new tests are
+uknc-only and cover the default being on and -mfpu overriding it.
+---
+ gcc/common/config/pdp11/pdp11-common.cc | 12 ++++++++++--
+ gcc/config/pdp11/pdp11.cc               |  9 ++++++---
+ gcc/doc/invoke.texi                     | 18 +++++++++++-------
+ gcc/testsuite/gcc.target/pdp11/fis-5.c  | 17 +++++++++++++++++
+ gcc/testsuite/gcc.target/pdp11/fis-6.c  | 16 ++++++++++++++++
+ 5 files changed, 60 insertions(+), 12 deletions(-)
+ create mode 100644 gcc/testsuite/gcc.target/pdp11/fis-5.c
+ create mode 100644 gcc/testsuite/gcc.target/pdp11/fis-6.c
+
+diff --git a/gcc/common/config/pdp11/pdp11-common.cc b/gcc/common/config/pdp11/pdp11-common.cc
+index 7c7886ba8c590..3d701c6baf302 100644
+--- a/gcc/common/config/pdp11/pdp11-common.cc
++++ b/gcc/common/config/pdp11/pdp11-common.cc
+@@ -111,10 +111,18 @@ pdp11_option_init_struct (struct gcc_options *opts)
+ /* Real UKNC hardware has no FPU coprocessor, so -msoft-float is the
+    correct default for this vendor (see config.gcc) -- unlike the
+    generic pdp11 default below, which assumes an 11/45 with hardware
+-   floating point.  -mfpu still works to override this explicitly.  */
++   floating point.  -mfpu still works to override this explicitly.
++
++   The FIS instructions, on the other hand, are worth having on by
++   default here.  The processor has no FIS hardware either, but the
++   machine's own software emulates the four instruction codes in a
++   HALT-mode trap handler, and going through that trap is still about
++   three times faster than calling the library.  -mno-fis turns them off
++   again, for a machine whose monitor does not do this, and -mfpu quietly
++   wins over the default rather than colliding with it.  */
+ #undef TARGET_DEFAULT_TARGET_FLAGS
+ #define TARGET_DEFAULT_TARGET_FLAGS \
+-  (TARGET_UNIX_ASM_DEFAULT)
++  (MASK_FIS | TARGET_UNIX_ASM_DEFAULT)
+ #else
+ #undef TARGET_DEFAULT_TARGET_FLAGS
+ #define TARGET_DEFAULT_TARGET_FLAGS \
+diff --git a/gcc/config/pdp11/pdp11.cc b/gcc/config/pdp11/pdp11.cc
+index a88f76c47d68b..a20480ee588f0 100644
+--- a/gcc/config/pdp11/pdp11.cc
++++ b/gcc/config/pdp11/pdp11.cc
+@@ -2398,11 +2398,14 @@ pdp11_option_override (void)
+      the PDP-11 line: a machine has the KE11-F/KEV11 four-instruction
+      stack arithmetic, or an FP11 with its own accumulators, never both.
+      They also disagree about what a float even is in a register, so
+-     there is no way to mix their code in one compilation.  */
++     there is no way to mix their code in one compilation.  Asking for
++     both is an error -- but FIS being merely the default, as it is for
++     the UKNC, is not asking, so there -mfpu just wins.  */
+   if (TARGET_FIS && TARGET_FPU)
+     {
+-      error ("%<-mfis%> and %<-mfpu%> are mutually exclusive; FIS and FPP "
+-	     "are alternative PDP-11 floating point options, not a pair");
++      if (target_flags_explicit & MASK_FIS)
++	error ("%<-mfis%> and %<-mfpu%> are mutually exclusive; FIS and FPP "
++	       "are alternative PDP-11 floating point options, not a pair");
+       target_flags &= ~MASK_FIS;
+     }
+ }
+diff --git a/gcc/doc/invoke.texi b/gcc/doc/invoke.texi
+index 3eb925ab29bef..b24b5f73863ac 100644
+--- a/gcc/doc/invoke.texi
++++ b/gcc/doc/invoke.texi
+@@ -30880,13 +30880,17 @@ point option of the PDP-11 line, the KE11-F on the PDP-11/35 and /40 and
+ the KEV11 on the PDP-11/03; it covers the four basic operations on single
+ precision values only, so conversions, comparisons and anything in
+ @code{double} still go to the library.  FIS and FPP are alternatives, so
+-this option cannot be combined with @option{-mfpu}.  It is off by
+-default, and @option{-mno-fis} turns it back off, because availability is
+-a property of the machine rather than of the processor: some machines
+-emulate the four instruction codes in a monitor trap handler instead of
+-executing them, and where nothing handles them the program dies.  Note
+-also that FIS traps on overflow, underflow and division by zero, where
+-the library routines return a value.
++asking for this option together with @option{-mfpu} is an error.
++
++Availability is a property of the machine rather than of the processor:
++some machines have none of the hardware but emulate the four instruction
++codes in a monitor trap handler, which is worth using anyway, and where
++nothing handles them at all the program dies.  So this is off by default
++everywhere except for the @samp{uknc} vendor, whose machine does emulate
++them; @option{-mno-fis} turns it off again, and is what to use when
++building for a machine that does not.  Note also that FIS traps on
++overflow, underflow and division by zero, where the library routines
++return a value.
+ 
+ @opindex mac0
+ @item -mac0
+diff --git a/gcc/testsuite/gcc.target/pdp11/fis-5.c b/gcc/testsuite/gcc.target/pdp11/fis-5.c
+new file mode 100644
+index 0000000000000..a01af48e9d8d8
+--- /dev/null
++++ b/gcc/testsuite/gcc.target/pdp11/fis-5.c
+@@ -0,0 +1,17 @@
++/* { dg-do compile { target pdp11-uknc-* } } */
++/* { dg-options "-O2 -fomit-frame-pointer" } */
++
++/* The UKNC emulates the FIS instruction codes in its own monitor, so the
++   vendor has them on by default and no option is needed here.  -mfpu
++   quietly wins over that default instead of colliding with it, which
++   fis-6.c checks; an explicit -mfis alongside -mfpu is still an error,
++   which fis-4.c checks.  */
++
++float
++mul (float a, float b)
++{
++  return a * b;
++}
++
++/* { dg-final { scan-assembler "fmul\t" } } */
++/* { dg-final { scan-assembler-not "___mulsf3" } } */
+diff --git a/gcc/testsuite/gcc.target/pdp11/fis-6.c b/gcc/testsuite/gcc.target/pdp11/fis-6.c
+new file mode 100644
+index 0000000000000..85ba5988650ad
+--- /dev/null
++++ b/gcc/testsuite/gcc.target/pdp11/fis-6.c
+@@ -0,0 +1,16 @@
++/* { dg-do compile { target pdp11-uknc-* } } */
++/* { dg-options "-O2 -fomit-frame-pointer -mfpu" } */
++
++/* Where FIS is on by default, asking for the FP11 instead has to work
++   rather than report a collision: a default is not a request.  So this
++   compiles, and compiles to FP11 code -- double precision in the
++   accumulators, since that is how this port drives an FP11.  */
++
++float
++mul (float a, float b)
++{
++  return a * b;
++}
++
++/* { dg-final { scan-assembler "muld\t" } } */
++/* { dg-final { scan-assembler-not "fmul" } } */

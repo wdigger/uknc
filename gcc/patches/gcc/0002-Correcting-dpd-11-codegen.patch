@@ -1,0 +1,62 @@
+From b6a22d2cc567af01c9847c20a1be508709f003f2 Mon Sep 17 00:00:00 2001
+From: Yury Klushin <digger@live.ru>
+Date: Tue, 24 Feb 2026 13:42:43 +0300
+Subject: [PATCH] Correcting dpd-11 codegen
+
+---
+ gcc/config/pdp11/pdp11.cc | 21 +++++++++++++++++++++
+ gcc/config/pdp11/pdp11.md |  9 +++++++++
+ 2 files changed, 30 insertions(+)
+
+diff --git a/gcc/config/pdp11/pdp11.cc b/gcc/config/pdp11/pdp11.cc
+index eda8404caaa40..ba5126a3aeb0f 100644
+--- a/gcc/config/pdp11/pdp11.cc
++++ b/gcc/config/pdp11/pdp11.cc
+@@ -518,6 +518,27 @@ pdp11_expand_operands (rtx *operands, rtx exops[][2],
+ 	  && REGNO (XEXP (XEXP (operands[0], 0), 0)) == STACK_POINTER_REGNUM
+ 	  && reg_overlap_mentioned_p (stack_pointer_rtx, operands[1]))
+ 	sameoff = true;
++
++      /* DMB - catch for source [1] is an indirect access via a register that
++         is also used as the destination [0] */
++      if (GET_CODE (operands[0]) == REG && GET_CODE (operands[1]) == MEM) {
++        int dstreg = REGNO (operands[0]);
++        int srcreg = -1;
++        if (GET_CODE (XEXP (operands[1], 0)) == REG) {
++          srcreg = REGNO (XEXP (operands[1], 0));
++        } else if (GET_CODE (XEXP (operands[1], 0)) == PLUS) {
++          if (GET_CODE (XEXP (XEXP (operands[1], 0), 0)) == REG) {
++            srcreg = REGNO (XEXP (XEXP (operands[1], 0), 0));
++          } else if (GET_CODE (XEXP (XEXP (operands[1], 0), 1)) == REG) {
++            srcreg = REGNO (XEXP (XEXP (operands[1], 0), 1));
++          }
++        }
++        /* If the source and destination registers are the same, force
++           little endian instruction order */
++        if (srcreg == dstreg) {
++          useorder = little;
++        }
++      }
+     }
+ 
+   /* If the caller didn't specify order, use the one we computed,
+diff --git a/gcc/config/pdp11/pdp11.md b/gcc/config/pdp11/pdp11.md
+index e66d18ed6a77d..955de6731853b 100644
+--- a/gcc/config/pdp11/pdp11.md
++++ b/gcc/config/pdp11/pdp11.md
+@@ -271,6 +271,15 @@
+    output_asm_insn ("tst\t%0", exops[1]);
+   else
+    output_asm_insn ("cmp\t%0,%1", exops[1]);
++   
++  // Correct V/N flags so signed comparisons work
++  output_asm_insn ("cln", NULL);
++  if (!CONST_INT_P (exops[1][1]) || INTVAL (exops[1][1]) != 0) {
++   output_asm_insn ("clv", NULL);
++   output_asm_insn ("bcc\t%l0", lb);
++   output_asm_insn ("sen", NULL);
++  }
++
+   output_asm_label (lb[0]);
+   fputs (":\n", asm_out_file);
+ 

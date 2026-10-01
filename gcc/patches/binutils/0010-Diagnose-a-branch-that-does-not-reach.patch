@@ -1,0 +1,124 @@
+From c5f9f1a731dc888a83a57748a76a84e240f80c08 Mon Sep 17 00:00:00 2001
+From: Yury Klushin <digger@live.ru>
+Date: Mon, 14 Sep 2026 23:25:57 +0300
+Subject: [PATCH] Diagnose a branch that does not reach
+
+A branch displacement is a count of words held inside the instruction
+word itself, so one that does not fit overwrites the opcode's own bits
+and comes out as a different, perfectly valid instruction.  Nothing
+checked.  A bne 440 bytes forward assembled without a word of complaint
+and with a successful exit status, and disassembled as a jump backwards.
+
+That is the worst way for a compiler bug to reach a program: any
+misjudged instruction length turns into wrong code instead of a build
+failure.  It found one immediately -- newlib's libc/search/hash.c had a
+branch five words out of reach, silently mis-assembled into libc.a for
+as long as this toolchain has existed.
+
+Check when the value is final -- while a symbol is still attached the
+displacement is not known yet -- and say how far out it is.  sob counts
+backwards into a six-bit unsigned field and gets its own message; a
+branch to an odd address gets one too.
+
+The range is exact: +127 words forward and -128 back are accepted, +128
+and -129 are not.  Nothing in this project's own code trips it, and all
+34 build artifacts are unchanged, the check only diagnosing.
+---
+ gas/config/tc-pdp11.c                  | 36 ++++++++++++++++++++++++++
+ gas/testsuite/gas/pdp11/branch-range.l |  4 +++
+ gas/testsuite/gas/pdp11/branch-range.s | 15 +++++++++++
+ gas/testsuite/gas/pdp11/pdp11.exp      |  3 +++
+ 4 files changed, 58 insertions(+)
+ create mode 100644 gas/testsuite/gas/pdp11/branch-range.l
+ create mode 100644 gas/testsuite/gas/pdp11/branch-range.s
+
+diff --git a/gas/config/tc-pdp11.c b/gas/config/tc-pdp11.c
+index a0118188d98..0a7e1201f75 100644
+--- a/gas/config/tc-pdp11.c
++++ b/gas/config/tc-pdp11.c
+@@ -363,6 +363,42 @@ md_apply_fix (fixS *fixP,
+     val += symbol_get_bfdsym (fixP->fx_addsy)->section->vma;
+     /* *value += fixP->fx_addsy->bsym->section->vma; */
+ 
++  /* A branch displacement is a count of words and lives in part of the
++     instruction word itself, so a value that does not fit simply
++     overwrites the opcode's own bits and produces a different, valid
++     instruction.  Nothing checked: a branch too far assembled without a
++     word of complaint and with a successful exit status, and what came
++     out was a branch to somewhere else entirely -- 440 bytes forward
++     disassembling as a jump backwards.  That turns any misjudged
++     instruction length in the compiler from a build failure into wrong
++     code, which is the worst way to find out about one.
++
++     Only when the value is final: while a symbol is still attached the
++     displacement is not known yet.  */
++  if (fixP->fx_addsy == NULL
++      && (fixP->fx_r_type == BFD_RELOC_PDP11_DISP_8_PCREL
++	  || fixP->fx_r_type == BFD_RELOC_PDP11_DISP_6_PCREL))
++    {
++      offsetT disp = (offsetT) val;
++      bool sob = fixP->fx_r_type == BFD_RELOC_PDP11_DISP_6_PCREL;
++
++      if ((disp & 1) != 0)
++	as_bad_where (fixP->fx_file, fixP->fx_line,
++		      _("branch to an odd address"));
++      disp /= 2;
++
++      /* sob counts backwards, and md_apply_fix negated the value above
++	 for it, so its field is unsigned.  */
++      if (sob ? (disp < 0 || disp > 63) : (disp < -128 || disp > 127))
++	as_bad_where (fixP->fx_file, fixP->fx_line,
++		      sob
++		      ? _("sob out of range: %ld words back, the field "
++			  "holds 0 to 63")
++		      : _("branch out of range: %ld words away, the field "
++			  "holds -128 to 127"),
++		      (long) disp);
++    }
++
+   code &= ~mask;
+   code |= (val >> shift) & mask;
+   number_to_chars_littleendian (buf, code, size);
+diff --git a/gas/testsuite/gas/pdp11/branch-range.l b/gas/testsuite/gas/pdp11/branch-range.l
+new file mode 100644
+index 00000000000..9b0857635e5
+--- /dev/null
++++ b/gas/testsuite/gas/pdp11/branch-range.l
+@@ -0,0 +1,4 @@
++.*: Assembler messages:
++.*:7: Error: branch out of range: 130 words away, the field holds -128 to 127
++.*:13: Error: sob out of range: 74 words back, the field holds 0 to 63
++.*:14: Error: branch to an odd address
+diff --git a/gas/testsuite/gas/pdp11/branch-range.s b/gas/testsuite/gas/pdp11/branch-range.s
+new file mode 100644
+index 00000000000..c5ce4b20dae
+--- /dev/null
++++ b/gas/testsuite/gas/pdp11/branch-range.s
+@@ -0,0 +1,15 @@
++# A branch displacement is a count of words held in part of the
++# instruction word itself, so one that does not fit overwrites the
++# opcode's own bits and assembles as some other, perfectly valid
++# instruction -- silently, and with a successful exit status, until
++# this was diagnosed.
++	.text
++	bne	far		# 130 words: too far
++	.space	260
++far:	halt
++	bne	far		# in range, backwards
++	sob	r0,far		# in range
++	.space	140
++	sob	r0,far		# 74 words back: too far for a 6-bit field
++	bne	odd+1		# lands on an odd address
++odd:	halt
+diff --git a/gas/testsuite/gas/pdp11/pdp11.exp b/gas/testsuite/gas/pdp11/pdp11.exp
+index 9bc85e9b950..853d72caced 100644
+--- a/gas/testsuite/gas/pdp11/pdp11.exp
++++ b/gas/testsuite/gas/pdp11/pdp11.exp
+@@ -38,4 +38,7 @@ if [expr [istarget "pdp11-*-*"]]  then {
+     pdp11_run_dump_test "pr14480"
+     run_dump_test "pr23481"
+     pdp11_run_dump_test "pr26001"
++    # Errors, not output: run_list_test compares what the assembler
++    # printed against branch-range.l.
++    run_list_test "branch-range" ""
+ }

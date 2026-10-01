@@ -1,0 +1,688 @@
+From: Yury Klushin <digger@live.ru>
+Date: Thu, 26 Feb 2026 01:35:39 +0300
+Subject: [PATCH] pdp11: the per-model instruction sets, as SUPP_INSN_*
+
+The machine description asked TARGET_M11_40_PLUS whether it could use
+MUL, DIV, ASH, SOB or XOR, which conflates five separate questions into
+one model comparison.  Each is its own SUPP_INSN_* now, and every
+pattern that needs one asks for that one.
+
+That is what the Soviet chips need in order to be describable at all --
+they do not sit anywhere in the DEC line.  The UKNC's 1801BM2 does: it
+is an 11/40 by every one of these five answers and has no FP11 either,
+so it needs no model of its own and gets none.  (It differs in FIS,
+which is a flag rather than a model, and in __pdp11_model, where it
+now answers 40.)  Its relatives would need masks of their own: 1801BM1A
+has SOB and XOR without MUL, 1801BM1G has MUL without DIV, and neither
+shape exists in this back end's -m10/-m40/-m45.  Nothing here targets
+them, so the masks are not carried for them.
+
+* Instruction-set macros, and the machine description gated on them
+* Shift expansion and assembly, and the prologue
+* pdp11 test suite
+
+Signed-off-by: Yuriy Shestakov <165710+yshestakov@users.noreply.github.com>
+
+Includes what was a separate fix on top of this one, now part of it:
+
+pdp11: a rotate ended its assembly with a statement separator
+
+rotlhi3 emitted "ashc %2,%0\t; limit 2261", the tail meant as a comment.
+For this assembler ";" does not start one -- comments are "#" and "/",
+and ";" separates statements -- so gas read "limit 2261" as an
+instruction and refused the file.  Any program whose compilation produced
+a 16-bit rotate failed to assemble, including ones with no rotate written
+anywhere in them: a modulo by a constant is enough, which is how this
+turned up, in an example drawing a sine wave.
+
+The comment is dropped rather than re-spelled: what "limit 2261" was
+telling the reader has not survived to anyone still here.  The
+instruction itself is right, ASHC on an odd register being the machine's
+own way to rotate, and the "d" constraint is what keeps the register odd.
+---
+ gcc/common/config/pdp11/pdp11-common.cc       | 24 ++++++---
+ gcc/config/pdp11/pdp11.cc                     |  5 +-
+ gcc/config/pdp11/pdp11.h                      | 17 ++++--
+ gcc/config/pdp11/pdp11.md                     | 50 ++++++++---------
+ gcc/config/pdp11/pdp11.opt                    | 18 +++++--
+ gcc/testsuite/gcc.target/pdp11/mul-bis.c      | 53 +++++++++++++++++++
+ gcc/testsuite/gcc.target/pdp11/mul-eis.c      | 53 +++++++++++++++++++
+ gcc/testsuite/gcc.target/pdp11/mul-m10.c      | 53 +++++++++++++++++++
+ gcc/testsuite/gcc.target/pdp11/nosob-1110.c   | 21 ++++++++
+ .../gcc.target/pdp11/rotate-comment.c         | 25 +++++++++
+ gcc/testsuite/gcc.target/pdp11/xor-m10.c      | 11 ++++
+ 11 files changed, 289 insertions(+), 41 deletions(-)
+ create mode 100644 gcc/testsuite/gcc.target/pdp11/mul-bis.c
+ create mode 100644 gcc/testsuite/gcc.target/pdp11/mul-eis.c
+ create mode 100644 gcc/testsuite/gcc.target/pdp11/mul-m10.c
+ create mode 100644 gcc/testsuite/gcc.target/pdp11/nosob-1110.c
+ create mode 100644 gcc/testsuite/gcc.target/pdp11/rotate-comment.c
+ create mode 100644 gcc/testsuite/gcc.target/pdp11/xor-m10.c
+
+diff --git a/gcc/common/config/pdp11/pdp11-common.cc b/gcc/common/config/pdp11/pdp11-common.cc
+index 934fbae..0abc86d 100644
+--- a/gcc/common/config/pdp11/pdp11-common.cc
++++ b/gcc/common/config/pdp11/pdp11-common.cc
+@@ -39,16 +39,23 @@ pdp11_handle_option (struct gcc_options *opts,
+   switch (code)
+     {
+     case OPT_m10:
+-      opts->x_target_flags &= ~(MASK_40 | MASK_45 | MASK_FPU | MASK_AC0 | MASK_SPLIT);
++      opts->x_target_flags &= ~(MASK_FPU | MASK_AC0 | MASK_SPLIT);
++      opts->x_pdp11_model = OPTION_MASK_M11_10;
+       return true;
+ 
+     case OPT_m40:
+-      opts->x_target_flags &= ~(MASK_45 | MASK_FPU | MASK_AC0 | MASK_SPLIT);
++      opts->x_target_flags &= ~(MASK_FPU | MASK_AC0 | MASK_SPLIT);
++      opts->x_pdp11_model = OPTION_MASK_M11_40;
++      return true;
++
++    case OPT_m45:
++      opts->x_target_flags |= (MASK_FPU | MASK_AC0 | MASK_SPLIT);
++      opts->x_pdp11_model = OPTION_MASK_M11_45;
+       return true;
+ 
+     case OPT_mfpu:
+-      opts->x_target_flags &= ~MASK_40;
+-      opts->x_target_flags |= MASK_45;
++      opts->x_pdp11_model &= ~OPTION_MASK_M11_40;
++      opts->x_pdp11_model |= OPTION_MASK_M11_45;
+       return true;
+ 
+     case OPT_msoft_float:
+@@ -56,8 +63,8 @@ pdp11_handle_option (struct gcc_options *opts,
+       return true;
+ 
+     case OPT_msplit:
+-      opts->x_target_flags &= ~MASK_40;
+-      opts->x_target_flags |= MASK_45;
++      opts->x_pdp11_model &= ~OPTION_MASK_M11_40;
++      opts->x_pdp11_model |= OPTION_MASK_M11_45;
+       return true;
+ 
+     case OPT_munix_asm:
+@@ -86,7 +93,10 @@ pdp11_option_init_struct (struct gcc_options *opts)
+ 
+ #undef TARGET_DEFAULT_TARGET_FLAGS
+ #define TARGET_DEFAULT_TARGET_FLAGS \
+-  (MASK_FPU | MASK_45 | TARGET_UNIX_ASM_DEFAULT)
++  (MASK_FPU | TARGET_UNIX_ASM_DEFAULT)
++#undef TARGET_DEFAULT_TARGET_CPU_MODEL
++#define TARGET_DEFAULT_TARGET_CPU_MODEL \
++  (OPTION_MASK_M11_45)
+ #undef TARGET_HANDLE_OPTION
+ #define TARGET_HANDLE_OPTION pdp11_handle_option
+ #undef TARGET_OPTION_INIT_STRUCT
+diff --git a/gcc/config/pdp11/pdp11.cc b/gcc/config/pdp11/pdp11.cc
+index f57c901..b9e7fdb 100644
+--- a/gcc/config/pdp11/pdp11.cc
++++ b/gcc/config/pdp11/pdp11.cc
+@@ -332,6 +332,7 @@ pdp11_expand_prologue (void)
+   unsigned regno;
+   rtx x, via_ac = NULL;
+ 
++  // fprintf(stderr, "<pdp11_expand_prologue:target_flags %04x :pdp11_model %04x>\n", target_flags, pdp11_model);
+   /* If we are outputting code for main, the switch FPU to the
+      right mode if TARGET_FPU.  */
+   if (MAIN_NAME_P (DECL_NAME (current_function_decl)) && TARGET_FPU)
+@@ -1938,7 +1939,7 @@ pdp11_expand_shift (rtx *operands, rtx (*shift_sc) (rtx, rtx, rtx),
+ 
+   if (CONST_INT_P (operands[2]) && pdp11_small_shift (INTVAL (operands[2])))
+     emit_insn ((*shift_sc) (operands[0], operands[1], operands[2]));
+-  else if (TARGET_40_PLUS)
++  else if (SUPP_INSN_ASH)
+     return false;
+   else
+     {
+@@ -1981,7 +1982,7 @@ pdp11_assemble_shift (rtx *operands, machine_mode m, int code)
+   pdp11_action action[2];
+   const bool small = CONST_INT_P (operands[2]) && pdp11_small_shift (INTVAL (operands[2]));
+ 
+-  gcc_assert (small || !TARGET_40_PLUS);
++  gcc_assert (small || !(SUPP_INSN_ASH));
+ 
+   if (m == E_SImode)
+     {
+diff --git a/gcc/config/pdp11/pdp11.h b/gcc/config/pdp11/pdp11.h
+index eac1008..6cb021a 100644
+--- a/gcc/config/pdp11/pdp11.h
++++ b/gcc/config/pdp11/pdp11.h
+@@ -36,9 +36,9 @@ along with GCC; see the file COPYING3.  If not see
+ 	builtin_define_with_int_value ("__pdp11_int", 16);	\
+       else							\
+ 	builtin_define_with_int_value ("__pdp11_int", 32);	\
+-      if (TARGET_40)						\
++      if (TARGET_M11_40)						\
+ 	builtin_define_with_int_value ("__pdp11_model", 40);	\
+-      else if (TARGET_45)					\
++      else if (TARGET_M11_45)					\
+ 	builtin_define_with_int_value ("__pdp11_model", 45);	\
+       else							\
+ 	builtin_define_with_int_value ("__pdp11_model", 10);	\
+@@ -52,8 +52,17 @@ along with GCC; see the file COPYING3.  If not see
+ #undef PREFERRED_DEBUGGING_TYPE
+ #define PREFERRED_DEBUGGING_TYPE NO_DEBUG
+ 
+-#define TARGET_40_PLUS		(TARGET_40 || TARGET_45)
+-#define TARGET_10		(! TARGET_40_PLUS)
++#define TARGET_M11_40_PLUS		\
++    (TARGET_M11_40 || TARGET_M11_45)
++
++#define SUPP_INSN_SOB (!TARGET_M11_10)
++#define SUPP_INSN_XOR (!TARGET_M11_10)
++#define SUPP_INSN_MUL \
++    ((pdp11_model & (OPTION_MASK_M11_40| OPTION_MASK_M11_45)) != 0)
++#define SUPP_INSN_DIV \
++    ((pdp11_model & (OPTION_MASK_M11_40| OPTION_MASK_M11_45)) != 0)
++#define SUPP_INSN_ASH \
++    ((pdp11_model & (OPTION_MASK_M11_40| OPTION_MASK_M11_45)) != 0)
+ 
+ #define TARGET_UNIX_ASM_DEFAULT	0
+ 
+diff --git a/gcc/config/pdp11/pdp11.md b/gcc/config/pdp11/pdp11.md
+index 88fa832..e7cc259 100644
+--- a/gcc/config/pdp11/pdp11.md
++++ b/gcc/config/pdp11/pdp11.md
+@@ -333,7 +333,7 @@
+ 	      (set (match_dup 0)
+ 		   (plus:HI (match_dup 0)
+ 			 (const_int -1)))])]
+-  "TARGET_40_PLUS"
++  "SUPP_INSN_SOB"
+   "{
+     if (GET_MODE (operands[0]) != HImode)
+       FAIL;
+@@ -351,7 +351,7 @@
+    (set (match_dup 0)
+ 	(plus:HI (match_dup 0)
+ 		 (const_int -1)))]
+-  "TARGET_40_PLUS"
++  "SUPP_INSN_SOB"
+   "#"
+   "&& reload_completed"
+   [(parallel [(set (pc)
+@@ -380,7 +380,7 @@
+ 	(plus:HI (match_dup 0)
+ 	      (const_int -1)))
+    (clobber (reg:CC CC_REGNUM))]
+-  "TARGET_40_PLUS && reload_completed"
++  "SUPP_INSN_SOB && reload_completed"
+   "*
+ {
+  rtx lb[1];
+@@ -746,7 +746,7 @@
+     output_asm_insn (\"mov\t(%1)+,(%0)+\", operands);
+   else
+     output_asm_insn (\"movb\t(%1)+,(%0)+\", operands);
+-  if (TARGET_40_PLUS)
++  if (SUPP_INSN_SOB)
+     output_asm_insn (\"sob\t%0,%l1\", lb);
+   else
+     {
+@@ -756,7 +756,7 @@
+   return \"\";
+ }"
+   [(set (attr "length")
+-	(if_then_else (match_test "TARGET_40_PLUS")
++	(if_then_else (match_test "SUPP_INSN_SOB")
+ 		      (const_int 4)
+ 		      (const_int 6)))])
+ 
+@@ -894,7 +894,7 @@
+ (define_insn_and_split "extendhisi2"
+   [(set (match_operand:SI 0 "nonimmediate_operand" "=o,<,r")
+ 	(sign_extend:SI (match_operand:HI 1 "general_operand" "g,g,g")))]
+-  "TARGET_40_PLUS"
++  "TARGET_M11_40_PLUS"
+   "#"
+   "&& reload_completed"
+   [(parallel [(set (match_dup 0) (sign_extend:SI (match_dup 1)))
+@@ -906,7 +906,7 @@
+   [(set (match_operand:SI 0 "nonimmediate_operand" "=o,<,r")
+ 	(sign_extend:SI (match_operand:HI 1 "general_operand" "g,g,g")))
+    (clobber (reg:CC CC_REGNUM))]
+-  "TARGET_40_PLUS && reload_completed"
++  "TARGET_M11_40_PLUS && reload_completed"
+   "*
+ {
+   rtx latehalf[2];
+@@ -1541,7 +1541,7 @@
+   [(set (match_operand:HI 0 "nonimmediate_operand" "=rR,Q")
+ 	(xor:HI (match_operand:HI 1 "general_operand" "%0,0")
+ 		(match_operand:HI 2 "register_operand" "r,r")))]
+-  "TARGET_40_PLUS"
++  "SUPP_INSN_XOR"
+   "#"
+   "&& reload_completed"
+   [(parallel [(set (match_dup 0)
+@@ -1555,7 +1555,7 @@
+ 	(xor:HI (match_operand:HI 1 "general_operand" "%0,0")
+ 	     (match_operand:HI 2 "register_operand" "r,r")))
+    (clobber (reg:CC CC_REGNUM))]
+-  "TARGET_40_PLUS && reload_completed"
++  "SUPP_INSN_XOR && reload_completed"
+   "xor\t%2,%0"
+   [(set_attr "length" "2,4")])
+ 
+@@ -1668,7 +1668,7 @@
+   [(set (match_operand:HI 0 "nonimmediate_operand" "=r,r")
+ 	(ashift:HI (match_operand:HI 1 "general_operand" "0,0")
+ 	               (match_operand:HI 2 "general_operand" "rR,Qi")))]
+-  "TARGET_40_PLUS"
++  "SUPP_INSN_ASH"
+   "#"
+   "&& reload_completed"
+   [(parallel [(set (match_dup 0)
+@@ -1683,8 +1683,8 @@
+ 	(ashift:HI (match_operand:HI 1 "general_operand" "0,0")
+ 		(match_operand:HI 2 "general_operand" "rR,Qi")))
+    (clobber (reg:CC CC_REGNUM))]
+-  "TARGET_40_PLUS && reload_completed"
+-  "ash\t%2,%0"
++  "SUPP_INSN_ASH && reload_completed"
++  "ash\t%2,%0\t"
+   [(set_attr "length" "2,4")
+    (set_attr "base_cost" "8")])
+ 
+@@ -1692,7 +1692,7 @@
+   [(set (match_operand:SI 0 "nonimmediate_operand" "=r,r")
+ 	(ashift:SI (match_operand:SI 1 "general_operand" "0,0")
+ 	           (match_operand:HI 2 "general_operand" "rR,Qi")))]
+-  "TARGET_40_PLUS"
++  "SUPP_INSN_ASH"
+   "#"
+   "&& reload_completed"
+   [(parallel [(set (match_dup 0)
+@@ -1707,8 +1707,8 @@
+ 	(ashift:SI (match_operand:SI 1 "general_operand" "0,0")
+ 		(match_operand:HI 2 "general_operand" "rR,Qi")))
+    (clobber (reg:CC CC_REGNUM))]
+-  "TARGET_40_PLUS && reload_completed"
+-  "ashc\t%2,%0"
++  "SUPP_INSN_ASH && reload_completed"
++  "ashc\t%2,%0\t"
+   [(set_attr "length" "2,4")
+    (set_attr "base_cost" "8")])
+ 
+@@ -2055,7 +2055,7 @@
+   [(set (match_operand:HI 0 "register_operand" "=d,d") ; multiply regs
+ 	(mult:HI (match_operand:HI 1 "register_operand" "%0,0")
+ 		 (match_operand:HI 2 "general_operand" "rR,Qi")))]
+-  "TARGET_40_PLUS"
++  "SUPP_INSN_MUL"
+   "#"
+   "&& reload_completed"
+   [(parallel [(set (match_dup 0) (mult:HI (match_dup 1) (match_dup 2)))
+@@ -2068,7 +2068,7 @@
+ 	(mult:HI (match_operand:HI 1 "register_operand" "%0,0")
+ 	      (match_operand:HI 2 "general_operand" "rR,Qi")))
+    (clobber (reg:CC CC_REGNUM))]
+-  "TARGET_40_PLUS && reload_completed"
++  "SUPP_INSN_MUL && reload_completed"
+   "mul\t%2,%0"
+   [(set_attr "length" "2,4")
+    (set_attr "base_cost" "20")])
+@@ -2078,7 +2078,7 @@
+   [(set (match_operand:SI 0 "register_operand" "=r,r")
+ 	(mult:SI (sign_extend:SI (match_operand:HI 1 "register_operand" "%0,0"))
+ 	         (sign_extend:SI (match_operand:HI 2 "general_operand" "rR,Qi"))))]
+-  "TARGET_40_PLUS"
++  "SUPP_INSN_MUL"
+   "#"
+   "&& reload_completed"
+   [(parallel [(set (match_dup 0)
+@@ -2093,7 +2093,7 @@
+ 	(mult:SI (sign_extend:SI (match_operand:HI 1 "register_operand" "%0,0"))
+ 	      (sign_extend:SI (match_operand:HI 2 "general_operand" "rR,Qi"))))
+    (clobber (reg:CC CC_REGNUM))]
+-  "TARGET_40_PLUS && reload_completed"
++  "SUPP_INSN_MUL && reload_completed"
+   "mul\t%2,%0"
+   [(set_attr "length" "2,4")
+    (set_attr "base_cost" "20")])
+@@ -2132,7 +2132,7 @@
+         (subreg:HI (match_dup 1) 0))
+    (set (match_operand:HI 3 "register_operand" "=r")
+         (subreg:HI (match_dup 1) 2))]
+-  "TARGET_40_PLUS"
++  "SUPP_INSN_DIV"
+   "")
+ 
+ (define_insn_and_split "*divmodhi4"
+@@ -2141,7 +2141,7 @@
+ 	     (match_operand:HI 2 "general_operand" "rR,Qi")))
+    (set (subreg:HI (match_dup 1) 2)
+ 	(mod:HI (match_dup 1) (match_dup 2)))]
+-  "TARGET_40_PLUS"
++  "SUPP_INSN_DIV"
+   "#"
+   "&& reload_completed"
+   [(parallel [(set (subreg:HI (match_dup 0) 0)
+@@ -2164,7 +2164,7 @@
+    (set (subreg:HI (match_dup 1) 2)
+ 	(mod:HI (match_dup 1) (match_dup 2)))
+    (clobber (reg:CC CC_REGNUM))]
+-  "TARGET_40_PLUS"
++  "SUPP_INSN_DIV"
+    "div\t%2,%0"
+   [(set_attr "length" "2,4")
+    (set_attr "base_cost" "40")])
+@@ -2231,7 +2231,7 @@
+   [(match_operand:HI 0 "register_operand" "")
+    (match_operand:HI 1 "register_operand" "")
+    (match_operand:HI 2 "general_operand" "")]
+-  "TARGET_40_PLUS"
++  "TARGET_M11_40_PLUS"
+   "
+ {
+   operands[2] = negate_rtx (HImode, operands[2]);
+@@ -2243,7 +2243,7 @@
+   [(set (match_operand:HI 0 "register_operand" "=d,d")
+ 	(rotate:HI (match_operand:HI 1 "register_operand" "0,0")
+ 	           (match_operand:HI 2 "general_operand" "rR,Qi")))]
+-  "TARGET_40_PLUS"
++  "TARGET_M11_40_PLUS"
+   "#"
+   "&& reload_completed"
+   [(parallel [(set (match_dup 0)
+@@ -2258,7 +2258,7 @@
+ 	(rotate:HI (match_operand:HI 1 "register_operand" "0,0")
+ 		   (match_operand:HI 2 "general_operand" "rR,Qi")))
+    (clobber (reg:CC CC_REGNUM))]
+-  "TARGET_40_PLUS && reload_completed"
++  "SUPP_INSN_ASH && reload_completed"
+   "ashc\t%2,%0"
+   [(set_attr "length" "2,4")
+    (set_attr "base_cost" "8")])
+diff --git a/gcc/config/pdp11/pdp11.opt b/gcc/config/pdp11/pdp11.opt
+index 39f1e63..a7a0392 100644
+--- a/gcc/config/pdp11/pdp11.opt
++++ b/gcc/config/pdp11/pdp11.opt
+@@ -18,16 +18,28 @@
+ ; along with GCC; see the file COPYING3.  If not see
+ ; <http://www.gnu.org/licenses/>.
+ 
++; HeaderInclude
++; config/pdp11/pdp11-opts.h
++
++;; mcpu=:
++
++;; Target RejectNegative Joined Enum(target_device) Init(unk_device)
++;;S pecify the target CPU.
++
++; Bit flags that specify the PDP-11 model we are compiling for.
++Variable
++int pdp11_model = OPTION_MASK_M11_45
++
+ m10
+-Target RejectNegative
++Target RejectNegative Negative(m40) Mask(M11_10) Var(pdp11_model) Save
+ Generate code for an 11/10.
+ 
+ m40
+-Target Mask(40)
++Target RejectNegative Mask(M11_40) Negative(m45)  Var(pdp11_model) Save
+ Generate code for an 11/40.
+ 
+ m45
+-Target Mask(45)
++Target RejectNegative Mask(M11_45) Negative(m10)  Var(pdp11_model) Save
+ Generate code for an 11/45.
+ 
+ mac0
+diff --git a/gcc/testsuite/gcc.target/pdp11/mul-bis.c b/gcc/testsuite/gcc.target/pdp11/mul-bis.c
+new file mode 100644
+index 0000000..4ec61bf
+--- /dev/null
++++ b/gcc/testsuite/gcc.target/pdp11/mul-bis.c
+@@ -0,0 +1,53 @@
++/* { dg-do compile { target pdp11-*-* } } */
++/* { dg-options "-O1 -m10" } */
++/* -O1 in the options is significant. Without it some operations 
++ * may not be optimized to custom instructions. 
++ * */
++
++volatile int m1, m2, m3;
++volatile long l1, l2;
++volatile unsigned int u1, u2, u3;
++
++volatile unsigned long ul1, ul2;
++
++int test_mul01() {
++  /* { dg-final { scan-assembler "__mulhi3" } } */
++    m1 = m2 * m3 ;
++}
++int test_mul02() {
++  /* { dg-final { scan-assembler "dec\tr2" } } */
++    m3 = m1 * 1234 ;    
++}
++int test_mul06() {
++  /* { dg-final { scan-assembler "mov\tr0,_m3" } } */
++    m3 = m2 << 15;
++}
++int test_mul07() {
++  /* { dg-final { scan-assembler "asl\tr1" } } */
++    m2 = m1 << m3;
++}
++int test_div10() {
++  /* { dg-final { scan-assembler "asr\tr0" } } */
++    m3 = m2 >> 15;
++}
++int test_div11() {
++  /* { dg-final { scan-assembler "asr\tr1" } } */
++    m2 = m1 >> m3;
++} 
++int test_div12() {
++  /* { dg-final { scan-assembler "___divhi3" } } */
++    m1 = m2 / m1;
++}
++int test_div13() {
++  /* { dg-final { scan-assembler "___udivhi3" } } */
++    u1 = u2 / u3;    
++}
++int test_ne14() {
++  /* { dg-final { scan-assembler "ror\tr0" } } */
++    m3 = (m3 != m1);
++}
++int test_eq15() {
++  /* { dg-final { scan-assembler "cmp\tr2,r1" } } */
++    return (m1 == m2);
++}
++
+diff --git a/gcc/testsuite/gcc.target/pdp11/mul-eis.c b/gcc/testsuite/gcc.target/pdp11/mul-eis.c
+new file mode 100644
+index 0000000..35eed42
+--- /dev/null
++++ b/gcc/testsuite/gcc.target/pdp11/mul-eis.c
+@@ -0,0 +1,53 @@
++/* { dg-do compile { target pdp11-*-* } } */
++/* { dg-options "-O1 -m40" } */
++/* -O1 in the options is significant. Without it some operations 
++ * may not be optimized to custom instructions. 
++ * */
++
++volatile int m1, m2, m3;
++volatile long l1, l2;
++volatile unsigned int u1, u2, u3;
++
++volatile unsigned long ul1, ul2;
++
++int test_mul01() {
++  /* { dg-final { scan-assembler "mul\tr0,r1" } } */
++    m1 = m2 * m3 ;
++}
++int test_mul02() {
++  /* { dg-final { scan-assembler "ash\t.04,r0" } } */
++    m3 = m1 * 1234 ;    
++}
++int test_mul06() {
++  /* { dg-final { scan-assembler "ash\t.017,r0" } } */
++    m3 = m2 << 15;
++}
++int test_mul07() {
++  /* { dg-final { scan-assembler "ash\tr1,r0" } } */
++    m2 = m1 << m3;
++}
++int test_div10() {
++  /* { dg-final { scan-assembler "ash\t.-017,r0" } } */
++    m3 = m2 >> 15;
++}
++int test_div11() {
++  /* { dg-final { scan-assembler "ash\tr1,r0" } } */
++    m2 = m1 >> m3;
++} 
++int test_div12() {
++  /* { dg-final { scan-assembler "div\tr2,r0" } } */
++    m1 = m2 / m1;
++}
++int test_div13() {
++  /* { dg-final { scan-assembler "___udivhi3" } } */
++    u1 = u2 / u3;    
++}
++int test_ne14() {
++  /* { dg-final { scan-assembler "ror\tr0" } } */
++    m3 = (m3 != m1);
++}
++int test_eq15() {
++  /* { dg-final { scan-assembler "cmp\tr2,r1" } } */
++    return (m1 == m2);
++}
++
+diff --git a/gcc/testsuite/gcc.target/pdp11/mul-m10.c b/gcc/testsuite/gcc.target/pdp11/mul-m10.c
+new file mode 100644
+index 0000000..4ec61bf
+--- /dev/null
++++ b/gcc/testsuite/gcc.target/pdp11/mul-m10.c
+@@ -0,0 +1,53 @@
++/* { dg-do compile { target pdp11-*-* } } */
++/* { dg-options "-O1 -m10" } */
++/* -O1 in the options is significant. Without it some operations 
++ * may not be optimized to custom instructions. 
++ * */
++
++volatile int m1, m2, m3;
++volatile long l1, l2;
++volatile unsigned int u1, u2, u3;
++
++volatile unsigned long ul1, ul2;
++
++int test_mul01() {
++  /* { dg-final { scan-assembler "__mulhi3" } } */
++    m1 = m2 * m3 ;
++}
++int test_mul02() {
++  /* { dg-final { scan-assembler "dec\tr2" } } */
++    m3 = m1 * 1234 ;    
++}
++int test_mul06() {
++  /* { dg-final { scan-assembler "mov\tr0,_m3" } } */
++    m3 = m2 << 15;
++}
++int test_mul07() {
++  /* { dg-final { scan-assembler "asl\tr1" } } */
++    m2 = m1 << m3;
++}
++int test_div10() {
++  /* { dg-final { scan-assembler "asr\tr0" } } */
++    m3 = m2 >> 15;
++}
++int test_div11() {
++  /* { dg-final { scan-assembler "asr\tr1" } } */
++    m2 = m1 >> m3;
++} 
++int test_div12() {
++  /* { dg-final { scan-assembler "___divhi3" } } */
++    m1 = m2 / m1;
++}
++int test_div13() {
++  /* { dg-final { scan-assembler "___udivhi3" } } */
++    u1 = u2 / u3;    
++}
++int test_ne14() {
++  /* { dg-final { scan-assembler "ror\tr0" } } */
++    m3 = (m3 != m1);
++}
++int test_eq15() {
++  /* { dg-final { scan-assembler "cmp\tr2,r1" } } */
++    return (m1 == m2);
++}
++
+diff --git a/gcc/testsuite/gcc.target/pdp11/nosob-1110.c b/gcc/testsuite/gcc.target/pdp11/nosob-1110.c
+new file mode 100644
+index 0000000..61c5795
+--- /dev/null
++++ b/gcc/testsuite/gcc.target/pdp11/nosob-1110.c
+@@ -0,0 +1,21 @@
++/* { dg-do compile { target pdp11-*-* } } */
++/* { dg-options "-O1 -m10" } */
++/* -O1 in the options is significant. Without it some operations 
++ * may not be optimized to custom instructions. 
++ * */
++
++int test_nosob01(int n) {
++  /* { dg-final { scan-assembler "cmp\tr2,r1" } } */
++    int c = 0;
++    for(int i=0; i<n; i++)
++        c += i;
++    return c;
++}
++
++int test_nosob02(int n) {
++  /* { dg-final { scan-assembler "tst\tr1" } } */
++    int c = 0, i = n;
++    while(i)
++        c += i--;
++    return c;
++}
+diff --git a/gcc/testsuite/gcc.target/pdp11/rotate-comment.c b/gcc/testsuite/gcc.target/pdp11/rotate-comment.c
+new file mode 100644
+index 0000000..05befe0
+--- /dev/null
++++ b/gcc/testsuite/gcc.target/pdp11/rotate-comment.c
+@@ -0,0 +1,25 @@
++/* { dg-do compile { target pdp11-*-* } } */
++/* { dg-options "-O2 -m40" } */
++
++/* A 16-bit rotate is ASHC on an odd register, that being the machine's
++   own idiom: for an odd register the 32-bit operand is the register
++   twice over, so shifting it rotates.  The instruction was emitted with
++   "; limit 2261" after it, in the belief that ";" starts a comment.  It
++   does not: for this assembler ";" separates statements, so what
++   followed was read as an instruction and the assembly failed outright.
++   Any program whose compilation produced a rotate could not be built --
++   and that includes ones with no rotate written in them, a modulo by a
++   constant being enough.  */
++
++unsigned short rot (unsigned short v)
++{
++  return (unsigned short) ((v >> 3) | (v << 13));
++}
++
++unsigned short mod (unsigned short v)
++{
++  return v % 320;
++}
++
++/* { dg-final { scan-assembler "ashc\t" } } */
++/* { dg-final { scan-assembler-not ";" } } */
+diff --git a/gcc/testsuite/gcc.target/pdp11/xor-m10.c b/gcc/testsuite/gcc.target/pdp11/xor-m10.c
+new file mode 100644
+index 0000000..3193817
+--- /dev/null
++++ b/gcc/testsuite/gcc.target/pdp11/xor-m10.c
+@@ -0,0 +1,11 @@
++/* { dg-do compile { target pdp11-*-* } } */
++/* { dg-options "-O1 -m10" } */
++/* -O1 in the options is significant. Without it some operations 
++ * may not be optimized to custom instructions. 
++ * */
++
++int test_xor01(int n) {
++  /* { dg-final { scan-assembler "___xorhi3" } } */
++    return (n+1)^n;
++}
++
+-- 
+2.54.0 (Apple Git-157)
+

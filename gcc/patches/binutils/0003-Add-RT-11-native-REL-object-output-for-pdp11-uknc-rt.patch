@@ -1,0 +1,1008 @@
+From: Yury Klushin <digger@live.ru>
+Date: Tue, 1 Sep 2026 00:23:37 +0300
+Subject: [PATCH] Add RT-11 native REL object output for pdp11-uknc-rt11 (-m
+ pdp11rt11rel)
+
+New emulation, selected explicitly via `-m pdp11rt11rel`, meant to be
+used with `-r`: writes RT-11's own "Relocatable Object Language" object
+format (GSD/TXT/RLD/ENDMOD blocks, RADIX-50 names, documented in the
+RT-11 Volume and File Formats Manual) instead of an a.out-pdp11 object.
+
+Same two-stage design as pdp11rt11sav: OUTPUT_FORMAT stays
+"a.out-pdp11" so the actual `-r` link goes through a.out-pdp11's own
+proven relocation-resolution code, producing exactly the file
+`ld -r -m pdp11rt11` would; once that file is fully written,
+ld/emultempl/pdp11rt11rel.em's after_close_output hook reopens it and
+reads its symbols/relocations/section contents back with ordinary
+a.out-pdp11 BFD calls (bfd_canonicalize_symtab/reloc,
+bfd_get_section_contents), then repacks all of that into RT-11's
+native object format directly, without needing a full BFD target of
+its own for either direction.
+
+Implements: a RADIX-50 codec (6-char uppercase names, non-representable
+characters such as C's leading '_' folded to '.'); GSD emission (module
+name, one p-sect entry per .text/.data/.bss immediately followed by the
+global symbols defined in it, then .ABS. followed by undefined global
+references); TXT blocks chunked to 128 bytes (an RLD entry's
+displacement byte only covers 0-255, relative to the immediately
+preceding TXT block's own load address); and RLD entries covering all
+three relocation kinds RT-11 distinguishes -- Internal (same p-sect),
+P-sect (a different p-sect), and Global (external symbol) -- in both
+their plain and additive/displaced forms, decided from the raw content
+word already sitting at each relocation's address (a.out-pdp11 has no
+separate stored addend) plus which of the three known sections the
+target symbol's own section-relative dummy symbol resolves to.
+
+Verified against the RADIX-50/GSD/RLD field layouts in the RT-11
+manual with an independent Python decoder (checksums, symbol names,
+section sizes, and relocation classification all confirmed correct)
+on a real two-object `-r` link exercising a still-undefined external
+symbol (___main), a same-section reference, and cross-section
+references in both directions.
+
+Includes what was a separate fix on top of this one, now part of it:
+
+Fix pdp11rt11rel truncating the file it was still reading
+
+pdp11rel_write opened the linked output "wb" to write the REL module
+over it, while ibfd was still open on that same path: rel_write_section
+reads each section's contents and relocations out of it as it goes.
+Every read past the point BFD had already cached failed with "file
+truncated", so whether a link worked depended on file size and section
+order -- it surfaced as an intermittent failure on a PPU program that
+had merely grown a little.
+
+Write to a temporary file and rename it over the original once the
+reader is done with it.
+---
+ ld/Makefile.am                |   1 +
+ ld/Makefile.in                |   2 +
+ ld/configure.tgt              |   2 +-
+ ld/emulparams/pdp11rt11rel.sh |  23 +
+ ld/emultempl/pdp11rt11rel.em  | 859 ++++++++++++++++++++++++++++++++++
+ 5 files changed, 886 insertions(+), 1 deletion(-)
+ create mode 100644 ld/emulparams/pdp11rt11rel.sh
+ create mode 100644 ld/emultempl/pdp11rt11rel.em
+
+diff --git a/ld/Makefile.am b/ld/Makefile.am
+index a2b9636..302fc62 100644
+--- a/ld/Makefile.am
++++ b/ld/Makefile.am
+@@ -337,6 +337,7 @@ ALL_EMULATION_SOURCES = \
+ 	epc532macha.c \
+ 	epdp11.c \
+ 	epdp11rt11.c \
++	epdp11rt11rel.c \
+ 	epdp11rt11sav.c \
+ 	epjelf.c \
+ 	epjlelf.c \
+diff --git a/ld/Makefile.in b/ld/Makefile.in
+index 065d030..e5463f7 100644
+--- a/ld/Makefile.in
++++ b/ld/Makefile.in
+@@ -848,6 +848,7 @@ ALL_EMULATION_SOURCES = \
+ 	epc532macha.c \
+ 	epdp11.c \
+ 	epdp11rt11.c \
++	epdp11rt11rel.c \
+ 	epdp11rt11sav.c \
+ 	epjelf.c \
+ 	epjlelf.c \
+@@ -1547,6 +1548,7 @@ distclean-compile:
+ @AMDEP_TRUE@@am__include@ @am__quote@./$(DEPDIR)/epc532macha.Po@am__quote@
+ @AMDEP_TRUE@@am__include@ @am__quote@./$(DEPDIR)/epdp11.Po@am__quote@
+ @AMDEP_TRUE@@am__include@ @am__quote@./$(DEPDIR)/epdp11rt11.Po@am__quote@
++@AMDEP_TRUE@@am__include@ @am__quote@./$(DEPDIR)/epdp11rt11rel.Po@am__quote@
+ @AMDEP_TRUE@@am__include@ @am__quote@./$(DEPDIR)/epdp11rt11sav.Po@am__quote@
+ @AMDEP_TRUE@@am__include@ @am__quote@./$(DEPDIR)/epjelf.Po@am__quote@
+ @AMDEP_TRUE@@am__include@ @am__quote@./$(DEPDIR)/epjlelf.Po@am__quote@
+diff --git a/ld/configure.tgt b/ld/configure.tgt
+index 089fb56..e891e20 100644
+--- a/ld/configure.tgt
++++ b/ld/configure.tgt
+@@ -682,7 +682,7 @@ or1k-*-elf | or1knd-*-elf | or1k-*-rtems* | or1knd-*-rtems*)
+ or1k-*-linux* | or1knd-*-linux*)	targ_emul=elf32or1k_linux
+ 			;;
+ pdp11-*-rt11*)		targ_emul=pdp11rt11sav
+-			targ_extra_emuls="pdp11rt11 pdp11"
++			targ_extra_emuls="pdp11rt11 pdp11 pdp11rt11rel"
+ 			targ_extra_ofiles=
+ 			;;
+ pdp11-*-*)		targ_emul=pdp11
+diff --git a/ld/emulparams/pdp11rt11rel.sh b/ld/emulparams/pdp11rt11rel.sh
+new file mode 100644
+index 0000000..823bdbc
+--- /dev/null
++++ b/ld/emulparams/pdp11rt11rel.sh
+@@ -0,0 +1,23 @@
++# Extra emulation for pdp11-*-rt11* targets, selected explicitly via
++# `-m pdp11rt11rel`: produce a relocatable RT-11 object module (the
++# native DEC "Relocatable Object Language" format documented in the
++# RT-11 Volume and File Formats Manual -- GSD/TXT/RLD/ENDMOD blocks,
++# RADIX-50 names) instead of an a.out-pdp11 object.
++#
++# Like pdp11rt11sav, OUTPUT_FORMAT is deliberately "a.out-pdp11", not a
++# format of its own: linking goes through a.out-pdp11's own specialized,
++# proven-correct relocatable-link path (pdp11_aout_link_input_section in
++# bfd/pdp11.c, in its `if (relocatable)` branch -- this emulation is
++# meant to be used with `-r`), producing exactly the file
++# `ld -r -m pdp11rt11` would.  Once that file is fully written to disk,
++# emultempl/pdp11rt11rel.em's after_close_output hook reads its symbols,
++# relocations and section contents back with ordinary a.out-pdp11 BFD
++# calls and repacks them into the RT-11 object format in place.  See the
++# comment on gld${EMULATION_NAME}_after_close_output in that file for
++# the full story.
++SCRIPT_NAME=pdp11rt11
++OUTPUT_FORMAT="a.out-pdp11"
++TEXT_START_ADDR=512
++EXTRA_EM_FILE=pdp11rt11rel
++ARCH=pdp11
++ENTRY=start
+diff --git a/ld/emultempl/pdp11rt11rel.em b/ld/emultempl/pdp11rt11rel.em
+new file mode 100644
+index 0000000..d0f9f4f
+--- /dev/null
++++ b/ld/emultempl/pdp11rt11rel.em
+@@ -0,0 +1,859 @@
++# This shell script emits a C file. -*- C -*-
++#   Copyright (C) 2026 Free Software Foundation, Inc.
++#
++# This file is part of the GNU Binutils.
++#
++# This program is free software; you can redistribute it and/or modify
++# it under the terms of the GNU General Public License as published by
++# the Free Software Foundation; either version 3 of the License, or
++# (at your option) any later version.
++#
++# This program is distributed in the hope that it will be useful,
++# but WITHOUT ANY WARRANTY; without even the implied warranty of
++# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++# GNU General Public License for more details.
++#
++# You should have received a copy of the GNU General Public License
++# along with this program; if not, write to the Free Software
++# Foundation, Inc., 51 Franklin Street - Fifth Floor, Boston,
++# MA 02110-1301, USA.
++#
++# This is pdp11.em (same PDP11-Unix-compatible --omagic/--imagic option
++# handling as the plain pdp11/pdp11rt11 emulations) plus one extra hook:
++# after_close_output, which converts a `-r` link's a.out-pdp11 output
++# into the native RT-11 relocatable object format ("REL": GSD/TXT/RLD/
++# ENDMOD blocks -- see the big comment on that function below).
++
++fragment <<EOF
++
++/* --- \begin{pdp11rt11rel.em} */
++#include "libiberty.h"
++#include "getopt.h"
++#include <errno.h>
++
++static void
++gld${EMULATION_NAME}_before_parse (void)
++{
++  ldfile_set_output_arch ("`echo ${ARCH}`", bfd_arch_unknown);
++  /* for PDP11 Unix compatibility, default to --omagic */
++  config.magic_demand_paged = false;
++  config.text_read_only = false;
++}
++
++/* PDP11 specific options.  */
++#define OPTION_IMAGIC 301
++
++static void
++gld${EMULATION_NAME}_add_options
++  (int ns ATTRIBUTE_UNUSED,
++   char **shortopts,
++   int nl,
++   struct option **longopts,
++   int nrl ATTRIBUTE_UNUSED,
++   struct option **really_longopts ATTRIBUTE_UNUSED)
++{
++  static const char xtra_short[] = "z";
++  static const struct option xtra_long[] =
++  {
++    {"imagic", no_argument, NULL, OPTION_IMAGIC},
++    {NULL, no_argument, NULL, 0}
++  };
++
++  *shortopts = (char *) xrealloc (*shortopts, ns + sizeof (xtra_short));
++  memcpy (*shortopts + ns, &xtra_short, sizeof (xtra_short));
++  *longopts
++    = xrealloc (*longopts, nl * sizeof (struct option) + sizeof (xtra_long));
++  memcpy (*longopts + nl, &xtra_long, sizeof (xtra_long));
++}
++
++static void
++gld${EMULATION_NAME}_list_options (FILE *file)
++{
++  fprintf (file, _("  -N, --omagic   Do not make text readonly, do not page align data (default)\n"));
++  fprintf (file, _("  -n, --nmagic   Make text readonly, align data to next page\n"));
++  fprintf (file, _("  -z, --imagic   Make text readonly, separate instruction and data spaces\n"));
++  fprintf (file, _("  --no-omagic    Equivalent to --nmagic\n"));
++}
++
++static bool
++gld${EMULATION_NAME}_handle_option (int optc)
++{
++  switch (optc)
++    {
++    default:
++      return false;
++
++    case 'z':
++    case OPTION_IMAGIC:
++      link_info.separate_code = 1;
++      command_line.check_section_addresses = 0;
++      break;
++    }
++
++  return true;
++}
++
++static char *
++gld${EMULATION_NAME}_get_script (int *isfile)
++EOF
++
++if test x"$COMPILE_IN" = xyes
++then
++# Scripts compiled in.
++
++sc="-f ${srcdir}/emultempl/stringify.sed"
++
++fragment <<EOF
++{
++  *isfile = 0;
++
++  if (bfd_link_relocatable (&link_info) && config.build_constructors)
++    return
++EOF
++sed $sc ldscripts/${EMULATION_NAME}.xu			>> e${EMULATION_NAME}.c
++echo '  ; else if (bfd_link_relocatable (&link_info)) return' >> e${EMULATION_NAME}.c
++sed $sc ldscripts/${EMULATION_NAME}.xr			>> e${EMULATION_NAME}.c
++echo '  ; else if (link_info.separate_code) return'	>> e${EMULATION_NAME}.c
++sed $sc ldscripts/${EMULATION_NAME}.xe			>> e${EMULATION_NAME}.c
++echo '  ; else if (!config.text_read_only) return'	>> e${EMULATION_NAME}.c
++sed $sc ldscripts/${EMULATION_NAME}.xbn			>> e${EMULATION_NAME}.c
++echo '  ; else if (!config.magic_demand_paged) return'	>> e${EMULATION_NAME}.c
++sed $sc ldscripts/${EMULATION_NAME}.xn			>> e${EMULATION_NAME}.c
++echo '  ; else return'					>> e${EMULATION_NAME}.c
++sed $sc ldscripts/${EMULATION_NAME}.x			>> e${EMULATION_NAME}.c
++echo '; }'						>> e${EMULATION_NAME}.c
++
++else
++# Scripts read from the filesystem.
++
++fragment <<EOF
++{
++  *isfile = 1;
++
++  if (bfd_link_relocatable (&link_info) && config.build_constructors)
++    return "ldscripts/${EMULATION_NAME}.xu";
++  else if (bfd_link_relocatable (&link_info))
++    return "ldscripts/${EMULATION_NAME}.xr";
++  else if (link_info.separate_code)
++    return "ldscripts/${EMULATION_NAME}.xe";
++  else if (!config.text_read_only)
++    return "ldscripts/${EMULATION_NAME}.xbn";
++  else if (!config.magic_demand_paged)
++    return "ldscripts/${EMULATION_NAME}.xn";
++  else
++    return "ldscripts/${EMULATION_NAME}.x";
++}
++EOF
++fi
++
++fragment <<EOF
++
++/* ==================================================================
++   RT-11 native relocatable object format ("REL": GSD/TXT/RLD/ENDMOD
++   blocks, RADIX-50 names) writer.
++
++   Field layouts and semantics below are all taken directly from the
++   "RT-11 Volume and File Formats Manual" (DEC, AA-PD6PA-TC), chapter 2
++   -- not guessed at.  Nothing in this project's own toolchain or test
++   setup ever reads this format back: it exists purely so \`ld -r -m
++   ${EMULATION_NAME}\` can emit a module in RT-11's own native
++   relocatable object representation, mirroring how pdp11rt11sav emits
++   RT-11's native *executable* representation (SAV).  Both work the
++   same way: link for real through a.out-pdp11's own proven relocation
++   code first (final link for SAV, \`-r\` link for this), then repack
++   the result -- here, by reading it back with ordinary a.out-pdp11 BFD
++   calls (bfd_canonicalize_symtab/reloc, bfd_get_section_contents; all
++   already fully working on the read side) and re-emitting it block by
++   block, rather than trying to make a from-scratch BFD target
++   understand this format on both ends.
++
++   RADIX-50: 6-character, uppercase-only symbol names (space=0, A-Z=1-
++   26, $=27, .=28, 0-9=36-45; two characters -- 29,30,31,35 -- unused),
++   3 characters packed per word as ((c1*50)+c2)*50+c3 (the "50" is
++   octal, i.e. base 40 decimal).  C identifiers longer than 6 characters
++   are simply truncated, and any character outside the RADIX-50 alphabet
++   (starting with '_', ubiquitous in C names) is mapped to '.' -- a
++   real, unavoidable lossy-compatibility limitation of this 1970s
++   format, not a bug: RT-11's own linker has no other way to spell a
++   global symbol name.
++
++   "Formatted binary block" framing (every block below): a byte 1, a
++   byte 0, a little-endian 16-bit length (covering everything except
++   the trailing checksum byte), the data bytes themselves (whose first
++   word is always a data-block-type code), and a checksum byte that is
++   the negative of the sum of every preceding byte in the block.
++
++   Symbol scope: only GLOBAL symbols can be represented at all -- RT-11
++   object modules have an Internal Symbol Directory (ISD) block type
++   for local symbols, but "the Linker does not support internal symbol
++   tables ... if the Linker encounters an internal symbol entry while
++   reading the GSD, it ignores it" (manual, section 2.2.1.3), so this
++   writer does not bother emitting ISD blocks at all.  This is exactly
++   right for C: a \`static\` symbol has no business being visible to a
++   separate link anyway.
++
++   Relocation model: RLD entries come in "direct" and "displaced" (PC-
++   relative) pairs, each further split into three cases depending on
++   what the reference resolves to -- Internal (same p-sect: the addend
++   in the RLD entry itself *is* the target offset, no separate "plain
++   vs additive" distinction needed), P-sect (a named p-sect other than
++   the one currently being written: plain 12/14 if the offset is zero,
++   additive 15/16 with an explicit constant otherwise), and Global (an
++   external symbol: plain 2/4 if zero offset, additive 5/6 otherwise).
++   Since a.out-pdp11 relocations carry their addend as the raw word
++   already sitting in the section content at that position (there is no
++   separate stored-addend field -- the same implicit-addend convention
++   pdp11_aout_link_input_section itself relies on), that raw word is
++   exactly what decides plain-vs-additive and supplies the constant.
++
++   TXT block chunking: an RLD entry's displacement byte is only one
++   byte (0-255), relative to the *immediately preceding* TXT block's own
++   load address -- so section content is chunked into REL_TXT_CHUNK
++   pieces well under that limit, each with its own load address, rather
++   than emitted as one large blob.  */
++
++#include "bfdlink.h"
++#include <ctype.h>
++
++#define REL_TXT_CHUNK 128
++
++/* Data block type codes (manual, Table 2-1).  */
++#define REL_BLK_GSD	1
++#define REL_BLK_ENDGSD	2
++#define REL_BLK_TXT	3
++#define REL_BLK_RLD	4
++#define REL_BLK_ENDMOD	6
++
++/* GSD entry types (manual, Table 2-2).  */
++#define REL_GSD_MODNAME	0
++#define REL_GSD_PSECT	5
++#define REL_GSD_GLOBAL	4
++
++/* GSD Global Symbol Name flag bits (manual, Table 2-3).  */
++#define REL_GFLAG_DEF	0x08	/* Bit 3: 1 = definition, 0 = reference.  */
++#define REL_GFLAG_REL	0x20	/* Bit 5: 1 = relative value.  */
++
++/* GSD P-sect Name flag bits (manual, Table 2-4).  */
++#define REL_PFLAG_REL	0x20	/* Bit 5: 1 = relocatable p-sect.  */
++#define REL_PFLAG_GBL	0x40	/* Bit 6: 1 = global scope.  */
++#define REL_PFLAG_DATA	0x80	/* Bit 7: 1 = data (D), 0 = instruction (I).  */
++
++/* RLD entry types (manual, Table 2-5).  */
++#define REL_RLD_INTERNAL	1
++#define REL_RLD_GLOBAL		2
++#define REL_RLD_INTERNAL_DISP	3
++#define REL_RLD_GLOBAL_DISP	4
++#define REL_RLD_GLOBAL_ADD	5
++#define REL_RLD_GLOBAL_ADD_DISP	6
++#define REL_RLD_LOCCTR_DEF	7
++#define REL_RLD_PSECT		12
++#define REL_RLD_PSECT_DISP	14
++#define REL_RLD_PSECT_ADD	15
++#define REL_RLD_PSECT_ADD_DISP	16
++
++/* ---- RADIX-50 ---- */
++
++/* Value of one character in the RADIX-50 alphabet, or -1 if it has no
++   representation (mapped to '.' by the caller before this is reached
++   for anything but the initial classification).  */
++
++static int
++rad50_value (char c)
++{
++  if (c == ' ')
++    return 0;
++  if (c >= 'A' && c <= 'Z')
++    return 1 + (c - 'A');
++  if (c == '\$')
++    return 27;
++  if (c == '.')
++    return 28;
++  if (c >= '0' && c <= '9')
++    return 36 + (c - '0');
++  return -1;
++}
++
++/* Pack up to 6 characters of NAME into 4 bytes (2 little-endian
++   RADIX-50 words) at OUT.  Longer names are truncated; characters
++   outside the RADIX-50 alphabet (starting with the universal case,
++   '_') are folded to '.'; lowercase letters are uppercased first.  */
++
++static void
++rad50_pack6 (const char *name, bfd_byte *out)
++{
++  char chars[6];
++  size_t i, len;
++  unsigned int word0, word1;
++
++  len = name != NULL ? strlen (name) : 0;
++  for (i = 0; i < 6; i++)
++    {
++      char c = (i < len) ? name[i] : ' ';
++      int v;
++
++      if (c >= 'a' && c <= 'z')
++	c = (char) toupper ((unsigned char) c);
++      v = rad50_value (c);
++      if (v < 0)
++	{
++	  /* Not representable (e.g. '_', common in C names) -- fold to
++	     '.', itself a valid RADIX-50 character.  */
++	  c = '.';
++	}
++      chars[i] = c;
++    }
++
++  /* The "50" in the packing formula is octal (= 40 decimal); write it
++     as decimal 40 directly rather than as a C literal that could be
++     misread as octal 050.  */
++  word0 = (unsigned int) (((rad50_value (chars[0]) * 40)
++			    + rad50_value (chars[1])) * 40
++			   + rad50_value (chars[2]));
++  word1 = (unsigned int) (((rad50_value (chars[3]) * 40)
++			    + rad50_value (chars[4])) * 40
++			   + rad50_value (chars[5]));
++
++  bfd_putl16 (word0, out);
++  bfd_putl16 (word1, out + 2);
++}
++
++/* ---- Growable byte buffer, used to build one data block's payload
++   (everything after the "1,0,length" framing prefix, i.e. starting
++   with the data-block-type word) before it is checksummed and
++   flushed.  ---- */
++
++struct relbuf
++{
++  bfd_byte *data;
++  size_t len;
++  size_t cap;
++};
++
++static void
++relbuf_init (struct relbuf *b)
++{
++  b->cap = 256;
++  b->data = (bfd_byte *) xmalloc (b->cap);
++  b->len = 0;
++}
++
++static void
++relbuf_reserve (struct relbuf *b, size_t more)
++{
++  if (b->len + more > b->cap)
++    {
++      while (b->len + more > b->cap)
++	b->cap *= 2;
++      b->data = (bfd_byte *) xrealloc (b->data, b->cap);
++    }
++}
++
++static void
++relbuf_byte (struct relbuf *b, unsigned int v)
++{
++  relbuf_reserve (b, 1);
++  b->data[b->len++] = (bfd_byte) v;
++}
++
++static void
++relbuf_word (struct relbuf *b, unsigned int v)
++{
++  relbuf_reserve (b, 2);
++  bfd_putl16 (v, b->data + b->len);
++  b->len += 2;
++}
++
++static void
++relbuf_name (struct relbuf *b, const char *name)
++{
++  relbuf_reserve (b, 4);
++  rad50_pack6 (name, b->data + b->len);
++  b->len += 4;
++}
++
++static void
++relbuf_bytes (struct relbuf *b, const void *p, size_t n)
++{
++  relbuf_reserve (b, n);
++  memcpy (b->data + b->len, p, n);
++  b->len += n;
++}
++
++static void
++relbuf_free (struct relbuf *b)
++{
++  free (b->data);
++  b->data = NULL;
++  b->len = b->cap = 0;
++}
++
++/* Write BUF (a complete data-block payload, starting with its type
++   word) out to F as one "formatted binary block": the 1,0,length
++   framing prefix, the payload itself, and a trailing checksum byte
++   (the negative of the sum of every preceding byte).  Does not free or
++   clear BUF -- callers that reuse one relbuf for several blocks (GSD
++   entries, in particular) do that themselves.  */
++
++static bool
++relbuf_flush (FILE *f, const struct relbuf *b)
++{
++  bfd_byte prefix[4];
++  unsigned int sum = 0;
++  bfd_byte checksum;
++  size_t i;
++
++  bfd_putl16 ((unsigned int) (b->len + 4), prefix + 2);
++  prefix[0] = 1;
++  prefix[1] = 0;
++
++  if (fwrite (prefix, 1, 4, f) != 4)
++    return false;
++  if (b->len != 0 && fwrite (b->data, 1, b->len, f) != b->len)
++    return false;
++
++  for (i = 0; i < 4; i++)
++    sum += prefix[i];
++  for (i = 0; i < b->len; i++)
++    sum += b->data[i];
++  checksum = (bfd_byte) (0x100 - (sum & 0xff));
++
++  return fwrite (&checksum, 1, 1, f) == 1;
++}
++
++/* Write a single-word data block (ENDGSD or ENDMOD -- just a type
++   code, no payload) directly, without needing a relbuf.  */
++
++static bool
++relbuf_flush_bare (FILE *f, unsigned int block_type)
++{
++  struct relbuf b;
++  bool ok;
++
++  relbuf_init (&b);
++  relbuf_word (&b, block_type);
++  ok = relbuf_flush (f, &b);
++  relbuf_free (&b);
++  return ok;
++}
++
++/* ---- The three p-sects this writer ever declares, matching this
++   toolchain's fixed .text/.data/.bss model (plus the special .ABS.
++   p-sect the manual says undefined global references must be declared
++   under).  ---- */
++
++enum rel_psect_kind { PSECT_TEXT, PSECT_DATA, PSECT_BSS, PSECT_ABS, PSECT_NONE };
++
++struct rel_psect_info
++{
++  const char *name;
++  asection *sec;	/* NULL for .ABS.  */
++  unsigned int flags;
++};
++
++/* Classify a relocation's target symbol: which of our own p-sects (if
++   any) it is a section-relative reference to, matching the special
++   per-section dummy symbols a.out-pdp11's own reloc reader
++   (pdp11_aout_swap_reloc_in / MOVE_ADDRESS in bfd/pdp11.c) hands back
++   for section-relative relocs, versus a real external symbol.  */
++
++static enum rel_psect_kind
++rel_classify_symbol (asymbol *sym, struct rel_psect_info *psects)
++{
++  int i;
++
++  if ((sym->flags & BSF_SECTION_SYM) == 0)
++    return PSECT_NONE;
++
++  for (i = 0; i < 3; i++)
++    if (psects[i].sec != NULL && bfd_asymbol_section (sym) == psects[i].sec)
++      return (enum rel_psect_kind) i;
++
++  if (bfd_is_abs_section (bfd_asymbol_section (sym)))
++    return PSECT_ABS;
++
++  return PSECT_NONE;
++}
++
++/* Emit the GSD block(s): module name, then each p-sect immediately
++   followed by the global symbols defined within it (manual: "all
++   global symbol definitions pertaining to [a p-sect] must appear ...
++   before another p-sect name is declared"), then .ABS. followed by
++   every undefined (referenced-but-not-defined) global.  A single GSD
++   block is enough here -- nothing in this module's expected symbol
++   count is likely to overflow one formatted-binary-block's 16-bit
++   length, and if it ever does, bfd_write below will simply fail
++   loudly rather than silently truncate.  */
++
++static bool
++rel_write_gsd (FILE *f, const char *modname, asymbol **syms, long symcount,
++	       struct rel_psect_info *psects)
++{
++  struct relbuf b;
++  int i;
++  long s;
++
++  relbuf_init (&b);
++  relbuf_word (&b, REL_BLK_GSD);
++
++  relbuf_name (&b, modname);
++  relbuf_word (&b, REL_GSD_MODNAME);
++  relbuf_word (&b, 0);
++
++  for (i = 0; i < 3; i++)
++    {
++      relbuf_name (&b, psects[i].name);
++      relbuf_word (&b, (unsigned int) (REL_GSD_PSECT | (psects[i].flags << 8)));
++      relbuf_word (&b, (unsigned int) psects[i].sec->size);
++
++      for (s = 0; s < symcount; s++)
++	{
++	  asymbol *sym = syms[s];
++
++	  if ((sym->flags & (BSF_GLOBAL | BSF_WEAK)) == 0)
++	    continue;
++	  if (bfd_asymbol_section (sym) != psects[i].sec)
++	    continue;
++
++	  relbuf_name (&b, bfd_asymbol_name (sym));
++	  relbuf_word (&b, (unsigned int)
++			    (REL_GSD_GLOBAL
++			     | ((REL_GFLAG_DEF | REL_GFLAG_REL) << 8)));
++	  relbuf_word (&b, (unsigned int) sym->value);
++	}
++    }
++
++  /* .ABS.: declare it (size 0, absolute -- REL_PFLAG_REL left clear),
++     then every undefined global reference under it, per the manual.  */
++  relbuf_name (&b, ".ABS.");
++  relbuf_word (&b, (unsigned int) (REL_GSD_PSECT | (REL_PFLAG_GBL << 8)));
++  relbuf_word (&b, 0);
++
++  for (s = 0; s < symcount; s++)
++    {
++      asymbol *sym = syms[s];
++
++      if (!bfd_is_und_section (bfd_asymbol_section (sym)))
++	continue;
++      if ((sym->flags & BSF_SECTION_SYM) != 0)
++	continue;
++
++      relbuf_name (&b, bfd_asymbol_name (sym));
++      relbuf_word (&b, (unsigned int) (REL_GSD_GLOBAL | (0 << 8)));
++      relbuf_word (&b, 0);
++    }
++
++  {
++    bool ok = relbuf_flush (f, &b);
++    relbuf_free (&b);
++    return ok && relbuf_flush_bare (f, REL_BLK_ENDGSD);
++  }
++}
++
++/* Emit the RLD/TXT block sequence for one p-sect's content: an initial
++   Location Counter Definition, then TXT chunks of at most
++   REL_TXT_CHUNK bytes each, each optionally followed by an RLD block
++   covering the relocations that fall within it.  */
++
++static bool
++rel_write_section (FILE *f, bfd *ibfd, struct rel_psect_info *psect,
++		    struct rel_psect_info *psects, asymbol **syms)
++{
++  asection *sec = psect->sec;
++  bfd_size_type size = sec->size;
++  bfd_byte *contents = NULL;
++  arelent **relpp = NULL;
++  long relcount = 0;
++  bfd_size_type chunk_start;
++  struct relbuf b;
++  bool ok = true;
++
++  /* Location Counter Definition: establishes the current p-sect for
++     the TXT/RLD blocks that follow (manual, 2.2.4.7).  Its own
++     displacement byte is unused (always 0).  */
++  relbuf_init (&b);
++  relbuf_word (&b, REL_BLK_RLD);
++  relbuf_byte (&b, 0);
++  relbuf_byte (&b, REL_RLD_LOCCTR_DEF);
++  relbuf_name (&b, psect->name);
++  relbuf_word (&b, 0);
++  ok = relbuf_flush (f, &b);
++  relbuf_free (&b);
++  if (!ok || size == 0)
++    return ok;
++
++  contents = (bfd_byte *) xmalloc (size);
++  if (!bfd_get_section_contents (ibfd, sec, contents, 0, size))
++    fatal (_("%P: %s: cannot read section \`%pA': %E\n"),
++	   bfd_get_filename (ibfd), sec);
++
++  if ((sec->flags & SEC_RELOC) != 0 && sec->reloc_count != 0)
++    {
++      long relsize = bfd_get_reloc_upper_bound (ibfd, sec);
++
++      if (relsize < 0)
++	fatal (_("%P: %s: cannot get relocation size for \`%pA': %E\n"),
++	       bfd_get_filename (ibfd), sec);
++      if (relsize > 0)
++	{
++	  relpp = (arelent **) xmalloc ((size_t) relsize);
++	  relcount = bfd_canonicalize_reloc (ibfd, sec, relpp, syms);
++	  if (relcount < 0)
++	    fatal (_("%P: %s: cannot read relocations for \`%pA': %E\n"),
++		   bfd_get_filename (ibfd), sec);
++	}
++    }
++
++  for (chunk_start = 0; chunk_start < size; chunk_start += REL_TXT_CHUNK)
++    {
++      bfd_size_type chunk_len = size - chunk_start;
++      long r;
++
++      if (chunk_len > REL_TXT_CHUNK)
++	chunk_len = REL_TXT_CHUNK;
++
++      relbuf_init (&b);
++      relbuf_word (&b, REL_BLK_TXT);
++      relbuf_word (&b, (unsigned int) chunk_start);
++      relbuf_bytes (&b, contents + chunk_start, (size_t) chunk_len);
++      ok = relbuf_flush (f, &b);
++      relbuf_free (&b);
++      if (!ok)
++	goto out;
++
++      relbuf_init (&b);
++      relbuf_word (&b, REL_BLK_RLD);
++
++      for (r = 0; r < relcount; r++)
++	{
++	  arelent *rel = relpp[r];
++	  bfd_vma addr = rel->address;
++	  unsigned int disp;
++	  bool pcrel;
++	  unsigned int constant;
++	  asymbol *sym;
++	  enum rel_psect_kind kind;
++
++	  if (addr < chunk_start || addr >= chunk_start + chunk_len)
++	    continue;
++
++	  disp = (unsigned int) (addr - chunk_start);
++	  pcrel = rel->howto != NULL && rel->howto->pc_relative;
++	  constant = bfd_getl16 (contents + addr);
++	  sym = *rel->sym_ptr_ptr;
++	  kind = rel_classify_symbol (sym, psects);
++
++	  if (kind == PSECT_NONE)
++	    {
++	      /* A real external symbol.  */
++	      const char *name = bfd_asymbol_name (sym);
++
++	      if (constant == 0)
++		{
++		  relbuf_byte (&b, disp);
++		  relbuf_byte (&b, pcrel ? REL_RLD_GLOBAL_DISP : REL_RLD_GLOBAL);
++		  relbuf_name (&b, name);
++		}
++	      else
++		{
++		  relbuf_byte (&b, disp);
++		  relbuf_byte (&b, pcrel
++				    ? REL_RLD_GLOBAL_ADD_DISP : REL_RLD_GLOBAL_ADD);
++		  relbuf_name (&b, name);
++		  relbuf_word (&b, constant);
++		}
++	    }
++	  else if (kind == (enum rel_psect_kind) (psect - psects))
++	    {
++	      /* Same p-sect as the one we're currently writing.  */
++	      relbuf_byte (&b, disp);
++	      relbuf_byte (&b, pcrel
++				? REL_RLD_INTERNAL_DISP : REL_RLD_INTERNAL);
++	      relbuf_word (&b, constant);
++	    }
++	  else
++	    {
++	      /* A different p-sect (including .ABS., kind == PSECT_ABS,
++		 which has no rel_psect_info entry of its own -- use its
++		 fixed name directly).  */
++	      const char *pname
++		= (kind == PSECT_ABS) ? ".ABS." : psects[(int) kind].name;
++
++	      if (constant == 0)
++		{
++		  relbuf_byte (&b, disp);
++		  relbuf_byte (&b, pcrel ? REL_RLD_PSECT_DISP : REL_RLD_PSECT);
++		  relbuf_name (&b, pname);
++		}
++	      else
++		{
++		  relbuf_byte (&b, disp);
++		  relbuf_byte (&b, pcrel
++				    ? REL_RLD_PSECT_ADD_DISP : REL_RLD_PSECT_ADD);
++		  relbuf_name (&b, pname);
++		  relbuf_word (&b, constant);
++		}
++	    }
++	}
++
++      if (b.len > 2)
++	ok = relbuf_flush (f, &b);
++      relbuf_free (&b);
++      if (!ok)
++	goto out;
++    }
++
++ out:
++  free (contents);
++  free (relpp);
++  return ok;
++}
++
++/* Read the just-linked (\`-r\`) a.out-pdp11 file back with ordinary BFD
++   calls and write it out as an RT-11 native relocatable object module
++   (GSD/TXT/RLD/ENDMOD).  See the big block comment above for the full
++   design.  */
++
++static bool
++pdp11rel_write (bfd *ibfd, const char *filename)
++{
++  FILE *f;
++  asymbol **syms = NULL;
++  long symcount;
++  struct rel_psect_info psects[3];
++  const char *base;
++  char *tmpname;
++  char modname[7];
++  size_t i;
++  bool ok;
++
++  psects[PSECT_TEXT].name = ".text";
++  psects[PSECT_TEXT].sec = bfd_get_section_by_name (ibfd, ".text");
++  psects[PSECT_TEXT].flags = REL_PFLAG_REL | REL_PFLAG_GBL;
++  psects[PSECT_DATA].name = ".data";
++  psects[PSECT_DATA].sec = bfd_get_section_by_name (ibfd, ".data");
++  psects[PSECT_DATA].flags = REL_PFLAG_REL | REL_PFLAG_GBL | REL_PFLAG_DATA;
++  psects[PSECT_BSS].name = ".bss";
++  psects[PSECT_BSS].sec = bfd_get_section_by_name (ibfd, ".bss");
++  psects[PSECT_BSS].flags = REL_PFLAG_REL | REL_PFLAG_GBL | REL_PFLAG_DATA;
++
++  for (i = 0; i < 3; i++)
++    if (psects[i].sec == NULL)
++      fatal (_("%P: %s: missing \`%s' section after linking\n"),
++	     filename, psects[i].name);
++
++  {
++    long storage = bfd_get_symtab_upper_bound (ibfd);
++
++    if (storage < 0)
++      fatal (_("%P: %s: cannot get symbol table size: %E\n"), filename);
++    if (storage > 0)
++      {
++	syms = (asymbol **) xmalloc ((size_t) storage);
++	symcount = bfd_canonicalize_symtab (ibfd, syms);
++	if (symcount < 0)
++	  fatal (_("%P: %s: cannot read symbol table: %E\n"), filename);
++      }
++    else
++      symcount = 0;
++  }
++
++  /* Module name: the output file's own base name, RADIX-50 truncated
++     like everything else here -- there is no more meaningful choice
++     for a module built by \`ld -r\` from multiple inputs.  */
++  base = lbasename (filename);
++  for (i = 0; i < 6 && base[i] != '\0' && base[i] != '.'; i++)
++    modname[i] = base[i];
++  modname[i] = '\0';
++
++  /* Written to a temporary file and renamed over the original, never
++     to \`filename\` directly: ibfd is still open on that same path and
++     rel_write_section below reads each section's contents and
++     relocations out of it as it goes.  Opening it "wb" here truncates
++     it under that reader, and every read after the point BFD has
++     cached fails with "file truncated" -- so whether the link worked
++     depended on file size and section order.  Seen as an intermittent
++     link failure on a PPU program that had merely grown a little
++     (2026-09-09).  */
++  tmpname = (char *) xmalloc (strlen (filename) + 5);
++  sprintf (tmpname, "%s.tmp", filename);
++
++  f = fopen (tmpname, "wb");
++  if (f == NULL)
++    fatal (_("%P: %s: cannot create RT-11 REL output: %s\n"),
++	   tmpname, strerror (errno));
++
++  ok = rel_write_gsd (f, modname, syms, symcount, psects);
++  for (i = 0; ok && i < 3; i++)
++    ok = rel_write_section (f, ibfd, &psects[i], psects, syms);
++  if (ok)
++    ok = relbuf_flush_bare (f, REL_BLK_ENDMOD);
++
++  if (fclose (f) != 0)
++    ok = false;
++  if (ok && rename (tmpname, filename) != 0)
++    {
++      fatal (_("%P: %s: cannot rename over the linked output: %s\n"),
++	     tmpname, strerror (errno));
++      ok = false;
++    }
++  if (!ok)
++    unlink (tmpname);
++  free (tmpname);
++  free (syms);
++  return ok;
++}
++
++/* This emulation's OUTPUT_FORMAT is "a.out-pdp11", same as plain
++   pdp11rt11 -- deliberately, and meant to be used with \`-r\`.  Linking
++   goes through a.out-pdp11's own specialized, proven-correct
++   relocatable-link path (pdp11_aout_link_input_section's \`if
++   (relocatable)\` branch in bfd/pdp11.c), producing exactly the file
++   \`ld -r -m pdp11rt11\` would.  Once that file is fully written to
++   disk, this hook reopens it, reads its symbols/relocations/contents
++   back with ordinary a.out-pdp11 BFD calls, and repacks all of that
++   into the RT-11 native relocatable object format in place -- see
++   pdp11rel_write above.  This hook runs from ldmain.c's
++   ldemul_after_close_output(), right after ldwrite()'s bfd_close()
++   finishes writing that a.out file to the user's requested output
++   path.
++
++   Only runs for -r/-Ur (bfd_link_relocatable) -- the opposite of
++   pdp11rt11sav's guard.  A normal, non-relocatable final link has
++   nothing meaningful to convert here: RT-11's native object format is
++   for feeding a *later* link, not for a finished, runnable program
++   (that role belongs to SAV, produced by pdp11rt11sav instead).  */
++
++static void
++gld${EMULATION_NAME}_after_close_output (void)
++{
++  bfd *ibfd;
++
++  if (!bfd_link_relocatable (&link_info))
++    return;
++
++  ibfd = bfd_openr (output_filename, "a.out-pdp11");
++  if (ibfd == NULL)
++    fatal (_("%P: %s: cannot reopen linked a.out-pdp11 output "
++	     "for RT-11 REL conversion: %E\n"), output_filename);
++  if (!bfd_check_format (ibfd, bfd_object))
++    fatal (_("%P: %s: not recognized as a.out-pdp11 after linking: "
++	     "%E\n"), output_filename);
++
++  if (!pdp11rel_write (ibfd, output_filename))
++    fatal (_("%P: %s: writing RT-11 REL output failed: %E\n"),
++	   output_filename);
++
++  if (!bfd_close (ibfd))
++    fatal (_("%P: %s: final close failed: %E\n"), output_filename);
++}
++
++/* --- \end{pdp11rt11rel.em} */
++
++EOF
++
++LDEMUL_BEFORE_PARSE=gld"$EMULATION_NAME"_before_parse
++LDEMUL_ADD_OPTIONS=gld"$EMULATION_NAME"_add_options
++LDEMUL_HANDLE_OPTION=gld"$EMULATION_NAME"_handle_option
++LDEMUL_LIST_OPTIONS=gld"$EMULATION_NAME"_list_options
++LDEMUL_GET_SCRIPT=gld"$EMULATION_NAME"_get_script
++LDEMUL_AFTER_CLOSE_OUTPUT=gld"$EMULATION_NAME"_after_close_output
+-- 
+2.54.0 (Apple Git-157)
+

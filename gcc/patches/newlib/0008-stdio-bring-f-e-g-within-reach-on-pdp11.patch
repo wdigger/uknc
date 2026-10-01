@@ -1,0 +1,248 @@
+From 012906a36fad357f787143d17d142fd5d3db4916 Mon Sep 17 00:00:00 2001
+From: Yury Klushin <digger@live.ru>
+Date: Tue, 15 Sep 2026 01:07:23 +0300
+Subject: [PATCH] stdio: bring %f/%e/%g within reach on pdp11
+
+Two things kept floating-point conversion out of reach here.
+
+__cvt takes the sign from the top bit of word0, which is the wrong
+half of the value on this machine: a double is stored as two 16-bit
+words in the PDP's own order, so word0 reads the low half, whose top
+bit is a mantissa bit.  printf ("%f", 3.14) therefore negated the
+value and then spun forever in the conversion below.  A plain
+comparison does what the bit test meant to do; the format has no
+negative zero to distinguish, an all-ones sign being a reserved
+operand rather than a number.
+
+The conversion itself was _dtoa_r, which is correctly rounded and
+arbitrary-precision and costs about 19KB of a 64KB address space,
+plus a heap large enough for its Balloc -- which a program of that
+size no longer has.  But __cvt only ever asks for modes 2 and 3, "n
+significant digits" and "n digits after the point"; the shortest-
+representation machinery is never wanted.  Those two modes come out
+of scaling the value into [1, 10) against a table of powers of ten
+and peeling digits off the top, using the soft-double routines that
+any program printing a double has already linked.  What is given up
+is the last place or two: each digit costs a multiply and the error
+accumulates, so of the format's ~16 decimal digits the last few can
+be off by one.  The default %.6f is nowhere near that.
+
+A hello-world with %f now links at 25184 bytes instead of 44792, and
+the heap survives.
+
+Only pdp11 is touched; every other target keeps _dtoa_r.
+---
+ newlib/libc/stdio/nano-vfprintf_float.c | 169 ++++++++++++++++++++++++
+ 1 file changed, 169 insertions(+)
+
+diff --git a/newlib/libc/stdio/nano-vfprintf_float.c b/newlib/libc/stdio/nano-vfprintf_float.c
+index 524f67a313..1f6fcc456b 100644
+--- a/newlib/libc/stdio/nano-vfprintf_float.c
++++ b/newlib/libc/stdio/nano-vfprintf_float.c
+@@ -57,6 +57,146 @@ int __exponent (char *p0, int exp, int fmtch);
+ 
+ #ifdef FLOATING_POINT
+ 
++#ifdef __pdp11__
++/* A compact replacement for the dtoa call below.
++
++   dtoa is David Gay's algorithm: correctly rounded, shortest
++   representation, arbitrary-precision arithmetic, and a heap to do it
++   in.  On this machine that costs about 19KB of the 64KB address space
++   (dtoa.o 10968 bytes, mprec.o 7898) and, worse, needs a malloc that a
++   program of that size no longer has room for -- the first Balloc
++   returns null and mprec's assertion fires.  So %f was unreachable in
++   practice, and this port carried a stub that discarded the argument.
++
++   What __cvt actually asks for is much less than dtoa offers: modes 2
++   and 3 only, never mode 0, so the shortest-representation machinery is
++   never wanted.  Modes 2 and 3 are "n significant digits" and "n digits
++   after the point", and those can be had by scaling the value into
++   [1, 10) with a table of powers of ten and then peeling digits off the
++   top.  No heap, no long arithmetic, and the soft-double routines it
++   uses are already linked into any program that has a double to print.
++
++   What is given up is exactness in the last place.  Each digit costs a
++   multiply, and the error accumulates: of the format's ~16 decimal
++   digits the last few can be off by one.  The default %.6f is nowhere
++   near that; %.15f is.  dtoa is off the table on this machine anyway,
++   so the choice is between approximate digits and none.
++
++   The format helps.  Its exponent reaches only 1e+-38, so the table is
++   six entries, and it has no infinities, NaNs or denormals -- the
++   callers above filter what little there is, and the rest of the edge
++   cases this code would otherwise need simply do not exist here.  */
++
++/* Significant digits worth generating: the format distinguishes about
++   16, and one spare digit is used for rounding.  */
++#define PDP11_CVT_SIG	17
++
++/* The returned string, which __cvt pads with zeros in place: a %f of a
++   number near the top of the range needs 39 digits before the point,
++   and the precision follows it.  A precision that would run past this
++   is clamped rather than overrun the buffer.  */
++#define PDP11_CVT_BUF	128
++
++static char pdp11_cvt_digits[PDP11_CVT_BUF];
++
++/* Behaves as _dtoa_r does for modes 2 and 3: returns the digit string
++   with trailing zeros suppressed, sets *DECPT to the exponent plus one,
++   and points *RVE past the last digit.  */
++
++static char *
++pdp11_dtoa (_PRINTF_FLOAT_TYPE value, int mode, int ndigits, int *decpt,
++	    char **rve)
++{
++  static const _PRINTF_FLOAT_TYPE tens[] =
++    { 1e32, 1e16, 1e8, 1e4, 1e2, 1e1 };
++  static const int tens_exp[] = { 32, 16, 8, 4, 2, 1 };
++  char *digits = pdp11_cvt_digits;
++  int e10 = 0;
++  int nd, i;
++  char *p;
++
++  if (value == 0)
++    {
++      digits[0] = '0';
++      *decpt = 1;
++      *rve = digits + 1;
++      return digits;
++    }
++
++  /* Scale into [1, 10).  Multiplying up is only ever reached with a
++     value below 1, so the product cannot overflow.  */
++  for (i = 0; i < 6; i++)
++    while (value >= tens[i])
++      {
++	value /= tens[i];
++	e10 += tens_exp[i];
++      }
++  if (value < 1)
++    for (i = 0; i < 6; i++)
++      while (value * tens[i] < 10)
++	{
++	  value *= tens[i];
++	  e10 -= tens_exp[i];
++	}
++
++  *decpt = e10 + 1;
++  nd = (mode == 3) ? ndigits + *decpt : ndigits;
++  if (nd > PDP11_CVT_SIG)
++    nd = PDP11_CVT_SIG;
++
++  /* Nothing survives at this precision -- except that the value may
++     still round up into the last place asked for.  */
++  if (nd < 1)
++    {
++      if (nd == 0 && value >= 5)
++	{
++	  digits[0] = '1';
++	  *decpt += 1;
++	}
++      else
++	digits[0] = '0';
++      *rve = digits + 1;
++      return digits;
++    }
++
++  for (i = 0; i < nd; i++)
++    {
++      int d = (int) value;
++
++      if (d > 9)
++	d = 9;
++      digits[i] = '0' + d;
++      value = (value - d) * 10;
++    }
++
++  /* Round on the digit that did not fit.  */
++  if (value >= 5)
++    {
++      for (i = nd - 1; i >= 0; i--)
++	{
++	  if (digits[i] != '9')
++	    {
++	      digits[i]++;
++	      break;
++	    }
++	  digits[i] = '0';
++	}
++      /* All nines: the string is now all zeros and gains a place.  */
++      if (i < 0)
++	{
++	  digits[0] = '1';
++	  *decpt += 1;
++	}
++    }
++
++  p = digits + nd;
++  while (p > digits + 1 && p[-1] == '0')
++    p--;
++  *rve = p;
++  return digits;
++}
++#endif /* __pdp11__ */
++
+ /* Using reentrant DATA, convert finite VALUE into a string of digits
+    with no decimal point, using NDIGITS precision and FLAGS as guides
+    to whether trailing zeros must be included.  Set *SIGN to nonzero
+@@ -70,8 +210,25 @@ __cvt (struct _reent *data, _PRINTF_FLOAT_TYPE value, int ndigits, int flags,
+ {
+   int mode, dsgn;
+   char *digits, *bp, *rve;
++#ifndef __pdp11__
+   union double_union tmp;
++#endif
+ 
++#ifdef __pdp11__
++  /* The bit test below reads the wrong half of the value here: a double
++     is stored as two 16-bit words in the PDP's own order, so word0 picks
++     up the low half, whose top bit has nothing to do with the sign.  The
++     format has no negative zero to catch either -- the all-ones-sign
++     pattern is a reserved operand, not a number -- so a plain comparison
++     says everything the bit test was there to say.  */
++  if (value < 0)
++    {
++      value = -value;
++      *sign = '-';
++    }
++  else
++    *sign = '\000';
++#else
+   tmp.d = value;
+   /* This will check for "< 0" and "-0.0".  */
+   if (word0 (tmp) & Sign_bit)
+@@ -81,6 +238,7 @@ __cvt (struct _reent *data, _PRINTF_FLOAT_TYPE value, int ndigits, int flags,
+     }
+   else
+     *sign = '\000';
++#endif
+ 
+   if (ch == 'f' || ch == 'F')
+     {
+@@ -99,7 +257,12 @@ __cvt (struct _reent *data, _PRINTF_FLOAT_TYPE value, int ndigits, int flags,
+       mode = 2;
+     }
+ 
++#ifdef __pdp11__
++  (void) dsgn;
++  digits = pdp11_dtoa (value, mode, ndigits, decpt, &rve);
++#else
+   digits = _DTOA_R (data, value, mode, ndigits, decpt, &dsgn, &rve);
++#endif
+ 
+   /* Print trailing zeros.  */
+   if ((ch != 'g' && ch != 'G') || flags & ALT)
+@@ -114,6 +277,12 @@ __cvt (struct _reent *data, _PRINTF_FLOAT_TYPE value, int ndigits, int flags,
+       /* Kludge for __dtoa irregularity.  */
+       if (value == 0)
+ 	rve = bp;
++#ifdef __pdp11__
++      /* The digits live in a fixed buffer here, so a precision that
++	 would pad past its end is cut short rather than overrun it.  */
++      if (bp > digits + PDP11_CVT_BUF - 1)
++	bp = digits + PDP11_CVT_BUF - 1;
++#endif
+       while (rve < bp)
+ 	*rve++ = '0';
+     }

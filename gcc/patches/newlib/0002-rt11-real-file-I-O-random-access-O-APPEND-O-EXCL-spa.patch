@@ -1,0 +1,951 @@
+From 8ec5d302b54206f2d4e0aaba20ac6c3d910dcc6b Mon Sep 17 00:00:00 2001
+From: Yury Klushin <digger@live.ru>
+Date: Tue, 1 Sep 2026 18:59:05 +0300
+Subject: [PATCH] rt11: real file I/O -- random access, O_APPEND/O_EXCL, sparse
+ zero-fill
+
+Replaces the previous console-only stub with actual .LOOKUP/.ENTER/
+.READW/.WRITW/.CLOSE-backed file I/O (EMT 375 codes 1/2/010/011, EMT
+374 code 6), built around one arbitrary-position 512-byte buffer per
+open file (rt11_ensure_block) that read-modify-writes partial in-block
+content instead of assuming sequential-only access.
+
+- _open/_read/_write/_close/_fstat/_lseek all implemented; O_RDONLY,
+  O_WRONLY, and O_RDWR are all supported, and lseek() works uniformly
+  for any of them (SEEK_SET/CUR/END) -- .READW/.WRITW both take an
+  explicit block number, so this is real random access, not emulated.
+- .SERR is issued once, lazily, on the first _open call, so BCS/byte-52
+  errors return normally to the caller instead of RT-11's default
+  .HERR hard job abort.
+- O_WRONLY without O_TRUNC on an existing file opens via .LOOKUP in
+  place (true overwrite-in-place), instead of always .ENTER-ing a
+  fresh copy.
+- O_APPEND tracks append_pos, the exact byte position write() reached
+  in the current open session, so consecutive appends on one fd land
+  back to back with byte precision; a file closed and reopened loses
+  that history (RT-11's .CLOSE only preserves a block count) and falls
+  back to the last whole-block boundary.
+- O_EXCL with O_CREAT on an existing name fails EEXIST instead of
+  silently opening it in place.
+- Writing past the current highest-flushed block zero-fills and
+  flushes every skipped block to disk first, giving real sparse-file
+  semantics instead of leaving stale disk content in the gap.
+- fstat()'s st_size and lseek(SEEK_END) report append_pos directly --
+  byte-exact for a file this session has written to, falling back to
+  the block-rounded .LOOKUP size only for a file this session hasn't
+  written (a plain read, or one reopened after a previous close).
+- RADIX-50 names exceeding RT-11's own hard 3/6/3-character limits are
+  rejected with ENAMETOOLONG instead of silently truncated.
+- Fixed two real GCC pdp11-backend codegen bugs found while verifying
+  this in the ukncbtl-debugger emulator: rt11_emt375's inline asm was
+  missing a "memory" clobber, so GCC dead-store-eliminated the
+  argument-block writes at -O2; and _read/_write recomputed
+  blk/off_in_blk via 32-bit division on every single byte transferred,
+  which both miscompiled on this backend and was needlessly slow --
+  both are now derived once per call and advanced by plain increment.
+
+Verified end-to-end against a real RT-11 disk image in the
+ukncbtl-debugger emulator (LOOKUP/ENTER/READW/WRITW argument tracing,
+byte-for-byte disk catalog checks), not just compiled.
+---
+ newlib/libc/sys/rt11/syscalls.c | 828 ++++++++++++++++++++++++++++++--
+ 1 file changed, 793 insertions(+), 35 deletions(-)
+
+diff --git a/newlib/libc/sys/rt11/syscalls.c b/newlib/libc/sys/rt11/syscalls.c
+index fe990e4e4..422bdca67 100644
+--- a/newlib/libc/sys/rt11/syscalls.c
++++ b/newlib/libc/sys/rt11/syscalls.c
+@@ -9,21 +9,62 @@
+  * this OS.
+  *
+  * Console I/O (fds 0/1/2) goes through RT-11's own terminal EMTs
+- * (.TTYIN/EMT 340, .TTYOUT/EMT 341 -- see the RT-11 System Macro Library
+- * Manual's "Programmed Request Description and Examples" chapter for
+- * both).  Real file I/O (.LOOKUP/.ENTER/.READW/.WRITW/.CLOSE) is not
+- * implemented yet: RT-11's file requests are block/word-oriented, not
+- * byte-stream oriented like POSIX read()/write(), so mapping one onto
+- * the other needs its own buffering layer rather than a one-line EMT
+- * wrapper -- left as a followup once this console+heap baseline is
+- * verified working.  _open/_close/_lseek on anything other than the
+- * three console fds fail with ENOSYS in the meantime.
++ * (.TTYIN/EMT 340, .TTYOUT/EMT 341).  Real files go through .LOOKUP/
++ * .ENTER/.READW/.WRITW/.CLOSE (EMT 375 codes 1/2/010/011, and EMT 374
++ * code 6 for .CLOSE -- a different vector), through one arbitrary-
++ * position 512-byte buffer per file (see rt11_ensure_block) bridging
++ * RT-11's block/word-oriented transfers onto POSIX byte-stream
++ * read()/write()/lseek().  O_RDONLY, O_WRONLY, and O_RDWR are all
++ * supported; lseek() works for any of them (SEEK_SET/CUR/END), refetching
++ * or read-modify-writing the target 512-byte block as needed -- .READW/
++ * .WRITW both take an explicit block number, so this is real random
++ * access, not emulated.  Console fds report ESPIPE from lseek(), not
++ * ENOSYS.  Opening an existing file with O_WRONLY (no O_TRUNC) preserves
++ * its untouched content -- true overwrite-in-place, via .LOOKUP instead
++ * of .ENTER; O_TRUNC (or O_CREAT on a name that doesn't yet exist) still
++ * goes through .ENTER with len=-1, same as before.  Every write() updates
++ * append_pos, this session's byte-exact high-water mark: the highest
++ * byte position any write() on this fd has reached so far (regardless of
++ * O_APPEND), which fstat()'s st_size and lseek(SEEK_END) both report
++ * directly.  O_APPEND additionally makes every _write() jump there
++ * first before writing, ignoring any lseek() done since the previous
++ * write() on this same fd, so multiple writes on one still-open append
++ * fd land back to back with byte precision.  A file that was closed and
++ * reopened has no such history, though -- RT-11's .CLOSE doesn't
++ * preserve byte-exact length, only a block count -- so append_pos (and
++ * therefore fstat()/SEEK_END and O_APPEND's target) starts back out
++ * block-rounded there, only becoming byte-exact again once this session
++ * writes to the file; an append past a reopened file's existing .LOOKUP
++ * allocation (which can't grow, see alloc_blocks below) fails ENOSPC
++ * rather than silently writing at the wrong place.  O_EXCL with O_CREAT
++ * on a name that already exists fails EEXIST instead of opening it in
++ * place.  Writing past the current highest-flushed block (e.g. writing
++ * block 5 having never written blocks 0-4) zero-fills and flushes each
++ * skipped block to disk first, so a later read of the gap returns
++ * genuine zeros -- real sparse-file semantics, confirmed (by direct
++ * test) that RT-11's own .CLOSE still truncates correctly to the highest
++ * block actually written regardless of write order.  Only already
++ * memory-resident devices work (SY:, TT:, MQ:, UB:, PI: -- no .FETCH is
++ * issued, so a name with no "DEV:" prefix defaults to SY:, and a device
++ * that needs fetching will fail).  Filenames exceeding RT-11's own hard
++ * RADIX-50 limits (3-char device, 6-char name, 3-char extension) are
++ * rejected with ENAMETOOLONG rather than silently truncated.  Reading a
++ * file this session never wrote to (a plain read-only open, or one
++ * reopened after a previous session's close) only knows its size to
++ * whole-block (512-byte) granularity -- .LOOKUP returns a block count,
++ * not a byte count, and RT-11 itself has no separate byte-exact-length
++ * convention for a plain sequential file -- so such a file's true data,
++ * if it didn't end on a block boundary when last written, reads back
++ * trailing padding from that last block.
+  */
+ 
+ #include <_ansi.h>
+ #include <sys/types.h>
+ #include <sys/stat.h>
++#include <fcntl.h>
+ #include <errno.h>
++#include <string.h>
++#include <unistd.h>
+ 
+ /* .EXIT -- EMT 350 (same request crt0rt.s itself uses to return to
+    RT-11 after main() returns).  */
+@@ -65,22 +106,479 @@ rt11_ttyin (void)
+   return (char) r0;
+ }
+ 
++/* ---- RT-11 file I/O: EMT wrappers, RADIX-50 names, and a small
++   sequential-only per-file buffering layer built directly on
++   .LOOKUP/.ENTER/.READW/.WRITW/.CLOSE.
++
++   Error reporting for all five follows one convention (RT-11 System
++   Macro Library Manual, section 1.3.7): BCS = error, with the error
++   code always in absolute byte 052 ($ERRBY); BCC = success, byte 052
++   reads 0.  R0's meaning is request-specific (length, words written,
++   etc.), never an error code.  */
++
++/* EMT 375 covers .LOOKUP (code 1), .ENTER (code 2), .READW (code 010 --
++   octal, decimal 8) and .WRITW (code 011 -- octal, decimal 9).  AREA is
++   the address of the request's own argument block, with its first word
++   already filled in by the caller as (code<<8)|chan.  Returns nonzero
++   (and *r0_out = R0) on success; zero on error (check rt11_errbyte()
++   for the reason).  Matches this file's existing rt11_ttyout/rt11_ttyin
++   idiom of pinning r0 by name and branching on BCS/BCC via numbered
++   labels rather than flag arithmetic -- GNU as resolves "1f"/"1b" to
++   the nearest occurrence, so these labels stay safe to reuse even if
++   this function is inlined at every call site.  */
++static int
++rt11_emt375 (void *area, unsigned short *r0_out)
++{
++  register unsigned short r0 asm ("r0") = (unsigned short) area;
++  unsigned short ok;
++
++  /* "memory" is required here, not optional: this asm only lists r0
++     (the pointer *value*) as an operand, so without it nothing tells
++     GCC that the EMT indirectly reads/writes the words AREA points
++     at.  Every caller fills that array via plain C stores just before
++     calling this function; with no memory clobber those stores have
++     no observed reader as far as the optimizer can see and are a
++     dead-store-elimination target -- confirmed by disassembling a
++     miscompiled build, where the array-filling code was gone entirely
++     and the EMT ran on uninitialized stack contents.  */
++  asm volatile (
++    "emt 0375\n\t"
++    "bcc 1f\n\t"
++    "mov $0,%1\n\t"
++    "br 2f\n"
++    "1:\n\t"
++    "mov $1,%1\n"
++    "2:"
++    : "+r" (r0), "=r" (ok)
++    :
++    : "cc", "memory");
++
++  *r0_out = r0;
++  return (int) ok;
++}
++
++/* .CLOSE -- EMT 374 (a different vector than the other four requests),
++   code 6.  No argument block: R0 is the (code<<8)|chan value directly.  */
++static int
++rt11_close_emt (unsigned char chan)
++{
++  register unsigned short r0 asm ("r0") = (unsigned short) ((6 << 8) | chan);
++  unsigned short ok;
++
++  asm volatile (
++    "emt 0374\n\t"
++    "bcc 1f\n\t"
++    "mov $0,%1\n\t"
++    "br 2f\n"
++    "1:\n\t"
++    "mov $1,%1\n"
++    "2:"
++    : "+r" (r0), "=r" (ok)
++    :
++    : "cc", "memory");
++
++  return (int) ok;
++}
++
++/* .SERR -- EMT 374, code 4.  RT-11 defaults to .HERR: a "hard" error
++   from almost any programmed request (including things as ordinary as
++   .LOOKUP not finding a file) aborts the whole job with a monitor-
++   printed "?MON-F-..." message instead of returning to the caller at
++   all -- BCS/byte-52 error reporting only actually happens once .SERR
++   has been issued.  Fired exactly once, lazily, the first time any
++   file gets opened (see rt11_serr_done in _open); no reason to pay for
++   it in a program that never touches a real file.  No argument block,
++   same shape as .CLOSE -- R0 is (4<<8)|0 directly.  Always "succeeds"
++   (R0 comes back with the *previous* .HERR/.SERR state, which nothing
++   here needs), so no bcc/bcs dance is needed.  */
++static void
++rt11_serr (void)
++{
++  register unsigned short r0 asm ("r0") = (unsigned short) (4 << 8);
++  asm volatile ("emt 0374" : "+r" (r0) :: "cc");
++}
++
++/* $ERRBY (absolute byte 052) is a genuine fixed address on this
++   freestanding target, not a null-pointer bug -- GCC's -Warray-bounds
++   heuristic flags any small literal address as "likely at address
++   zero" and can't be told otherwise short of silencing it locally.  */
++#pragma GCC diagnostic push
++#pragma GCC diagnostic ignored "-Warray-bounds"
++static inline unsigned char
++rt11_errbyte (void)
++{
++  return *(volatile unsigned char *) 052;
++}
++#pragma GCC diagnostic pop
++
++/* RADIX-50: space=0, A-Z=1-26, $=27, .=28, 0-9=36-45.  Anything else
++   (in practice only reached for a character newlib's caller passed
++   that isn't representable at all, e.g. '_') folds to space -- a
++   best-effort fallback, not an error, matching how lossy this whole
++   format inherently is for anything beyond upper-case DEC filenames.  */
++static int
++rad50_value (char c)
++{
++  if (c == ' ')
++    return 0;
++  if (c >= 'A' && c <= 'Z')
++    return 1 + (c - 'A');
++  if (c == '$')
++    return 27;
++  if (c == '.')
++    return 28;
++  if (c >= '0' && c <= '9')
++    return 36 + (c - '0');
++  return 0;
++}
++
++/* Packs exactly 3 already-uppercased, already-space-padded characters
++   into one RADIX-50 word: ((c0*40)+c1)*40+c2 (40 is decimal here, three
++   digits, not an octal escape).  */
++static unsigned short
++rt11_rad50_pack3 (const char *c)
++{
++  return (unsigned short) (((rad50_value (c[0]) * 40)
++			     + rad50_value (c[1])) * 40
++			    + rad50_value (c[2]));
++}
++
++/* Splits NAME as [DEV:]FILE[.EXT] (no POSIX path translation -- this
++   project's own convention) into the 4-word RADIX-50 dblk .LOOKUP/
++   .ENTER expect: word0=device (3 chars), word1-2=filename (6 chars),
++   word3=extension (3 chars).  Missing device defaults to SY: (the
++   system/boot device, always memory-resident -- the manual's
++   .FETCH/.RELEAS section lists it as "Permanently resident (SY:, TT:,
++   MQ:, UB:, PI:)").  Opening a file on any OTHER (non-resident) device
++   would need an explicit .FETCH first, which this minimal port does
++   not implement.  Any segment (device/name/extension) longer than
++   RT-11's own hard 3/6/3-character limits is rejected with -1 (caller
++   maps this to ENAMETOOLONG) rather than silently truncated; lowercase
++   input is uppercased first.  Returns 0 on success.  */
++static int
++rt11_parse_name (const char *name, unsigned short dblk[4])
++{
++  char dev[3] = { 'S', 'Y', ' ' };
++  char fn[6] = { ' ', ' ', ' ', ' ', ' ', ' ' };
++  char ext[3] = { ' ', ' ', ' ' };
++  const char *colon = strchr (name, ':');
++  const char *p = name;
++  const char *dot;
++  int n, i;
++
++  if (colon != NULL)
++    {
++      n = (int) (colon - name);
++      if (n > 3)
++	return -1;
++      for (i = 0; i < n; i++)
++	dev[i] = name[i];
++      for (; i < 3; i++)
++	dev[i] = ' ';
++      p = colon + 1;
++    }
++
++  dot = strchr (p, '.');
++  n = dot ? (int) (dot - p) : (int) strlen (p);
++  if (n > 6)
++    return -1;
++  for (i = 0; i < n; i++)
++    fn[i] = p[i];
++
++  if (dot != NULL)
++    {
++      n = (int) strlen (dot + 1);
++      if (n > 3)
++	return -1;
++      for (i = 0; i < n; i++)
++	ext[i] = dot[1 + i];
++    }
++
++  for (i = 0; i < 3; i++)
++    if (dev[i] >= 'a' && dev[i] <= 'z')
++      dev[i] = (char) (dev[i] - ('a' - 'A'));
++  for (i = 0; i < 6; i++)
++    if (fn[i] >= 'a' && fn[i] <= 'z')
++      fn[i] = (char) (fn[i] - ('a' - 'A'));
++  for (i = 0; i < 3; i++)
++    if (ext[i] >= 'a' && ext[i] <= 'z')
++      ext[i] = (char) (ext[i] - ('a' - 'A'));
++
++  dblk[0] = rt11_rad50_pack3 (dev);
++  dblk[1] = rt11_rad50_pack3 (fn);
++  dblk[2] = rt11_rad50_pack3 (fn + 3);
++  dblk[3] = rt11_rad50_pack3 (ext);
++  return 0;
++}
++
++/* Byte-52 error code -> errno.  Two separate mappers: the same numeric
++   code means different things for .LOOKUP vs .ENTER.  */
++static int
++rt11_lookup_errno (unsigned char code)
++{
++  switch (code)
++    {
++    case 0: return EBUSY;   /* channel already open */
++    case 1: return ENOENT;  /* file not found */
++    case 2: return EBUSY;   /* already open, nonshareable device */
++    case 5: return EINVAL;  /* invalid argument */
++    case 6: return ENXIO;   /* invalid special-directory unit */
++    default: return EIO;
++    }
++}
++
++static int
++rt11_enter_errno (unsigned char code)
++{
++  switch (code)
++    {
++    case 0: return EBUSY;   /* channel unavailable */
++    case 1: return ENOSPC;  /* no space / directory full */
++    case 2: return EBUSY;   /* nonshareable device in use */
++    case 3: return EACCES;  /* file exists and is protected */
++    case 4: case 5: return EINVAL;   /* seqnum (unreachable, non-magtape) */
++    case 6: return ENXIO;   /* invalid unit */
++    default: return EIO;
++    }
++}
++
++#define RT11_MAX_FILES    2
++#define RT11_BLOCK_BYTES  512
++#define RT11_BLOCK_WORDS  (RT11_BLOCK_BYTES / 2)
++#define RT11_FD_BASE      3
++
++struct rt11_file
++{
++  unsigned char  in_use;
++  unsigned char  chan;          /* index + 1; 0 = never a live slot */
++  unsigned char  readable;      /* O_RDONLY or O_RDWR */
++  unsigned char  writable;      /* O_WRONLY or O_RDWR */
++  unsigned char  have_block;    /* buf currently holds a loaded block */
++  unsigned char  dirty;         /* buf has writes not yet flushed to disk */
++  unsigned char  append;        /* O_APPEND: _write() jumps to EOF first */
++  unsigned short cur_block;     /* block index currently in buf, if have_block */
++  unsigned short size_blocks;   /* current persisted size, in blocks --
++                                    .LOOKUP's R0 for an existing file, or
++                                    grows as new blocks get flushed for a
++                                    freshly-.ENTER'd one */
++  unsigned short alloc_blocks;  /* total allocated extent; writes past this
++                                    fail ENOSPC.  Equals size_blocks for a
++                                    .LOOKUP'd file (its allocation can't
++                                    grow through this interface); equals
++                                    .ENTER's granted R0 for a fresh file */
++  off_t          pos;           /* absolute current byte position */
++  off_t          append_pos;    /* The exact highest byte position reached
++                                    by a write() in THIS open session
++                                    (block-rounded only at open time, from
++                                    size_blocks -- see _write's use of this
++                                    field).  Doubles as this session's
++                                    best-known byte-exact file size: used
++                                    directly by _fstat()/SEEK_END (see
++                                    below) as well as being O_APPEND's
++                                    jump target regardless of whether
++                                    O_APPEND is actually set. */
++  /* unsigned short, not char: this address is handed straight to
++     .READW/.WRITW as the word-transfer buffer, so it must be
++     guaranteed even-aligned -- a char array wouldn't be.  */
++  unsigned short buf[RT11_BLOCK_WORDS];
++};
++
++static struct rt11_file rt11_files[RT11_MAX_FILES];
++
++static struct rt11_file *
++rt11_fd_to_slot (int fd)
++{
++  int index = fd - RT11_FD_BASE;
++
++  if (index < 0 || index >= RT11_MAX_FILES || !rt11_files[index].in_use)
++    return NULL;
++  return &rt11_files[index];
++}
++
++/* Raw .WRITW of WCNT words from F->buf to block BLK -- no bookkeeping,
++   callers own cur_block/size_blocks.  A failure here (byte 52 code 0)
++   means the file's .ENTER allocation is exhausted, a real error, not
++   benign like .READW's past-EOF code 0.  */
++static int
++rt11_writw_raw (struct rt11_file *f, unsigned short blk, unsigned short wcnt)
++{
++  unsigned short area[5];
++  unsigned short r0;
++
++  area[0] = (unsigned short) ((011 << 8) | f->chan);
++  area[1] = blk;
++  area[2] = (unsigned short) f->buf;
++  area[3] = wcnt;
++  area[4] = 0;
++
++  return rt11_emt375 (area, &r0);
++}
++
++/* Raw .READW of block BLK into F->buf -- no bookkeeping.  Returns 1 on
++   success, 0 on error (byte-52 code 0 = past-EOF, not itself a failure;
++   check rt11_errbyte() as at every other call site).  */
++static int
++rt11_readw_raw (struct rt11_file *f, unsigned short blk)
++{
++  unsigned short area[5];
++  unsigned short r0;
++
++  area[0] = (unsigned short) ((010 << 8) | f->chan);
++  area[1] = blk;
++  area[2] = (unsigned short) f->buf;
++  area[3] = RT11_BLOCK_WORDS;
++  area[4] = 0;
++
++  return rt11_emt375 (area, &r0);
++}
++
++/* Core buffering primitive shared by _read/_write/_lseek: makes sure
++   block BLK is the one currently sitting in F->buf, flushing a dirty
++   different block first if needed.  A block within the file's known
++   size gets a real .READW (read-modify-write correctness for a partial
++   write into existing content); a block beyond that -- allocated by
++   .ENTER but never actually written -- gets zero-filled instead of read,
++   since .ENTER doesn't zero-allocate and reading it would return
++   whatever raw, stale disk content happens to be physically there
++   (confirmed by direct test in the emulator).  Callers are responsible
++   for bounds-checking BLK against size_blocks (read) or alloc_blocks
++   (write) before calling this.  */
++static int
++rt11_ensure_block (struct rt11_file *f, unsigned short blk)
++{
++  if (f->have_block && f->cur_block == blk)
++    return 1;
++
++  if (f->have_block && f->dirty)
++    {
++      if (!rt11_writw_raw (f, f->cur_block, RT11_BLOCK_WORDS))
++	return 0;
++      if (f->cur_block >= f->size_blocks)
++	f->size_blocks = (unsigned short) (f->cur_block + 1);
++      f->dirty = 0;
++    }
++
++  if (blk < f->size_blocks)
++    {
++      if (!rt11_readw_raw (f, blk))
++	return 0;
++    }
++  else
++    {
++      /* BLK is either the next block right after the known end, or --
++	 if the caller (only _write) skipped ahead, e.g. writing block 5
++	 having never written blocks 0-4 -- there's a gap.  Zero-fill and
++	 flush each gap block to disk now, so a later read of it returns
++	 genuine zeros instead of whatever raw, stale content happened to
++	 be physically on those sectors -- real sparse-file semantics,
++	 not just "undefined".  The caller already bounds-checked BLK
++	 against alloc_blocks, and every gap block is < BLK, so no
++	 further bounds check is needed here.  f->buf stays zeroed
++	 throughout (same buffer flushed unmodified for each gap block),
++	 ready to become BLK's own virgin content on return.  */
++      memset (f->buf, 0, sizeof (f->buf));
++      while (f->size_blocks < blk)
++	{
++	  if (!rt11_writw_raw (f, f->size_blocks, RT11_BLOCK_WORDS))
++	    return 0;
++	  f->size_blocks++;
++	}
++    }
++
++  f->cur_block = blk;
++  f->have_block = 1;
++  return 1;
++}
++
++/* F's current size in whole blocks, including a pending write that hasn't
++   been flushed to disk yet -- used for _read()'s EOF check and, for a
++   read-only file, _lseek()'s bounds check (block-granular is genuinely
++   all a read-only open can know: see append_pos instead for the
++   byte-exact size a write() session has actually reached, used by
++   _fstat()/SEEK_END).  */
++static unsigned short
++rt11_effective_size_blocks (struct rt11_file *f)
++{
++  if (f->have_block && f->dirty && f->cur_block >= f->size_blocks)
++    return (unsigned short) (f->cur_block + 1);
++  return f->size_blocks;
++}
++
+ int
+ _write (int file, const void *ptr, size_t len)
+ {
+-  const char *p = (const char *) ptr;
++  const unsigned char *p = (const unsigned char *) ptr;
+   size_t i;
++  struct rt11_file *f;
+ 
+-  if (file != 1 && file != 2)
++  if (file == 1 || file == 2)
+     {
+-      errno = ENOSYS;
++      for (i = 0; i < len; i++)
++	rt11_ttyout ((char) p[i]);
++      return (int) len;
++    }
++
++  f = rt11_fd_to_slot (file);
++  if (f == NULL || !f->writable)
++    {
++      errno = EBADF;
+       return -1;
+     }
+ 
+-  for (i = 0; i < len; i++)
+-    rt11_ttyout (p[i]);
++  /* O_APPEND: every write() jumps to append_pos first -- the exact
++     highest byte position reached by a write() in THIS open session,
++     ignoring any lseek() done since.  append_pos starts out block-
++     rounded (from size_blocks at open time, the best RT-11 itself can
++     report for a file that was already closed once -- .CLOSE doesn't
++     preserve byte-exact length), but every write() call while this fd
++     stays open keeps it byte-exact from then on -- see the update at
++     the end of this function.  Consequence, documented in the header
++     comment: appending to a file that was closed and reopened can only
++     continue from a whole-block boundary, but appending across
++     multiple write() calls on the SAME still-open fd lands exactly
++     where the previous write() left off, regardless of a stray
++     lseek() in between.  */
++  if (f->append)
++    f->pos = f->append_pos;
++
++  /* blk/off_in_blk are derived from f->pos ONCE here, then advanced by
++     plain increment (wrapping at RT11_BLOCK_BYTES) instead of re-deriving
++     them from f->pos via division/modulo on every byte -- off_t is a
++     32-bit type on this 16-bit target, so a division per byte is both
++     needlessly expensive and, per this project's established practice of
++     not trusting this rare backend's codegen for anything unusual,
++     avoided outright.  f->pos itself is only updated once, at the end.  */
++  {
++    unsigned short blk = (unsigned short) (f->pos / RT11_BLOCK_BYTES);
++    unsigned short off_in_blk = (unsigned short) (f->pos % RT11_BLOCK_BYTES);
+ 
+-  return (int) len;
++    for (i = 0; i < len; i++)
++      {
++	if (blk >= f->alloc_blocks)
++	  {
++	    errno = ENOSPC;
++	    break;
++	  }
++	if (!rt11_ensure_block (f, blk))
++	  {
++	    errno = EIO;
++	    break;
++	  }
++	((unsigned char *) f->buf)[off_in_blk] = p[i];
++	f->dirty = 1;
++	off_in_blk++;
++	if (off_in_blk == RT11_BLOCK_BYTES)
++	  {
++	    off_in_blk = 0;
++	    blk++;
++	  }
++      }
++  }
++
++  f->pos += (off_t) i;
++  if (f->pos > f->append_pos)
++    f->append_pos = f->pos;
++  return i > 0 ? (int) i : (len > 0 ? -1 : 0);
+ }
+ 
+ int
+@@ -88,55 +586,315 @@ _read (int file, void *ptr, size_t len)
+ {
+   char *p = (char *) ptr;
+   size_t i;
++  struct rt11_file *f;
+ 
+-  if (file != 0)
++  if (file == 0)
+     {
+-      errno = ENOSYS;
+-      return -1;
++      for (i = 0; i < len; i++)
++	{
++	  char c = rt11_ttyin ();
++
++	  p[i] = c;
++	  if (c == '\r' || c == '\n')
++	    {
++	      i++;
++	      break;
++	    }
++	}
++      return (int) i;
+     }
+ 
+-  for (i = 0; i < len; i++)
++  f = rt11_fd_to_slot (file);
++  if (f == NULL || !f->readable)
+     {
+-      char c = rt11_ttyin ();
+-
+-      p[i] = c;
+-      if (c == '\r' || c == '\n')
+-	{
+-	  i++;
+-	  break;
+-	}
++      errno = EBADF;
++      return -1;
+     }
+ 
++  /* See the matching comment in _write: blk/off_in_blk are derived from
++     f->pos ONCE, then advanced by plain increment instead of re-deriving
++     them via division/modulo every byte.  */
++  {
++    unsigned short blk = (unsigned short) (f->pos / RT11_BLOCK_BYTES);
++    unsigned short off_in_blk = (unsigned short) (f->pos % RT11_BLOCK_BYTES);
++    int io_error = 0;
++
++    for (i = 0; i < len; i++)
++      {
++	if (blk >= rt11_effective_size_blocks (f))
++	  break;   /* EOF -- return what we already have this call */
++
++	if (!rt11_ensure_block (f, blk))
++	  {
++	    io_error = 1;
++	    break;
++	  }
++	p[i] = (char) ((unsigned char *) f->buf)[off_in_blk];
++	off_in_blk++;
++	if (off_in_blk == RT11_BLOCK_BYTES)
++	  {
++	    off_in_blk = 0;
++	    blk++;
++	  }
++      }
++
++    f->pos += (off_t) i;
++    if (io_error)
++      {
++	errno = EIO;
++	return i > 0 ? (int) i : -1;
++      }
++  }
++
+   return (int) i;
+ }
+ 
+ int
+ _close (int file)
+ {
++  struct rt11_file *f;
++  int ok = 1;
++
+   if (file == 0 || file == 1 || file == 2)
+     return 0;
+-  errno = ENOSYS;
+-  return -1;
++
++  f = rt11_fd_to_slot (file);
++  if (f == NULL)
++    {
++      errno = EBADF;
++      return -1;
++    }
++
++  if (f->have_block && f->dirty)
++    {
++      ok = rt11_writw_raw (f, f->cur_block, RT11_BLOCK_WORDS);
++      if (ok && f->cur_block >= f->size_blocks)
++	f->size_blocks = (unsigned short) (f->cur_block + 1);
++    }
++
++  if (!rt11_close_emt (f->chan))
++    ok = 0;
++
++  f->in_use = 0;
++
++  if (!ok)
++    {
++      errno = EIO;
++      return -1;
++    }
++  return 0;
+ }
+ 
+-int
++/* Works uniformly for read-only, write-only, and O_RDWR files: just
++   repositions f->pos (bounds-checked), no I/O here at all -- the next
++   read()/write() loads or read-modify-writes the right block lazily via
++   rt11_ensure_block(), the same as a real lseek() never touching disk
++   either.  A writable file may seek anywhere within its allocated
++   extent (to write there later, possibly creating a gap -- see header
++   comment); a read-only file is bounded by its actual known content.
++   Console fds give ESPIPE, matching real POSIX for a non-seekable
++   descriptor.  */
++off_t
+ _lseek (int file, off_t offset, int whence)
+ {
+-  errno = ENOSYS;
+-  return -1;
++  struct rt11_file *f;
++  off_t base, target, limit;
++
++  if (file == 0 || file == 1 || file == 2)
++    {
++      errno = ESPIPE;
++      return (off_t) -1;
++    }
++
++  f = rt11_fd_to_slot (file);
++  if (f == NULL)
++    {
++      errno = EBADF;
++      return (off_t) -1;
++    }
++
++  switch (whence)
++    {
++    case SEEK_SET: base = 0; break;
++    case SEEK_CUR: base = f->pos; break;
++    case SEEK_END:
++      /* append_pos is this session's byte-exact high-water mark (see the
++	 struct comment) -- for a file untouched by write() this session
++	 it's exactly the block-rounded LOOKUP size, same as before; for
++	 one written to in this session it's the real byte count, not
++	 rounded up to the next block. */
++      base = f->append_pos;
++      break;
++    default:
++      errno = EINVAL;
++      return (off_t) -1;
++    }
++  target = base + offset;
++
++  limit = f->writable
++	    ? (off_t) f->alloc_blocks * RT11_BLOCK_BYTES
++	    : (off_t) rt11_effective_size_blocks (f) * RT11_BLOCK_BYTES;
++  if (target < 0 || target > limit)
++    {
++      errno = EINVAL;
++      return (off_t) -1;
++    }
++
++  f->pos = target;
++  return target;
+ }
+ 
++static int rt11_serr_done;
++
+ int
+ _open (const char *name, int flags, int mode)
+ {
+-  errno = ENOSYS;
+-  return -1;
++  int acc = flags & O_ACCMODE;
++  int i;
++  struct rt11_file *f = NULL;
++  unsigned short dblk[4];
++  unsigned short area[4];
++  unsigned short r0;
++  unsigned char chan;
++  int readable, writable, need_enter;
++
++  if (!rt11_serr_done)
++    {
++      rt11_serr ();
++      rt11_serr_done = 1;
++    }
++
++  if (acc != O_RDONLY && acc != O_WRONLY && acc != O_RDWR)
++    {
++      errno = ENOSYS;
++      return -1;
++    }
++  readable = (acc == O_RDONLY || acc == O_RDWR);
++  writable = (acc == O_WRONLY || acc == O_RDWR);
++
++  for (i = 0; i < RT11_MAX_FILES; i++)
++    if (!rt11_files[i].in_use)
++      {
++	f = &rt11_files[i];
++	break;
++      }
++  if (f == NULL)
++    {
++      errno = EMFILE;
++      return -1;
++    }
++  chan = (unsigned char) (i + 1);
++
++  if (rt11_parse_name (name, dblk) != 0)
++    {
++      errno = ENAMETOOLONG;
++      return -1;
++    }
++
++  need_enter = (writable && (flags & O_TRUNC)) != 0;
++
++  if (!need_enter)
++    {
++      /* .LOOKUP: open an existing file in place -- for read, write, or
++	 both -- without touching its current content.  This is what
++	 makes overwrite-in-place work: a plain O_WRONLY open (no
++	 O_TRUNC) on an existing file lands here, not in .ENTER below,
++	 so untouched bytes survive.  O_RDONLY|O_CREAT intentionally
++	 still doesn't auto-create on a miss (unchanged, out of scope
++	 here) -- only a writable open falls back to .ENTER below.  */
++      area[0] = (unsigned short) ((1 << 8) | chan);
++      area[1] = (unsigned short) dblk;
++      area[2] = 0;
++
++      if (rt11_emt375 (area, &r0))
++	{
++	  /* O_EXCL|O_CREAT on a name that already exists must fail, not
++	     silently open the existing file in place.  */
++	  if ((flags & O_CREAT) && (flags & O_EXCL))
++	    {
++	      errno = EEXIST;
++	      rt11_close_emt (chan);
++	      return -1;
++	    }
++	  f->size_blocks = r0;
++	  f->alloc_blocks = r0;   /* .LOOKUP can't grow the file further */
++	}
++      else
++	{
++	  unsigned char code = rt11_errbyte ();
++
++	  if (code == 1 && writable && (flags & O_CREAT))
++	    need_enter = 1;   /* doesn't exist yet -- fall back to .ENTER */
++	  else
++	    {
++	      errno = rt11_lookup_errno (code);
++	      rt11_close_emt (chan);
++	      return -1;
++	    }
++	}
++    }
++
++  if (need_enter)
++    {
++      /* .ENTER, len=-1 (largest available space): .CLOSE truncates the
++	 file to the actual highest block written (confirmed correct
++	 even under out-of-order writes by direct test), so this is
++	 always safe for a write of unknown final length.  Used for a
++	 brand new file, or when O_TRUNC discards existing content.  */
++      area[0] = (unsigned short) ((2 << 8) | chan);
++      area[1] = (unsigned short) dblk;
++      area[2] = (unsigned short) -1;
++      area[3] = 0;
++
++      if (!rt11_emt375 (area, &r0))
++	{
++	  errno = rt11_enter_errno (rt11_errbyte ());
++	  rt11_close_emt (chan);
++	  return -1;
++	}
++      f->size_blocks = 0;
++      f->alloc_blocks = r0;
++    }
++
++  f->chan = chan;
++  f->readable = (unsigned char) readable;
++  f->writable = (unsigned char) writable;
++  f->append = (unsigned char) (writable && (flags & O_APPEND));
++  f->have_block = 0;
++  f->dirty = 0;
++  f->pos = 0;
++  /* Best known append target at open time: block-rounded, since that's
++     all .LOOKUP/.ENTER can report -- see _write's use of this field for
++     how it becomes byte-exact across further writes on this same fd.  */
++  f->append_pos = (off_t) f->size_blocks * RT11_BLOCK_BYTES;
++  f->in_use = 1;
++
++  return RT11_FD_BASE + i;
+ }
+ 
+ int
+ _fstat (int file, struct stat *st)
+ {
+-  st->st_mode = S_IFCHR;
++  struct rt11_file *f;
++
++  if (file == 0 || file == 1 || file == 2)
++    {
++      st->st_mode = S_IFCHR;
++      return 0;
++    }
++
++  f = rt11_fd_to_slot (file);
++  if (f == NULL)
++    {
++      errno = EBADF;
++      return -1;
++    }
++
++  st->st_mode = S_IFREG;
++  /* append_pos: this session's byte-exact high-water mark (see the struct
++     comment and _lseek's matching SEEK_END case) -- block-rounded only
++     for a file this session has never written to. */
++  st->st_size = f->append_pos;
+   return 0;
+ }
+ 

@@ -1,0 +1,60 @@
+From: Yury Klushin <digger@live.ru>
+Date: Mon, 31 Aug 2026 14:36:27 +0300
+Subject: [PATCH] pdp11: zero .bss in the rt11 crt0 before touching statics
+
+RT-11 doesn't clear memory between programs, so a previous job's
+leftovers can still be sitting in a freshly loaded program's .bss --
+including this crt0's own cmdbuf/argv buffers, which are declared
+there. Add a zero-fill loop over __bss_start..._end (from the linker
+script, ld/scripttempl/pdp11rt11.sc in the wdigger/binutils-gdb fork)
+right after the SP is set from the SAV header, before anything else
+touches memory.
+
+Verified via SIMH: reads/writes cleanly and reaches the program's own
+halt without crashing; a global array poked with nonzero data before
+the fixed crt0 runs reads back as zero once main is reached.
+
+Includes what was a separate fix on top of this one, now part of it:
+
+pdp11: crt0rt: clear .bss with an unsigned compare
+
+The loop that clears .bss ended on BGE, a signed compare of two
+addresses.  A .bss that starts below 0100000 (32 KB) and ends above it
+then compares as start >= end, and is not cleared at all: a program of
+more than 32 KB starts with whatever was in that memory.  BHIS compares
+them unsigned.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ libgcc/config/pdp11/crt0rt.s | 15 +++++++++++++++
+ 1 file changed, 15 insertions(+)
+
+diff --git a/libgcc/config/pdp11/crt0rt.s b/libgcc/config/pdp11/crt0rt.s
+index 81b25f5..7a9e6c9 100644
+--- a/libgcc/config/pdp11/crt0rt.s
++++ b/libgcc/config/pdp11/crt0rt.s
+@@ -12,6 +12,21 @@ cmdbuf_max = 80
+ start:
+         mov   @$042, sp   // SP comes from the SAV header (RT-11 sets it before we start)
+ 
++        // RT-11 doesn't clear memory between programs, so a previous job's
++        // leftovers can still be sitting in our .bss; zero it before touching
++        // any of our own statics (including cmdbuf/argv below).  __bss_start
++        // and _end come from the linker script (ld/scripttempl/pdp11rt11.sc).
++        mov   $__bss_start, r1
++        mov   $_end, r2
++        // Addresses are unsigned: BHIS, not BGE.  With BGE a .bss that
++        // straddles 0100000 (32 KB) -- start below, end above -- compares
++        // as start >= end and is left uncleared.
++4$:     cmp   r1, r2
++        bhis  5$
++        clrb  (r1)+
++        br    4$
++5$:
++
+         // RT-11's KMON, when it runs a program via RUN (or by typing its name
+         // directly), copies whatever followed the program name on that command
+         // into the fixed "chain area": a byte count at address 0510 and the
+-- 
+2.54.0 (Apple Git-157)
+

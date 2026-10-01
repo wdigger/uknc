@@ -1,0 +1,438 @@
+From: Yury Klushin <digger@live.ru>
+Date: Sun, 13 Sep 2026 10:44:42 +0300
+Subject: [PATCH] pdp11: -mfis, using the FIS instructions for single precision
+ arithmetic
+
+FIS is the small floating point option of the PDP-11 line: the KE11-F on
+the 11/35 and 11/40, the KEV11 on the 11/03.  Four instructions, single
+precision only, and no floating point registers at all -- a general
+register points at a two-element stack of values, the right operand at
+(R) and the left at (R)+4, the result replaces the left operand, and R is
+then incremented by 4 so that it points at the result.
+
+So each of addsf3, subsf3, mulsf3 and divsf3 lays its operands out in a
+stack temporary, loads its address, and reads the result back; the
+instruction itself is one word.  A temporary rather than real pushes,
+because pushing would move the stack pointer in the middle of a function
+and floats never live in registers on this machine, so the operands
+themselves are very often stack addresses whose displacements would then
+all need correcting.  The memory traffic is described loosely on purpose:
+the insn reads a BLKmode MEM through the pointer, which keeps the stores
+of the operands from looking dead, and clobbers all of memory, which
+keeps anything from moving across it.  Naming the two slots exactly would
+mean writing down stack addresses that reload is still free to rewrite.
+
+Off by default, and -mno-fis turns it back off, because whether the four
+instruction codes do anything is a property of the machine rather than of
+the processor: a UKNC, for one, has no FIS hardware but emulates the codes
+in a HALT-mode trap handler, while elsewhere nothing handles them and the
+program dies.  Mutually exclusive with -mfpu, which is an error rather
+than a silent choice of one of them.  __pdp11_fis is predefined when the
+option is on, next to the existing __pdp11_fpu.
+
+Measured on a UKNC, where the monitor emulates the instructions, at 4602
+CPU ticks per single precision addition against 13038 for the library
+call, so 2.8 times faster even with the trap; on real KE11-F hardware the
+gap is of course much wider.  Correctness does not depend on this option:
+a later patch makes the library right for these formats too.
+---
+ gcc/config/pdp11/pdp11-protos.h        |  1 +
+ gcc/config/pdp11/pdp11.cc              | 57 +++++++++++++++++++++
+ gcc/config/pdp11/pdp11.h               |  2 +
+ gcc/config/pdp11/pdp11.md              | 71 ++++++++++++++++++++++++++
+ gcc/config/pdp11/pdp11.opt             |  4 ++
+ gcc/doc/invoke.texi                    | 24 +++++++--
+ gcc/testsuite/gcc.target/pdp11/fis-1.c | 46 +++++++++++++++++
+ gcc/testsuite/gcc.target/pdp11/fis-2.c | 17 ++++++
+ gcc/testsuite/gcc.target/pdp11/fis-3.c | 25 +++++++++
+ gcc/testsuite/gcc.target/pdp11/fis-4.c | 14 +++++
+ 10 files changed, 258 insertions(+), 3 deletions(-)
+ create mode 100644 gcc/testsuite/gcc.target/pdp11/fis-1.c
+ create mode 100644 gcc/testsuite/gcc.target/pdp11/fis-2.c
+ create mode 100644 gcc/testsuite/gcc.target/pdp11/fis-3.c
+ create mode 100644 gcc/testsuite/gcc.target/pdp11/fis-4.c
+
+diff --git a/gcc/config/pdp11/pdp11-protos.h b/gcc/config/pdp11/pdp11-protos.h
+index 4167b4ee89b83..d0255b3155c40 100644
+--- a/gcc/config/pdp11/pdp11-protos.h
++++ b/gcc/config/pdp11/pdp11-protos.h
+@@ -36,6 +36,7 @@ extern int pdp11_initial_elimination_offset (int, int);
+ extern enum reg_class pdp11_regno_reg_class (int);
+ extern bool pdp11_fixed_cc_regs (unsigned int *, unsigned int *);
+ extern machine_mode pdp11_cc_mode (enum rtx_code, rtx, rtx);
++extern void pdp11_expand_fis (enum rtx_code, rtx *);
+ extern bool pdp11_expand_shift (rtx *, rtx (*) (rtx, rtx, rtx),
+ 				rtx (*) (rtx, rtx, rtx));
+ extern const char * pdp11_assemble_shift (rtx *, machine_mode, int);
+diff --git a/gcc/config/pdp11/pdp11.cc b/gcc/config/pdp11/pdp11.cc
+index f75f2d9129576..a88f76c47d68b 100644
+--- a/gcc/config/pdp11/pdp11.cc
++++ b/gcc/config/pdp11/pdp11.cc
+@@ -1954,6 +1954,51 @@ pdp11_small_shift (int n)
+   return (unsigned) n < 4;
+ }
+ 
++/* Expand addsf3, subsf3, mulsf3 or divsf3 as a FIS instruction.  CODE is
++   the arithmetic code, OPERANDS[0] is the result and OPERANDS[1] and [2]
++   are the left and right operand.
++
++   FIS reads both operands from memory, as a two-element stack addressed
++   by a general register: the right operand at (R), the left one at (R)+4.
++   The result replaces the left operand and R is incremented by 4, so
++   afterwards R points at the result.
++
++   The "stack" is just memory, so this uses a stack temporary rather than
++   real pushes.  Pushing would move the stack pointer in the middle of a
++   function, and since floats never live in registers here the operands
++   themselves are very often stack addresses, whose displacements would
++   then all have to be corrected.  */
++void
++pdp11_expand_fis (enum rtx_code code, rtx *operands)
++{
++  rtx slot, left, right, ptr;
++
++  /* Eight bytes: the right operand, then the left one above it.  */
++  slot = assign_stack_temp (DFmode, 8);
++  right = adjust_address (slot, SFmode, 0);
++  left = adjust_address (slot, SFmode, 4);
++
++  /* These are ordinary SFmode moves, split into two word moves by the
++     generic code because this machine has no SFmode move of its own
++     without an FPU.  They work for a constant operand as well.  */
++  emit_move_insn (left, operands[1]);
++  emit_move_insn (right, operands[2]);
++
++  ptr = copy_addr_to_reg (XEXP (slot, 0));
++
++  switch (code)
++    {
++    case PLUS:  emit_insn (gen_fis_add (ptr)); break;
++    case MINUS: emit_insn (gen_fis_sub (ptr)); break;
++    case MULT:  emit_insn (gen_fis_mul (ptr)); break;
++    case DIV:   emit_insn (gen_fis_div (ptr)); break;
++    default:    gcc_unreachable ();
++    }
++
++  /* The result took the place of the left operand.  */
++  emit_move_insn (operands[0], left);
++}
++
+ /* Expand a shift insn.  Returns true if the expansion was done,
+    false if it needs to be handled by the caller.  */
+ bool
+@@ -2348,6 +2393,18 @@ pdp11_option_override (void)
+   if (!global_options_set.x_pdp11_model)
+     pdp11_model = OPTION_MASK_M11_40;
+ #endif
++
++  /* FIS and FPP are the two mutually exclusive floating point options of
++     the PDP-11 line: a machine has the KE11-F/KEV11 four-instruction
++     stack arithmetic, or an FP11 with its own accumulators, never both.
++     They also disagree about what a float even is in a register, so
++     there is no way to mix their code in one compilation.  */
++  if (TARGET_FIS && TARGET_FPU)
++    {
++      error ("%<-mfis%> and %<-mfpu%> are mutually exclusive; FIS and FPP "
++	     "are alternative PDP-11 floating point options, not a pair");
++      target_flags &= ~MASK_FIS;
++    }
+ }
+ 
+ static void
+diff --git a/gcc/config/pdp11/pdp11.h b/gcc/config/pdp11/pdp11.h
+index 4f72d577ead62..56c1a38887ce7 100644
+--- a/gcc/config/pdp11/pdp11.h
++++ b/gcc/config/pdp11/pdp11.h
+@@ -48,6 +48,8 @@ along with GCC; see the file COPYING3.  If not see
+ 	builtin_define_with_int_value ("__pdp11_model", 10);	\
+       if (TARGET_FPU)						\
+ 	builtin_define ("__pdp11_fpu");				\
++      if (TARGET_FIS)						\
++	builtin_define ("__pdp11_fis");				\
+       if (TARGET_AC0)						\
+ 	builtin_define ("__pdp11_ac0");				\
+     }						\
+diff --git a/gcc/config/pdp11/pdp11.md b/gcc/config/pdp11/pdp11.md
+index d96cecf94c3ba..feb0fa77acd56 100644
+--- a/gcc/config/pdp11/pdp11.md
++++ b/gcc/config/pdp11/pdp11.md
+@@ -27,6 +27,10 @@
+     UNSPECV_SETD
+     UNSPECV_SETI
+     UNSPECV_CPYMEM
++    UNSPECV_FIS_ADD
++    UNSPECV_FIS_SUB
++    UNSPECV_FIS_MUL
++    UNSPECV_FIS_DIV
+   ])
+ 
+ (define_constants
+@@ -82,6 +86,19 @@
+ 
+ (define_code_iterator SHF [ashift ashiftrt lshiftrt])
+ 
++;; The four FIS operations.  The expanders iterate over the rtx codes to
++;; get their standard names; the insns themselves hold no arithmetic, just
++;; an unspec, so they iterate over the four unspec numbers instead.
++(define_code_iterator FIS [plus minus mult div])
++(define_code_attr fisop [(plus "add") (minus "sub") (mult "mul") (div "div")])
++
++(define_int_iterator FISV [UNSPECV_FIS_ADD UNSPECV_FIS_SUB
++			   UNSPECV_FIS_MUL UNSPECV_FIS_DIV])
++(define_int_attr fisname [(UNSPECV_FIS_ADD "add") (UNSPECV_FIS_SUB "sub")
++			  (UNSPECV_FIS_MUL "mul") (UNSPECV_FIS_DIV "div")])
++(define_int_attr fisinsn [(UNSPECV_FIS_ADD "fadd") (UNSPECV_FIS_SUB "fsub")
++			  (UNSPECV_FIS_MUL "fmul") (UNSPECV_FIS_DIV "fdiv")])
++
+ (define_mode_iterator PDPfp [SF DF])
+ 
+ ;; Substitution to turn a CC clobber into a CC setter.  We have four of
+@@ -1089,6 +1106,60 @@
+    (set_attr "base_cost" "12")])
+ 
+ 
++;;- FIS single precision arithmetic
++;;
++;; FIS -- the KE11-F option of the PDP-11/35 and /40, the KEV11 of the
++;; PDP-11/03 -- has no floating point registers at all.  A general
++;; register points at a two-element stack of single precision values: the
++;; right operand at (R), the left one at (R)+4, the result replaces the
++;; left operand, and R is then incremented by 4, so that it ends up
++;; pointing at the result.  Only the four basic operations exist, only in
++;; single precision, which is why these are the only FIS patterns: every
++;; conversion and comparison still goes to the library.
++;;
++;; The memory traffic is described loosely on purpose.  The insn reads a
++;; BLKmode MEM through the pointer, which is what keeps the stores of the
++;; operands from looking dead, and clobbers all of memory, which keeps
++;; anything from moving across it.  Naming the two slots exactly would
++;; mean writing down stack addresses that reload is still free to rewrite.
++
++(define_expand "<fisop>sf3"
++  [(set (match_operand:SF 0 "nonimmediate_operand" "")
++	(FIS:SF (match_operand:SF 1 "general_operand" "")
++		(match_operand:SF 2 "general_operand" "")))]
++  "TARGET_FIS && !TARGET_FPU"
++{
++  pdp11_expand_fis (<CODE>, operands);
++  DONE;
++})
++
++(define_insn_and_split "fis_<fisname>"
++  [(set (match_operand:HI 0 "register_operand" "+r")
++	(plus:HI (match_dup 0) (const_int 4)))
++   (unspec_volatile [(mem:BLK (match_dup 0))] FISV)
++   (clobber (mem:BLK (scratch)))]
++  "TARGET_FIS"
++  "#"
++  "&& reload_completed"
++  [(parallel [(set (match_dup 0) (plus:HI (match_dup 0) (const_int 4)))
++	      (unspec_volatile [(mem:BLK (match_dup 0))] FISV)
++	      (clobber (mem:BLK (scratch)))
++	      (clobber (reg:CC CC_REGNUM))])]
++  ""
++  [(set_attr "length" "2")
++   (set_attr "base_cost" "40")])
++
++(define_insn "fis_<fisname>_nocc"
++  [(set (match_operand:HI 0 "register_operand" "+r")
++	(plus:HI (match_dup 0) (const_int 4)))
++   (unspec_volatile [(mem:BLK (match_dup 0))] FISV)
++   (clobber (mem:BLK (scratch)))
++   (clobber (reg:CC CC_REGNUM))]
++  "TARGET_FIS && reload_completed"
++  "<fisinsn>\t%0"
++  [(set_attr "length" "2")
++   (set_attr "base_cost" "40")])
++
+ ;;- arithmetic instructions
+ ;;- add instructions
+ 
+diff --git a/gcc/config/pdp11/pdp11.opt b/gcc/config/pdp11/pdp11.opt
+index eeb28e9e55d8b..612c778f64372 100644
+--- a/gcc/config/pdp11/pdp11.opt
++++ b/gcc/config/pdp11/pdp11.opt
+@@ -75,6 +75,10 @@ mfpu
+ Target RejectNegative Mask(FPU)
+ Use hardware floating point.
+ 
++mfis
++Target Mask(FIS)
++Use the FIS floating point instructions for single precision arithmetic.
++
+ mint16
+ Target InverseMask(INT32, INT16)
+ Use 16 bit int.
+diff --git a/gcc/doc/invoke.texi b/gcc/doc/invoke.texi
+index 64a3131c19068..3eb925ab29bef 100644
+--- a/gcc/doc/invoke.texi
++++ b/gcc/doc/invoke.texi
+@@ -1248,7 +1248,8 @@ Objective-C and Objective-C++ Dialects}.
+ -mcmodel=@var{code-model}}
+ 
+ @emph{PDP-11 Options} (@ref{PDP-11 Options})
+-@gccoptlist{-mfpu  -msoft-float  -mac0  -mno-ac0  -m40  -m45  -m10
++@gccoptlist{-mfpu  -msoft-float  -mfis  -mno-fis  -mac0  -mno-ac0
++-m40  -m45  -m10
+ -mint32  -mno-int16  -mint16  -mno-int32
+ -msplit  -munix-asm  -mdec-asm  -mgnu-asm  -mlra}
+ 
+@@ -30863,13 +30864,30 @@ These options are defined for the PDP-11:
+ @table @gcctabopt
+ @opindex mfpu
+ @item -mfpu
+-Use hardware FPP floating point.  This is the default.  (FIS floating
+-point on the PDP-11/40 is not supported.)  Implies -m45.
++Use hardware FPP floating point.  This is the default.  Implies -m45.
+ 
+ @opindex msoft-float
+ @item -msoft-float
+ Do not use hardware floating point.
+ 
++@opindex mfis
++@opindex mno-fis
++@item -mfis
++Use the FIS floating point instructions @code{fadd}, @code{fsub},
++@code{fmul} and @code{fdiv} for @code{float} arithmetic, instead of
++calling the library routines.  FIS is the small stack-based floating
++point option of the PDP-11 line, the KE11-F on the PDP-11/35 and /40 and
++the KEV11 on the PDP-11/03; it covers the four basic operations on single
++precision values only, so conversions, comparisons and anything in
++@code{double} still go to the library.  FIS and FPP are alternatives, so
++this option cannot be combined with @option{-mfpu}.  It is off by
++default, and @option{-mno-fis} turns it back off, because availability is
++a property of the machine rather than of the processor: some machines
++emulate the four instruction codes in a monitor trap handler instead of
++executing them, and where nothing handles them the program dies.  Note
++also that FIS traps on overflow, underflow and division by zero, where
++the library routines return a value.
++
+ @opindex mac0
+ @item -mac0
+ Return floating-point results in ac0 (fr0 in Unix assembler syntax).
+diff --git a/gcc/testsuite/gcc.target/pdp11/fis-1.c b/gcc/testsuite/gcc.target/pdp11/fis-1.c
+new file mode 100644
+index 0000000000000..5dba2be507833
+--- /dev/null
++++ b/gcc/testsuite/gcc.target/pdp11/fis-1.c
+@@ -0,0 +1,46 @@
++/* { dg-do compile { target pdp11-*-* } } */
++/* { dg-options "-O2 -fomit-frame-pointer -mfis" } */
++
++/* -mfis turns the four single precision operations into FIS
++   instructions instead of calls to the library.  FIS addresses its two
++   operands through a general register, the right one at (R) and the
++   left one at (R)+4, so each operation lays them out in a stack
++   temporary first.  */
++
++float
++add (float a, float b)
++{
++  return a + b;
++}
++
++float
++sub (float a, float b)
++{
++  return a - b;
++}
++
++float
++mul (float a, float b)
++{
++  return a * b;
++}
++
++float
++divide (float a, float b)
++{
++  return a / b;
++}
++
++/* { dg-final { scan-assembler "fadd\t" } } */
++/* { dg-final { scan-assembler "fsub\t" } } */
++/* { dg-final { scan-assembler "fmul\t" } } */
++/* { dg-final { scan-assembler "fdiv\t" } } */
++/* Eight bytes of scratch, and the pointer loaded from the stack
++   pointer, in each of the four.  */
++/* { dg-final { scan-assembler-times "add\t.-010,sp" 4 } } */
++/* { dg-final { scan-assembler-times "mov\tsp,r" 4 } } */
++/* No library call is left for any of them.  */
++/* { dg-final { scan-assembler-not "___addsf3" } } */
++/* { dg-final { scan-assembler-not "___subsf3" } } */
++/* { dg-final { scan-assembler-not "___mulsf3" } } */
++/* { dg-final { scan-assembler-not "___divsf3" } } */
+diff --git a/gcc/testsuite/gcc.target/pdp11/fis-2.c b/gcc/testsuite/gcc.target/pdp11/fis-2.c
+new file mode 100644
+index 0000000000000..b97f0f1cd0c81
+--- /dev/null
++++ b/gcc/testsuite/gcc.target/pdp11/fis-2.c
+@@ -0,0 +1,17 @@
++/* { dg-do compile { target pdp11-*-* } } */
++/* { dg-options "-O2 -fomit-frame-pointer -mfis -mno-fis" } */
++
++/* FIS is off unless asked for, and -mno-fis turns it back off again,
++   because whether the four instruction codes do anything is a property
++   of the machine and not of the processor: some machines emulate them in
++   a monitor trap handler, and elsewhere nothing handles them at all.  So
++   this has to come out as the ordinary library call.  */
++
++float
++mul (float a, float b)
++{
++  return a * b;
++}
++
++/* { dg-final { scan-assembler "jsr\tpc,___mulsf3" } } */
++/* { dg-final { scan-assembler-not "fmul" } } */
+diff --git a/gcc/testsuite/gcc.target/pdp11/fis-3.c b/gcc/testsuite/gcc.target/pdp11/fis-3.c
+new file mode 100644
+index 0000000000000..a1111284bdbc1
+--- /dev/null
++++ b/gcc/testsuite/gcc.target/pdp11/fis-3.c
+@@ -0,0 +1,25 @@
++/* { dg-do compile { target pdp11-*-* } } */
++/* { dg-options "-O2 -fomit-frame-pointer -mfis" } */
++
++/* A constant operand is stored into the FIS scratch area as two words,
++   the sign and exponent word first because that is the lower address in
++   the PDP-11 single precision format.  1.5 is 040300 0, and 3.0 is
++   040500 0; getting this backwards would be the easy mistake, and the
++   FIS result would then be meaningless.  */
++
++float
++addc (float a)
++{
++  return a + 1.5f;
++}
++
++float
++mulc (float a)
++{
++  return a * 3.0f;
++}
++
++/* { dg-final { scan-assembler "mov\t.040300,\\(sp\\)\n\tclr\t02\\(sp\\)" } } */
++/* { dg-final { scan-assembler "mov\t.040500,\\(sp\\)\n\tclr\t02\\(sp\\)" } } */
++/* { dg-final { scan-assembler "fadd\t" } } */
++/* { dg-final { scan-assembler "fmul\t" } } */
+diff --git a/gcc/testsuite/gcc.target/pdp11/fis-4.c b/gcc/testsuite/gcc.target/pdp11/fis-4.c
+new file mode 100644
+index 0000000000000..8737447497459
+--- /dev/null
++++ b/gcc/testsuite/gcc.target/pdp11/fis-4.c
+@@ -0,0 +1,14 @@
++/* { dg-do compile { target pdp11-*-* } } */
++/* { dg-options "-O2 -mfis -mfpu" } */
++/* { dg-error "mutually exclusive" "" { target pdp11-*-* } 0 } */
++
++/* FIS and FPP are the two alternative floating point options of the
++   PDP-11 line, never both on one machine, and they do not even agree on
++   where a float lives.  Asking for both is an error rather than a silent
++   choice of one of them.  */
++
++float
++mul (float a, float b)
++{
++  return a * b;
++}

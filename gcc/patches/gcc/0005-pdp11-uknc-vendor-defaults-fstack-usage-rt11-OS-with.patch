@@ -1,0 +1,357 @@
+From: Yury Klushin <digger@live.ru>
+Date: Mon, 31 Aug 2026 01:42:34 +0300
+Subject: [PATCH] pdp11: uknc vendor defaults, -fstack-usage, rt11 OS with
+ auto-linked startup
+
+Squashes five incremental steps into one coherent feature:
+
+- config.sub / gcc/config.gcc: recognize "uknc" as a vendor alias for
+  pdp11-uknc-aout, defaulting to the 11/40 (TARGET_UKNC_DEFAULTS in
+  pdp11_option_override) unless the user explicitly overrides the
+  model.
+
+- gcc/config/pdp11/pdp11.cc: implement -fstack-usage/-Wstack-usage
+  support (previously silently ignored by this backend), so static
+  stack usage is reported the same way it would have caught this
+  project's earlier crt0 stack-overflow bug automatically at compile
+  time.
+
+- gcc/config.gcc: register "rt11" as a valid OS for the pdp11 target
+  triple (pdp11-uknc-rt11), alongside the existing aout OS -- a
+  landing spot for a future newlib port, since newlib's own
+  configure.host selects a libc/sys/<os> directory by matching the
+  triple's OS component, which "aout" (the object file format, not the
+  runtime environment) was never meant to carry.
+
+- gcc/config/pdp11/pdp11.h, libgcc/config.host,
+  libgcc/config/pdp11/{t-pdp11rt11,crt0rt.s,parse_args.c}: make a
+  plain link for pdp11-uknc-rt11 work without -nostartfiles and a
+  hand-linked crt0rt.o.  TARGET_RT11_DEFAULTS (set only for this OS)
+  makes pdp11.h's STARTFILE_SPEC pull in crt0rt.o/parse_args.o, built
+  as part of libgcc's own build (extra_parts, compiled via
+  $(GCC_FOR_TARGET) in t-pdp11rt11 -- the same pattern
+  libgcc/config/nds32/t-nds32 uses for its own optional crt0) so they
+  install as ordinary libgcc parts alongside libgcc.a.  crt0rt.s sets
+  SP from the SAV header and builds argc/argv from RT-11's own
+  command-line "chain area" (see its own comments for why
+  .CSISPC/CSTRNG=0 is a red herring for a plain interactive RUN);
+  parse_args.c is the C tokenizer it calls into, leaving argv[0] an
+  empty-string placeholder since RT-11 never tells a program its own
+  invocation name.  pdp11-uknc-aout and generic pdp11-*-* are
+  untouched and still get gcc.cc's generic STARTFILE_SPEC.
+
+- gcc/common/config/pdp11/pdp11-common.cc: default to -msoft-float for
+  the uknc vendor.  Real UKNC hardware has no FPU coprocessor, but the
+  generic pdp11 target default assumes an 11/45 with hardware floating
+  point, so every build for this target had to pass -msoft-float by
+  hand.  Gated on the same TARGET_UKNC_DEFAULTS (set for both
+  pdp11-uknc-rt11 and pdp11-uknc-aout), TARGET_DEFAULT_TARGET_FLAGS now
+  omits MASK_FPU for this vendor; -mfpu still works to opt back into
+  hardware floating point explicitly, and the generic (non-uknc) pdp11
+  target is unaffected.
+
+Verified with a full bootstrap build of pdp11-uknc-rt11: a minimal
+`int main(int argc, char **argv)` compiled with nothing but
+`-std=gnu23 -fomit-frame-pointer -O2` (no -msoft-float needed anymore)
+links cleanly through the gcc driver alone, and this project's real
+examples build end to end with their Makefiles simplified to match.
+Also verified with two freshly built cc1's: pdp11-uknc-rt11 now
+reports -mfpu [disabled] / -msoft-float [enabled] under --help=target
+with no flags, and compiling a double add() with no flags emits a call
+to ___adddf3 instead of hardware ldd/addd/std -- while a plain
+pdp11-aout build still reports -mfpu [enabled] / -msoft-float
+[disabled], confirming the generic default is untouched.
+---
+ config.sub                              |  6 ++-
+ gcc/common/config/pdp11/pdp11-common.cc | 10 ++++
+ gcc/config.gcc                          | 25 ++++++++++
+ gcc/config/pdp11/pdp11.cc               | 12 +++++
+ gcc/config/pdp11/pdp11.h                | 12 +++++
+ libgcc/config.host                      |  4 ++
+ libgcc/config/pdp11/crt0rt.s            | 63 +++++++++++++++++++++++++
+ libgcc/config/pdp11/parse_args.c        | 29 ++++++++++++
+ libgcc/config/pdp11/t-pdp11rt11         | 13 +++++
+ 9 files changed, 173 insertions(+), 1 deletion(-)
+ create mode 100644 libgcc/config/pdp11/crt0rt.s
+ create mode 100644 libgcc/config/pdp11/parse_args.c
+ create mode 100644 libgcc/config/pdp11/t-pdp11rt11
+
+diff --git a/config.sub b/config.sub
+index 38f3d037a785f..a4da7dd496bd2 100755
+--- a/config.sub
++++ b/config.sub
+@@ -607,6 +607,10 @@ case $1 in
+ 				basic_machine=a29k-amd
+ 				basic_os=udi
+ 				;;
++			uknc)
++				basic_machine=pdp11-uknc
++				basic_os=aout
++				;;
+ 			ultra3)
+ 				basic_machine=a29k-nyu
+ 				basic_os=sym1
+@@ -1732,7 +1736,7 @@ case $os in
+ 	     | mirbsd* | netbsd* | dicos* | openedition* | ose* \
+ 	     | bitrig* | openbsd* | secbsd* | solidbsd* | libertybsd* | os108* \
+ 	     | ekkobsd* | freebsd* | riscix* | lynxos* | os400* \
+-	     | bosx* | nextstep* | cxux* | aout* | elf* | oabi* \
++	     | bosx* | nextstep* | cxux* | aout* | elf* | oabi* | rt11* \
+ 	     | ptx* | coff* | ecoff* | winnt* | domain* | vsta* \
+ 	     | udi* | lites* | ieee* | go32* | aux* | hcos* \
+ 	     | chorusrdb* | cegcc* | glidix* | serenity* \
+diff --git a/gcc/common/config/pdp11/pdp11-common.cc b/gcc/common/config/pdp11/pdp11-common.cc
+index 1b21295f7f3a1..7c7886ba8c590 100644
+--- a/gcc/common/config/pdp11/pdp11-common.cc
++++ b/gcc/common/config/pdp11/pdp11-common.cc
+@@ -107,9 +107,19 @@ pdp11_option_init_struct (struct gcc_options *opts)
+   opts->x_flag_signaling_nans = 0;
+ }
+ 
++#ifdef TARGET_UKNC_DEFAULTS
++/* Real UKNC hardware has no FPU coprocessor, so -msoft-float is the
++   correct default for this vendor (see config.gcc) -- unlike the
++   generic pdp11 default below, which assumes an 11/45 with hardware
++   floating point.  -mfpu still works to override this explicitly.  */
++#undef TARGET_DEFAULT_TARGET_FLAGS
++#define TARGET_DEFAULT_TARGET_FLAGS \
++  (TARGET_UNIX_ASM_DEFAULT)
++#else
+ #undef TARGET_DEFAULT_TARGET_FLAGS
+ #define TARGET_DEFAULT_TARGET_FLAGS \
+   (MASK_FPU | TARGET_UNIX_ASM_DEFAULT)
++#endif
+ #undef TARGET_DEFAULT_TARGET_CPU_MODEL
+ #define TARGET_DEFAULT_TARGET_CPU_MODEL \
+   (OPTION_MASK_M11_45)
+diff --git a/gcc/config.gcc b/gcc/config.gcc
+index 087aaa7be3719..33cfb249d4c6a 100644
+--- a/gcc/config.gcc
++++ b/gcc/config.gcc
+@@ -2960,6 +2960,31 @@ or1k*-*-*)
+ 		;;
+ 	esac
+ 	;;
++pdp11-uknc-rt11*)
++	# Landing spot for a future newlib port targeting RT-11 on real
++	# UKNC hardware (newlib's own configure.host selects a
++	# libc/sys/<os> directory by matching this triple's OS component,
++	# which "aout" below was never meant to carry).  It exists as its
++	# own arm so it can grow independently without disturbing
++	# pdp11-uknc-aout.
++	#
++	# TARGET_RT11_DEFAULTS additionally makes STARTFILE_SPEC
++	# (pdp11.h) pull in crt0rt.o/parse_args.o -- built from
++	# libgcc/config/pdp11/{crt0rt.s,parse_args.c} via
++	# libgcc/config/pdp11/t-pdp11rt11 -- so a plain link for this OS
++	# gets a working RT-11 startup (SP from the SAV header, argc/argv
++	# from RT-11's own command-line chain area) without needing
++	# -nostartfiles and a hand-linked crt0rt.o, the way the aout OS
++	# still does.
++	tm_file="${tm_file} newlib-stdint.h"
++	tm_defines="${tm_defines} TARGET_UKNC_DEFAULTS=1 TARGET_RT11_DEFAULTS=1"
++	use_gcc_stdint=wrap
++	;;
++pdp11-uknc-*)
++	tm_file="${tm_file} newlib-stdint.h"
++	tm_defines="${tm_defines} TARGET_UKNC_DEFAULTS=1"
++	use_gcc_stdint=wrap
++	;;
+ pdp11-*-*)
+ 	tm_file="${tm_file} newlib-stdint.h"
+ 	use_gcc_stdint=wrap
+diff --git a/gcc/config/pdp11/pdp11.cc b/gcc/config/pdp11/pdp11.cc
+index e9490cd0d9d01..38c47dfed77d2 100644
+--- a/gcc/config/pdp11/pdp11.cc
++++ b/gcc/config/pdp11/pdp11.cc
+@@ -149,6 +149,7 @@ decode_pdp11_d (const struct real_format *fmt ATTRIBUTE_UNUSED,
+ }
+ 
+ static const char *singlemove_string (rtx *);
++static int pdp11_reg_save_size (void);
+ static bool pdp11_assemble_integer (rtx, unsigned int, int);
+ static bool pdp11_rtx_costs (rtx, machine_mode, int, int, int *, bool);
+ static int pdp11_addr_cost (rtx, machine_mode, addr_space_t, bool);
+@@ -379,6 +380,9 @@ pdp11_expand_prologue (void)
+   if (fsize)
+     emit_insn (gen_addhi3 (stack_pointer_rtx, stack_pointer_rtx,
+ 			   GEN_INT (-fsize)));
++
++  if (flag_stack_usage_info)
++    current_function_static_stack_size = pdp11_reg_save_size () + fsize;
+ }
+ 
+ /* Generate epilogue.  This uses the frame pointer to pop the local
+@@ -2335,6 +2339,14 @@ pdp11_option_override (void)
+       targetm.asm_out.open_paren  = "<";
+       targetm.asm_out.close_paren = ">";
+     }
++
++#ifdef TARGET_UKNC_DEFAULTS
++  /* Configured for vendor "uknc" (pdp11-uknc-*): default to the 11/40,
++     which is what the machine's own 1801BM2 is to this compiler --
++     unless the user explicitly overrode it.  */
++  if (!global_options_set.x_pdp11_model)
++    pdp11_model = OPTION_MASK_M11_40;
++#endif
+ }
+ 
+ static void
+diff --git a/gcc/config/pdp11/pdp11.h b/gcc/config/pdp11/pdp11.h
+index 023416d751c6e..c8f70571cf500 100644
+--- a/gcc/config/pdp11/pdp11.h
++++ b/gcc/config/pdp11/pdp11.h
+@@ -664,3 +664,15 @@ extern int current_first_parm_offset;
+ /* pdp11-unknown-aout target has no support of C99 runtime */
+ #undef TARGET_LIBC_HAS_FUNCTION
+ #define TARGET_LIBC_HAS_FUNCTION no_c99_libc_has_function
++
++#ifdef TARGET_RT11_DEFAULTS
++/* For pdp11-uknc-rt11 (see config.gcc), a plain link should just work
++   without -nostartfiles: pull in the RT-11 startup (sets SP from the SAV
++   header, builds argc/argv from RT-11's own command-line chain area) built
++   as crt0rt.o/parse_args.o from libgcc/config/pdp11/{crt0rt.s,parse_args.c}
++   via libgcc/config/pdp11/t-pdp11rt11.  This overrides gcc.cc's generic
++   STARTFILE_SPEC, which looks for a "crt0.o" this target has never
++   provided.  */
++#undef STARTFILE_SPEC
++#define STARTFILE_SPEC "crt0rt.o%s parse_args.o%s"
++#endif
+diff --git a/libgcc/config.host b/libgcc/config.host
+index 6a88ee5a2dd0b..5b9eb7a15d886 100644
+--- a/libgcc/config.host
++++ b/libgcc/config.host
+@@ -1205,6 +1205,10 @@ or1k-*-*)
+ 	tmake_file="$tmake_file or1k/t-or1k or1k/t-crtstuff"
+ 	tmake_file="$tmake_file t-softfp-sfdf t-softfp"
+ 	;;
++pdp11-uknc-rt11*)
++	tmake_file="pdp11/t-pdp11 pdp11/t-pdp11rt11 t-fdpbit"
++	extra_parts="$extra_parts crt0rt.o parse_args.o"
++	;;
+ pdp11-*-*)
+ 	tmake_file="pdp11/t-pdp11 t-fdpbit"
+ 	;;
+diff --git a/libgcc/config/pdp11/crt0rt.s b/libgcc/config/pdp11/crt0rt.s
+new file mode 100644
+index 0000000000000..81b25f5efb830
+--- /dev/null
++++ b/libgcc/config/pdp11/crt0rt.s
+@@ -0,0 +1,63 @@
++    .TITLE CRT0RT shim
++    .IDENT "V00.00"
++
++    .text
++    .GLOBAL _main
++    .GLOBAL _parse_args
++
++argv_max   = 16
++cmdbuf_max = 80
++
++    .GLOBAL start
++start:
++        mov   @$042, sp   // SP comes from the SAV header (RT-11 sets it before we start)
++
++        // RT-11's KMON, when it runs a program via RUN (or by typing its name
++        // directly), copies whatever followed the program name on that command
++        // into the fixed "chain area": a byte count at address 0510 and the
++        // raw (not NUL-terminated) text itself starting at 0512 -- this
++        // survives untouched into our own memory as long as our SAV file
++        // doesn't set the CHAIN$ bit in the JSW (bit 8 of the word at 044),
++        // which sav-pdp11.c never does.  (.CSISPC with CSTRNG=0 looks similar
++        // but is a red herring here: per the RT-11 System Macro Library
++        // Manual it only replays this text when the program was invoked
++        // *through an indirect command file*; for a plain interactive RUN it
++        // instead reprompts the terminal with "*", which is why an earlier
++        // version of this file using that EMT never actually saw argv.)
++        mov   @$0510, r2       // r2 = byte count of the invoking command line
++        cmp   r2, $cmdbuf_max
++        ble   1$
++        mov   $cmdbuf_max, r2
++1$:     mov   $0512, r1        // r1 = raw command-line text
++        mov   $cmdbuf, r3      // r3 = our own copy, which we NUL-terminate
++        tst   r2
++        beq   3$
++2$:     movb  (r1)+, (r3)+
++        dec   r2
++        bne   2$
++3$:     clrb  (r3)
++
++        mov   $argv_max, -(sp)
++        mov   $argv, -(sp)
++        mov   $cmdbuf, -(sp)
++        jsr   pc, _parse_args
++        add   $6, sp      // r0 now holds argc
++
++        mov   $argv, -(sp)
++        mov   r0, -(sp)
++        jsr   pc, _main
++        emt   0350	// .EXIT
++        nop
++    .even
++
++    .GLOBAL ___main
++___main:
++        rts   pc
++    .even
++
++    .bss
++cmdbuf: .skip cmdbuf_max+1
++    .even          // argv holds words -- must not land on an odd address
++argv:   .skip (argv_max+1)*2
++
++    .end
+diff --git a/libgcc/config/pdp11/parse_args.c b/libgcc/config/pdp11/parse_args.c
+new file mode 100644
+index 0000000000000..784ae8182d7a3
+--- /dev/null
++++ b/libgcc/config/pdp11/parse_args.c
+@@ -0,0 +1,29 @@
++static char empty_string[1];
++
++int
++parse_args (char *cmdline, char **argv, int max_args)
++{
++  int argc = 1;
++  char *p = cmdline;
++
++  /* RT-11 never tells a program its own invocation name (see crt0rt.s), so
++     argv[0] is just this placeholder -- real arguments start at argv[1],
++     matching the usual C convention.  */
++  argv[0] = empty_string;
++
++  while (argc < max_args)
++    {
++      while (*p == ' ' || *p == '\t')
++	p++;
++      if (*p == '\0')
++	break;
++      argv[argc++] = p;
++      while (*p != '\0' && *p != ' ' && *p != '\t')
++	p++;
++      if (*p == '\0')
++	break;
++      *p++ = '\0';
++    }
++  argv[argc] = 0;
++  return argc;
++}
+diff --git a/libgcc/config/pdp11/t-pdp11rt11 b/libgcc/config/pdp11/t-pdp11rt11
+new file mode 100644
+index 0000000000000..ceadd6a7bf8c8
+--- /dev/null
++++ b/libgcc/config/pdp11/t-pdp11rt11
+@@ -0,0 +1,13 @@
++# Build crt0rt.o and parse_args.o (see gcc/config/pdp11/pdp11.h's
++# STARTFILE_SPEC, guarded by TARGET_RT11_DEFAULTS) for pdp11-uknc-rt11:
++# the RT-11 startup that sets SP from the SAV header and builds argc/argv
++# from RT-11's own command-line chain area (see crt0rt.s's own comments),
++# plus the plain C command-line tokenizer it calls into.
++
++crt0rt.o: $(srcdir)/config/pdp11/crt0rt.s
++	$(GCC_FOR_TARGET) $(INCLUDES) $(CFLAGS) -Wa,-mno-fpu,-mlimited-eis,-pic \
++		-c $(srcdir)/config/pdp11/crt0rt.s -o crt0rt.o
++
++parse_args.o: $(srcdir)/config/pdp11/parse_args.c
++	$(GCC_FOR_TARGET) $(INCLUDES) $(CFLAGS) -fomit-frame-pointer -msoft-float \
++		-O2 -c $(srcdir)/config/pdp11/parse_args.c -o parse_args.o

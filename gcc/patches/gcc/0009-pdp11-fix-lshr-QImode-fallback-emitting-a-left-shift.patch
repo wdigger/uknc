@@ -1,0 +1,53 @@
+From f2f0dea373eb9e38a668f3e85cfe67a331d2ef42 Mon Sep 17 00:00:00 2001
+From: Yury Klushin <digger@live.ru>
+Date: Sat, 5 Sep 2026 22:22:25 +0300
+Subject: [PATCH] pdp11: fix lshr QImode fallback emitting a left shift instead
+ of right
+
+lshr<mode>3's QImode path (taken whenever pdp11_expand_shift's
+small-constant fast path doesn't apply, i.e. shift counts >= 4 -- see
+pdp11_small_shift) zero-extends to HImode and emits a single ASH: a
+positive count shifts left, negative shifts right. This is a logical
+*right* shift, so the count needs negating first -- ashr<mode>3's own
+QImode case, right above it, already does exactly this for the
+arithmetic right shift. lshr<mode>3's copy of the same pattern never
+got the negation, so it silently shifted left instead.
+
+Confirmed directly: `(unsigned char)b >> 4` (and >>5/>>6/>>7; >>0
+through >>3 stay on the small-constant path and were never affected)
+compiled to code that behaved as `b << 4` instead -- same operand
+count, same instruction shape, so nothing about the build itself
+looked wrong. Verified on real hardware (ukncbtl-debugger emulator):
+0xff shifted right by 0..7 now reads back ff 7f 3f 1f 0f 07 03 01,
+where it previously read ff 7f 3f 1f f0 e0 c0 80 for the last four.
+---
+ gcc/config/pdp11/pdp11.md | 15 ++++++++++++++-
+ 1 file changed, 14 insertions(+), 1 deletion(-)
+
+diff --git a/gcc/config/pdp11/pdp11.md b/gcc/config/pdp11/pdp11.md
+index 554158591489b..ad6f69dd3deab 100644
+--- a/gcc/config/pdp11/pdp11.md
++++ b/gcc/config/pdp11/pdp11.md
+@@ -1786,8 +1786,21 @@
+     {
+       if (<QHSint:e_mname> == E_QImode)
+         {
++          /* aslhi_op is ASH: a positive count shifts left, negative
++             shifts right.  This is a logical *right* shift, so the
++             count must be negated here -- see ashr<mode>3's own
++             QImode case above, which does the same thing for the
++             arithmetic right shift.  Without this, whenever
++             pdp11_expand_shift's small-constant fast path doesn't
++             apply (shift counts >= 4 -- see pdp11_small_shift), this
++             path silently emitted a *left* shift instead of a right
++             one: a wrong but plausible-looking result (same operands,
++             same instruction count), not a build failure, so this
++             went unnoticed until traced back from a C testcase that
++             compared (b >> 4) against its expected value.  */
++          rtx neg_amount = negate_rtx (HImode, operands[2]);
+           r = copy_to_mode_reg (HImode, gen_rtx_ZERO_EXTEND (HImode, operands[1]));
+-          emit_insn (gen_aslhi_op (r, r, operands[2]));
++          emit_insn (gen_aslhi_op (r, r, neg_amount));
+           emit_insn (gen_movqi (operands[0], gen_rtx_SUBREG (QImode, r, 0)));
+         }
+       else

@@ -6,7 +6,7 @@ AS:=pdp11-aout-as
 AR:=pdp11-aout-ar
 LD:=pdp11-aout-ld
 OPT_FLAG:=-O0
-GCC_FLAGS:=-std=gnu23 -fomit-frame-pointer -msoft-float -fcprop-registers -fPIC -nostartfiles -nodefaultlibs -nostdlib -mbm2 -fno-builtin $(OPT_FLAG)
+GCC_FLAGS:=-std=gnu23 -fomit-frame-pointer -msoft-float -fcprop-registers -fPIC -nostartfiles -nodefaultlibs -nostdlib -fno-builtin $(OPT_FLAG)
 AS_FLAGS:=-mno-fpu -meis -mfis -pic
 
 all:	libpdp11-float.a test.sav test.dsk

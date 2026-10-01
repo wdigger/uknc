@@ -1,0 +1,457 @@
+From: Yury Klushin <digger@live.ru>
+Date: Mon, 31 Aug 2026 02:33:45 +0300
+Subject: [PATCH] newlib: minimal port for pdp11-uknc-rt11
+
+Adds a small newlib port targeting RT-11 on real UKNC hardware
+(pdp11-uknc-rt11, see gcc/config.gcc in the wdigger/gcc fork), so
+ordinary printf/malloc/file-I/O-style C code works out of the box
+instead of every example hand-rolling its own tiny libc.
+
+- libc/sys/rt11/syscalls.c: _read/_write/_open/_close/_lseek/_fstat/
+  _isatty/_sbrk/_exit, plus ENOSYS stubs for _kill/_getpid/_link/
+  _unlink/_stat. Console I/O for fds 0/1/2 goes through RT-11's own
+  TTY EMTs (.TTYIN/.TTYOUT), with the value pinned to hardware
+  register R0 via GCC's register-asm extension (a plain "r" constraint
+  isn't enough here -- the EMT reads/writes R0 specifically).  _sbrk
+  grows the heap from _end (as defined by the linker script) upward,
+  capped against the current SP with a fixed safety margin. Startup
+  itself is NOT provided here -- it comes from GCC's own
+  STARTFILE_SPEC (crt0rt.o/parse_args.o), so configure.host sets
+  have_crt0="no" for this arm.
+- configure.host: sys_dir=rt11 for pdp11-uknc-rt11; libc/acinclude.m4
+  and libc/sys/Makefile.inc wire the new sys/rt11 directory into the
+  generated build the same way every other sys_dir does.  A separate
+  pdp11* arm in the CPU-dispatch case avoids falling through to the
+  generic default, which sets -DMISSING_SYSCALL_NAMES and would alias
+  away this port's _read/_write/etc. (see _syslist.h) in favor of
+  plain names it never defines -- this port uses the normal
+  underscore-prefixed convention (matching e.g. d10v), not the
+  plain-name one.
+- libc/include/machine/ieeefp.h: a __pdp11__ block defining
+  __IEEE_LITTLE_ENDIAN (doubles are little-endian at the word level on
+  this target even though plain 32-bit ints are word-swapped) and
+  __SMALL_BITFIELDS (pdp11 int is 16 bits, same reason msp430/rl78/cr16
+  need it) -- without these this header hits a flat #error and, once
+  that's fixed, bitfield-width errors on 32-bit-wide fields.
+- libc/ssp/Makefile.inc: stack_protector.c left out. It needs
+  __attribute__((constructor)) to seed __stack_chk_guard at startup,
+  and GCC's pdp11 backend doesn't support constructors at all ("sorry,
+  unimplemented: global constructors not supported on this target") --
+  a real, separate backend limitation, not something newlib can work
+  around. -fstack-protector isn't usable on this target either way, so
+  nothing else references __stack_chk_guard/__stack_chk_fail without
+  it.
+
+Verified with a full from-scratch build of gcc+newlib (--with-newlib):
+libc.a/libm.a build and install cleanly with zero compiler ICEs and
+zero archive errors, and a real `printf`/`malloc`/`hypot` test program
+compiles and links straight to a working RT-11 .sav file with a single
+plain `pdp11-uknc-rt11-gcc -O2 -o test.sav test.c` -- no -nodefaultlibs,
+no manual -lgcc.  (Two genuine, separate GCC pdp11-backend bugs were
+found and fixed along the way in the wdigger/gcc fork rather than
+worked around here: a reload-pass ICE avoided by -msoft-float, now the
+default for this vendor, and a cprop_hardreg ICE in
+libc/stdlib/gdtoa-hexnan.c fixed at its root with a new predicate in
+gcc/config/pdp11/predicates.md.)
+
+Includes what was a separate fix on top of this one, now part of it:
+
+rt11: remove redundant errno definition, matching reent.c's own default
+
+libc/sys/rt11/syscalls.c copied the "#undef errno / int errno;" pattern
+from its own stated reference port, libc/sys/d10v/syscalls.c. But
+libc/reent/reent.c already provides that exact definition by default,
+guarded by #ifndef REENTRANT_SYSCALLS_PROVIDED -- precisely the escape
+hatch a port is meant to use if (and only if) it wants to own errno's
+storage itself. rt11's port never defines that macro, so both
+translation units emitted a real, non-tentative `errno` symbol,
+producing a "multiple definition" link error.
+
+This only surfaces under a modern (GCC >= 10) toolchain: -fno-common
+has been the default since then, so tentative definitions across files
+are no longer silently merged the way older GCC always did -- which is
+why d10v itself, never rebuilt with a current GCC, never hit this.
+
+Removing the duplicate leaves errno as newlib's normal (*__errno())
+macro, backed by reent.c's default storage, same as every other
+assignment already in this file (errno = ENOSYS; etc.).
+---
+ newlib/configure.host                |  46 ++++++
+ newlib/libc/acinclude.m4             |   2 +-
+ newlib/libc/include/machine/ieeefp.h |  11 ++
+ newlib/libc/ssp/Makefile.inc         |  11 +-
+ newlib/libc/sys/Makefile.inc         |   3 +
+ newlib/libc/sys/rt11/Makefile.inc    |   1 +
+ newlib/libc/sys/rt11/syscalls.c      | 211 +++++++++++++++++++++++++++
+ 7 files changed, 282 insertions(+), 3 deletions(-)
+ create mode 100644 newlib/libc/sys/rt11/Makefile.inc
+ create mode 100644 newlib/libc/sys/rt11/syscalls.c
+
+diff --git a/newlib/configure.host b/newlib/configure.host
+index 960cca2..b1799b5 100644
+--- a/newlib/configure.host
++++ b/newlib/configure.host
+@@ -293,6 +293,33 @@ case "${host_cpu}" in
+ 	machine_dir=or1k
+ 	have_init_fini=no
+ 	;;
++  pdp11*)
++	# No CPU-specific optimized routines in libc/machine; plain C
++	# implementations are used throughout.
++	#
++	# No -msoft-float here: the absence of an FPU is a trait of the
++	# uknc vendor, not of this CPU generically or of the rt11 OS this
++	# port targets, so it belongs in the compiler's own target defaults
++	# (gcc/common/config/pdp11/pdp11-common.cc, gated on
++	# TARGET_UKNC_DEFAULTS) rather than hardcoded for every pdp11 build
++	# here. Real UKNC hardware has no FPU coprocessor, and GCC now
++	# defaults to -msoft-float for that vendor accordingly.
++	#
++	# That default is still functionally required, though, to avoid a
++	# real backend bug: a union of a double with a smaller integer
++	# struct member (exactly what libm/math/e_hypot.c,
++	# libm/common/s_cbrt.c and libm/common/s_infinity.c all do via the
++	# GET_HIGH_WORD-style type-punning macros) makes GCC represent the
++	# union as a single DImode pseudo that also needs a DFmode subreg
++	# view for hardware floating-point registers, and reload can't find
++	# a valid allocation for that combination on pdp11's tiny register
++	# file -- "internal compiler error: in find_reloads_toplev, at
++	# reload.cc:4760".  -msoft-float avoids it by keeping doubles out of
++	# the separate FP register class entirely.  If this newlib port is
++	# ever built for a non-uknc pdp11 target (hardware FPU enabled by
++	# default), this ICE will resurface and need -msoft-float added back
++	# here explicitly.
++	;;
+   powerpc*)
+ 	machine_dir=powerpc
+ 	libm_machine_dir=powerpc
+@@ -447,6 +474,13 @@ case "${host}" in
+ 	sys_dir=tirtos
+ 	have_crt0="no"
+ 	;;
++  pdp11-*-rt11*)
++	sys_dir=rt11
++	# crt0 (crt0rt.o) is supplied by GCC's own STARTFILE_SPEC
++	# (gcc/config/pdp11/pdp11.h, TARGET_RT11_DEFAULTS), built as part
++	# of libgcc (libgcc/config/pdp11/t-pdp11rt11) -- not by newlib.
++	have_crt0="no"
++	;;
+   *-esp-*)
+ 	sys_dir=esp
+     have_crt0="no"
+@@ -815,6 +849,18 @@ newlib_cflags="${newlib_cflags} -DCLOCK_PROVIDED -DMALLOC_PROVIDED -DEXIT_PROVID
+   or1k*|or1knd*)
+ 	syscall_dir=syscalls
+ 	;;
++  pdp11*)
++	# Without an explicit arm here, this would fall through to the
++	# generic default below and pick up -DMISSING_SYSCALL_NAMES, which
++	# makes libc/reent's _read_r-style wrappers call the plain (e.g.
++	# "read") syscall name instead of the underscore-prefixed one
++	# (_syslist.h's #define _read read etc.) -- but libc/sys/rt11/
++	# syscalls.c uses the normal underscore-prefixed convention (_read,
++	# _write, ...), the same as e.g. d10v above, so nothing here should
++	# be aliased.  syscall_dir is left unset (no libc/syscalls): that
++	# directory only adds plain-POSIX-name wrappers (read() calling
++	# _read_r()) on top, which nothing in this minimal port needs.
++	;;
+   powerpc*-*-eabialtivec*)
+ 	default_newlib_io_long_long="yes"
+ 	newlib_cflags="${newlib_cflags} -DMISSING_SYSCALL_NAMES"
+diff --git a/newlib/libc/acinclude.m4 b/newlib/libc/acinclude.m4
+index 52a6c57..0a2f7dc 100644
+--- a/newlib/libc/acinclude.m4
++++ b/newlib/libc/acinclude.m4
+@@ -19,7 +19,7 @@ m4_foreach_w([SYS_DIR], [
+   m88kbug mmixware
+   netware
+   or1k
+-  rdos rtems
++  rdos rt11 rtems
+   sh sysmec sysnec810 sysnecv850 sysvi386 sysvnecv70
+   tic80 tirtos
+   w65
+diff --git a/newlib/libc/include/machine/ieeefp.h b/newlib/libc/include/machine/ieeefp.h
+index c5fafcf..1412a57 100644
+--- a/newlib/libc/include/machine/ieeefp.h
++++ b/newlib/libc/include/machine/ieeefp.h
+@@ -212,6 +212,17 @@
+ # define _SUPPORTS_ERREXCEPT
+ #endif
+ 
++/* PDP-11 doubles are little-endian at the word level (GCC's own
++   __FLOAT_WORD_ORDER__ == __ORDER_LITTLE_ENDIAN__ for this target),
++   even though plain 32-bit integers are word-swapped ("PDP-endian",
++   __BYTE_ORDER__ == __ORDER_PDP_ENDIAN__) -- the two are independent
++   here and only the float one matters to this file.  __SMALL_BITFIELDS:
++   pdp11 int is 16 bits, same reason msp430/rl78/cr16 above need it.  */
++#ifdef __pdp11__
++#define __IEEE_LITTLE_ENDIAN
++#define __SMALL_BITFIELDS	/* 16 Bit INT */
++#endif
++
+ #ifdef __riscv
+ #if defined(__BYTE_ORDER__) && (__BYTE_ORDER__ == __ORDER_BIG_ENDIAN__)
+ #define __IEEE_BIG_ENDIAN
+diff --git a/newlib/libc/ssp/Makefile.inc b/newlib/libc/ssp/Makefile.inc
+index f1dc912..533fa8d 100644
+--- a/newlib/libc/ssp/Makefile.inc
++++ b/newlib/libc/ssp/Makefile.inc
+@@ -1,7 +1,14 @@
+ ## General sources.
++# stack_protector.c is deliberately left out for pdp11: it needs a global
++# constructor (__attribute__((constructor))) to seed __stack_chk_guard at
++# startup, and GCC's pdp11 backend doesn't support constructors at all
++# ("sorry, unimplemented: global constructors not supported on this
++# target") -- a real, separate backend limitation, not something newlib
++# can work around.  -fstack-protector isn't usable on this target either
++# way, so nothing references __stack_chk_guard/__stack_chk_fail without
++# it.
+ %C%_ELIX_SOURCES = \
+-  %D%/chk_fail.c \
+-  %D%/stack_protector.c
++  %D%/chk_fail.c
+ 
+ ## String sources.
+ %C%_ELIX_SOURCES += \
+diff --git a/newlib/libc/sys/Makefile.inc b/newlib/libc/sys/Makefile.inc
+index 9f87589..055769e 100644
+--- a/newlib/libc/sys/Makefile.inc
++++ b/newlib/libc/sys/Makefile.inc
+@@ -34,6 +34,9 @@ endif
+ if HAVE_LIBC_SYS_RDOS_DIR
+ include %D%/rdos/Makefile.inc
+ endif
++if HAVE_LIBC_SYS_RT11_DIR
++include %D%/rt11/Makefile.inc
++endif
+ if HAVE_LIBC_SYS_RTEMS_DIR
+ include %D%/rtems/Makefile.inc
+ endif
+diff --git a/newlib/libc/sys/rt11/Makefile.inc b/newlib/libc/sys/rt11/Makefile.inc
+new file mode 100644
+index 0000000..ec43972
+--- /dev/null
++++ b/newlib/libc/sys/rt11/Makefile.inc
+@@ -0,0 +1 @@
++libc_a_SOURCES += %D%/syscalls.c
+diff --git a/newlib/libc/sys/rt11/syscalls.c b/newlib/libc/sys/rt11/syscalls.c
+new file mode 100644
+index 0000000..fe990e4
+--- /dev/null
++++ b/newlib/libc/sys/rt11/syscalls.c
+@@ -0,0 +1,211 @@
++/* syscalls.c -- minimal newlib syscall layer for RT-11 (pdp11-uknc-rt11)
++ *
++ * This is a small port in newlib's own sense (see libc/sys/d10v for the
++ * precedent this follows): one syscalls.c, no reentrancy support, no
++ * POSIX path translation.  Startup (crt0) is not provided here -- it
++ * comes from GCC's own STARTFILE_SPEC (gcc/config/pdp11/pdp11.h,
++ * TARGET_RT11_DEFAULTS), built via libgcc/config/pdp11/t-pdp11rt11 from
++ * crt0rt.s/parse_args.c -- see newlib/configure.host's have_crt0=no for
++ * this OS.
++ *
++ * Console I/O (fds 0/1/2) goes through RT-11's own terminal EMTs
++ * (.TTYIN/EMT 340, .TTYOUT/EMT 341 -- see the RT-11 System Macro Library
++ * Manual's "Programmed Request Description and Examples" chapter for
++ * both).  Real file I/O (.LOOKUP/.ENTER/.READW/.WRITW/.CLOSE) is not
++ * implemented yet: RT-11's file requests are block/word-oriented, not
++ * byte-stream oriented like POSIX read()/write(), so mapping one onto
++ * the other needs its own buffering layer rather than a one-line EMT
++ * wrapper -- left as a followup once this console+heap baseline is
++ * verified working.  _open/_close/_lseek on anything other than the
++ * three console fds fail with ENOSYS in the meantime.
++ */
++
++#include <_ansi.h>
++#include <sys/types.h>
++#include <sys/stat.h>
++#include <errno.h>
++
++/* .EXIT -- EMT 350 (same request crt0rt.s itself uses to return to
++   RT-11 after main() returns).  */
++void
++_exit (int status)
++{
++  asm volatile ("emt 0350");
++  for (;;)
++    ;
++}
++
++/* .TTYOUT -- EMT 341.  Character in R0; BCS retries while the console
++   is still busy transmitting the previous one.  Both EMTs read/write R0
++   specifically, not just "some register", so it's pinned by name (same
++   trick this file's own _sbrk uses for the stack pointer) rather than
++   left to a generic "r" constraint, which wouldn't guarantee R0.  */
++static void
++rt11_ttyout (char c)
++{
++  register unsigned short r0 asm ("r0") = (unsigned char) c;
++  asm volatile (
++    "1: emt 0341\n\t"
++    "bcs 1b"
++    : "+r" (r0)
++    :
++    : "cc");
++}
++
++/* .TTYIN -- EMT 340.  Blocks until a character is available; returned
++   right-justified (low byte) in R0.  */
++static char
++rt11_ttyin (void)
++{
++  register unsigned short r0 asm ("r0");
++  asm volatile (
++    "1: emt 0340\n\t"
++    "bcs 1b"
++    : "=r" (r0));
++  return (char) r0;
++}
++
++int
++_write (int file, const void *ptr, size_t len)
++{
++  const char *p = (const char *) ptr;
++  size_t i;
++
++  if (file != 1 && file != 2)
++    {
++      errno = ENOSYS;
++      return -1;
++    }
++
++  for (i = 0; i < len; i++)
++    rt11_ttyout (p[i]);
++
++  return (int) len;
++}
++
++int
++_read (int file, void *ptr, size_t len)
++{
++  char *p = (char *) ptr;
++  size_t i;
++
++  if (file != 0)
++    {
++      errno = ENOSYS;
++      return -1;
++    }
++
++  for (i = 0; i < len; i++)
++    {
++      char c = rt11_ttyin ();
++
++      p[i] = c;
++      if (c == '\r' || c == '\n')
++	{
++	  i++;
++	  break;
++	}
++    }
++
++  return (int) i;
++}
++
++int
++_close (int file)
++{
++  if (file == 0 || file == 1 || file == 2)
++    return 0;
++  errno = ENOSYS;
++  return -1;
++}
++
++int
++_lseek (int file, off_t offset, int whence)
++{
++  errno = ENOSYS;
++  return -1;
++}
++
++int
++_open (const char *name, int flags, int mode)
++{
++  errno = ENOSYS;
++  return -1;
++}
++
++int
++_fstat (int file, struct stat *st)
++{
++  st->st_mode = S_IFCHR;
++  return 0;
++}
++
++int
++_isatty (int file)
++{
++  return file == 0 || file == 1 || file == 2;
++}
++
++/* Heap grows from _end (see ld/scripttempl/pdp11rt11.sc) up towards the
++   current stack, with a fixed safety margin -- the same class of
++   stack/heap collision this project already hit once with a hardcoded
++   crt0 stack address, not repeating it here.  */
++#define RT11_STACK_MARGIN 512
++
++register char *stack_ptr asm ("sp");
++
++caddr_t
++_sbrk (int incr)
++{
++  extern char _end;
++  static char *heap_end;
++  char *prev_heap_end;
++
++  if (heap_end == 0)
++    heap_end = &_end;
++
++  prev_heap_end = heap_end;
++
++  if (heap_end + incr > stack_ptr - RT11_STACK_MARGIN)
++    {
++      errno = ENOMEM;
++      return (caddr_t) -1;
++    }
++
++  heap_end += incr;
++  return (caddr_t) prev_heap_end;
++}
++
++int
++_kill (int pid, int sig)
++{
++  errno = ENOSYS;
++  return -1;
++}
++
++int
++_getpid (void)
++{
++  return 1;
++}
++
++int
++_link (const char *old, const char *new)
++{
++  errno = ENOSYS;
++  return -1;
++}
++
++int
++_unlink (const char *name)
++{
++  errno = ENOSYS;
++  return -1;
++}
++
++int
++_stat (const char *file, struct stat *st)
++{
++  errno = ENOSYS;
++  return -1;
++}
+-- 
+2.54.0 (Apple Git-157)
+

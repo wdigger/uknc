@@ -1,0 +1,207 @@
+From 21275ce2fb7390857455f8637db4fb70cfa1da68 Mon Sep 17 00:00:00 2001
+From: Yury Klushin <digger@live.ru>
+Date: Sun, 13 Sep 2026 14:28:56 +0300
+Subject: [PATCH] libm: hand fdlibm an IEEE view of the PDP-11's DEC formats
+
+A float on the PDP-11 is not an IEEE one: the formats are DEC's, single
+precision differing from IEEE single only in the bias and double
+precision rather more, an 8-bit exponent and 55 bits of fraction against
+11 and 52.  fdlibm reaches into a double for its exponent and mantissa
+all over the place, so none of it worked here: sqrt(4.0) returned
+garbage, and so did everything else.
+
+Every one of those reads goes through eight macros in this file, though,
+and what the algorithms do with the value itself is arithmetic, which the
+compiler gets right.  So the macros now hand out an IEEE view of a DEC
+number and take one back, and not a line of the algorithms needs
+touching: they read the exponent they expect, compute in whatever the
+machine's arithmetic really is, and hand back bits that are put away
+again in the real format.
+
+The view is faithful over the whole of this format's range, which is
+narrower than IEEE's in both precisions, so nothing is clamped on the way
+out and the familiar constants still mean what they say -- 0x3ff00000 is
+still the high word of 1.0.  Three things do not survive the trip, all at
+the edges: a double loses the bottom 3 bits of its fraction, 55 not
+fitting in 52, so results are good to IEEE's 53 bits rather than this
+format's 56; a value built through the macros with an exponent out of
+range comes back as the largest finite magnitude or as zero, there being
+no infinity to overflow to; and the two single precision exponents below
+IEEE's smallest normal read as zero.
+
+Checked on a UKNC under RT-11 against constants the compiler folded:
+sqrt, exp, log, log10, pow, sin, cos, tan, atan, atan2, asin, acos, fmod,
+hypot, sinh, cosh, tanh, expm1, floor, ceil, fabs, ldexp, frexp and modf
+all come out right.  What remains is a matter of size rather than
+correctness: libm is enormous against a 64KB address space, and tan for
+one comes to 47KB with a test harness around it and will not load.
+---
+ newlib/libm/common/fdlibm.h | 155 ++++++++++++++++++++++++++++++++++++
+ 1 file changed, 155 insertions(+)
+
+diff --git a/newlib/libm/common/fdlibm.h b/newlib/libm/common/fdlibm.h
+index 7a49e29e0b..ad359430b5 100644
+--- a/newlib/libm/common/fdlibm.h
++++ b/newlib/libm/common/fdlibm.h
+@@ -378,6 +378,161 @@ do {								\
+   (d) = sf_u.value;						\
+ } while (0)
+ 
++#ifdef __pdp11__
++
++/* On the PDP-11 a float is not an IEEE one: the formats are DEC's, see
++   pdp11_f_format and pdp11_d_format in gcc/config/pdp11/pdp11.cc.  Single
++   precision has IEEE's field widths but a bias of 129 over a fraction
++   taken as lying in [0.5, 1); double precision has an 8-bit exponent,
++   like single precision, and 55 bits of fraction rather than 11 and 52.
++   Neither has an infinity, a NaN or a denormal.
++
++   That would make a whole library out of this one, since every algorithm
++   below reaches into the bits for an exponent.  But they only ever do it
++   through the eight macros above, and what they do with the value itself
++   is arithmetic, which the compiler gets right.  So the macros here hand
++   out an IEEE *view* of a DEC number and take one back, and the
++   algorithms need no changes at all: they read the exponent they expect,
++   compute in whatever the machine's arithmetic really is, and hand back
++   bits that are put away again in the real format.
++
++   The view is faithful over this format's whole range, which is narrower
++   than IEEE's in both precisions, so nothing is clamped on the way out
++   and the familiar constants still mean what they say: 0x3ff00000 is
++   still the high word of 1.0.  Three things do not survive the trip, all
++   of them at the edges.  A double loses the bottom 3 bits of its
++   fraction, 55 not fitting in 52, so results are good to IEEE's 53 bits
++   rather than this format's 56.  A value built through the macros with an
++   exponent out of range comes back as the largest finite magnitude or as
++   zero, there being no infinity to overflow to.  And the very bottom of
++   the single precision range, the two exponents below IEEE's smallest
++   normal, reads as zero.  */
++
++typedef union { double __d; __uint64_t __u; } __pdp11_dbits;
++typedef union { float __f; __uint32_t __u; } __pdp11_fbits;
++
++#define __PDP11_D_FRACBITS 55
++#define __PDP11_D_EXCESS   894	/* IEEE's 1023 less this format's 129 */
++
++static __inline__ __uint64_t
++__pdp11_d_to_ieee (double __x)
++{
++  __pdp11_dbits __v;
++  __uint64_t __e;
++
++  __v.__d = __x;
++  __e = (__v.__u >> __PDP11_D_FRACBITS) & 0xff;
++  if (__e == 0)
++    return 0;
++  return (__v.__u & ((__uint64_t) 1 << 63))
++	 | ((__e + __PDP11_D_EXCESS) << 52)
++	 | ((__v.__u & ((((__uint64_t) 1) << __PDP11_D_FRACBITS) - 1)) >> 3);
++}
++
++static __inline__ double
++__pdp11_ieee_to_d (__uint64_t __i)
++{
++  __pdp11_dbits __v;
++  __uint64_t __s;
++  __int32_t __e;
++
++  __s = __i & ((__uint64_t) 1 << 63);
++  __e = (__int32_t) ((__i >> 52) & 0x7ff);
++  if (__e == 0)
++    {
++      __v.__u = 0;
++      return __v.__d;
++    }
++  __e -= __PDP11_D_EXCESS;
++  if (__e <= 0)			/* nothing this small exists here */
++    {
++      __v.__u = 0;
++      return __v.__d;
++    }
++  if (__e > 0xff)		/* nor anything this large */
++    __v.__u = __s | ((__uint64_t) 0xff << __PDP11_D_FRACBITS)
++	      | ((((__uint64_t) 1) << __PDP11_D_FRACBITS) - 1);
++  else
++    __v.__u = __s | ((__uint64_t) __e << __PDP11_D_FRACBITS)
++	      | ((__i & ((((__uint64_t) 1) << 52) - 1)) << 3);
++  return __v.__d;
++}
++
++static __inline__ __uint32_t
++__pdp11_f_to_ieee (float __x)
++{
++  __pdp11_fbits __v;
++  __uint32_t __e;
++
++  __v.__f = __x;
++  __e = (__v.__u >> 23) & 0xff;
++  if (__e <= 2)			/* zero, or below IEEE's smallest normal */
++    return __v.__u & 0x80000000UL;
++  return (__v.__u & 0x807fffffUL) | ((__e - 2) << 23);
++}
++
++static __inline__ float
++__pdp11_ieee_to_f (__uint32_t __i)
++{
++  __pdp11_fbits __v;
++  __uint32_t __e;
++
++  __e = (__i >> 23) & 0xff;
++  if (__e == 0)
++    __v.__u = 0;
++  else if (__e >= 253)
++    __v.__u = (__i & 0x80000000UL) | 0x7fffffffUL;
++  else
++    __v.__u = (__i & 0x807fffffUL) | ((__e + 2) << 23);
++  return __v.__f;
++}
++
++#undef EXTRACT_WORDS
++#define EXTRACT_WORDS(ix0,ix1,d)				\
++do {								\
++  __uint64_t ew_i = __pdp11_d_to_ieee (d);			\
++  (ix0) = (__uint32_t) (ew_i >> 32);				\
++  (ix1) = (__uint32_t) ew_i;					\
++} while (0)
++
++#undef GET_HIGH_WORD
++#define GET_HIGH_WORD(i,d)					\
++  ((i) = (__uint32_t) (__pdp11_d_to_ieee (d) >> 32))
++
++#undef GET_LOW_WORD
++#define GET_LOW_WORD(i,d)					\
++  ((i) = (__uint32_t) __pdp11_d_to_ieee (d))
++
++#undef INSERT_WORDS
++#define INSERT_WORDS(d,ix0,ix1)					\
++  ((d) = __pdp11_ieee_to_d (((__uint64_t) (__uint32_t) (ix0) << 32)	\
++			   | (__uint32_t) (ix1)))
++
++#undef SET_HIGH_WORD
++#define SET_HIGH_WORD(d,v)					\
++do {								\
++  __uint64_t sh_i = __pdp11_d_to_ieee (d);			\
++  sh_i = ((__uint64_t) (__uint32_t) (v) << 32) | (__uint32_t) sh_i; \
++  (d) = __pdp11_ieee_to_d (sh_i);				\
++} while (0)
++
++#undef SET_LOW_WORD
++#define SET_LOW_WORD(d,v)					\
++do {								\
++  __uint64_t sl_i = __pdp11_d_to_ieee (d);			\
++  sl_i = (sl_i & ((__uint64_t) 0xffffffffUL << 32))		\
++	 | (__uint32_t) (v);					\
++  (d) = __pdp11_ieee_to_d (sl_i);				\
++} while (0)
++
++#undef GET_FLOAT_WORD
++#define GET_FLOAT_WORD(i,d)	((i) = __pdp11_f_to_ieee (d))
++
++#undef SET_FLOAT_WORD
++#define SET_FLOAT_WORD(d,i)	((d) = __pdp11_ieee_to_f (i))
++
++#endif /* __pdp11__ */
++
+ /* Macros to avoid undefined behaviour that can arise if the amount
+    of a shift is exactly equal to the size of the shifted operand.  */
+ 

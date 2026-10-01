@@ -1,0 +1,167 @@
+From: Yury Klushin <digger@live.ru>
+Date: Sun, 13 Sep 2026 23:38:38 +0300
+Subject: [PATCH] pdp11: byte shifts of four or more, and how long a four-word
+ compare is
+
+Three wrong-code bugs, all found by finally running the execution tests
+on the machine rather than only compiling them.
+
+A byte shift by four or more is done by widening to a word and handing
+that to ASH, which shifts the whole word.  The arithmetic right shift
+widened with zeros, leaving no sign for ASH to carry, so every negative
+value came back as though it had been shifted logically: (signed char)
+-91 >> 4 gave 10 rather than -6.  It now widens with the sign.
+
+The logical right shift did widen with zeros, and then lost them again to
+the optimizers.  ASH is described as a left shift by a negative count, and
+asked about a left shift they rightly concluded that the upper half could
+not matter, so they replaced the widening with a plain byte load, which on
+this machine brings the sign along: (unsigned char) 0xa5 >> 4 gave 0xfa
+rather than 0x0a, and only with optimization on.  So the RTL now says what
+is really happening -- the widened value goes to the HImode logical shift
+rather than to ASH directly -- at a cost of two instructions.
+
+And cmpdi asked pdp11_cmp_length how long a *two* word compare is, so a
+four-word one measured 20 bytes where it assembles to 36.  Three of them
+in a loop is enough to put the loop's own branch out of reach, and the
+assembler encodes an unreachable branch without a word of complaint,
+which is how 20230802-1.c came to jump into the middle of nowhere and
+trap.  (gas silently truncating an out-of-range branch is its own bug,
+still there.)
+
+gcc.target/pdp11 is 125 passes and no failures; lshr-qi-neg-count.c now
+checks the widening as well as the direction, since getting the direction
+right was only the first of these.  gcc.c-torture/compile is unchanged,
+the same 10245 passes and 69 failures file for file, and on the emulator
+board gcc.c-torture/execute over the tests beginning with 2 goes from
+4714 passes and 72 failures to 4717 and 69.
+---
+ gcc/config/pdp11/pdp11.md                     | 29 +++++++++--
+ .../gcc.target/pdp11/lshr-qi-neg-count.c      | 51 ++++++++++++++-----
+ 2 files changed, 62 insertions(+), 18 deletions(-)
+
+diff --git a/gcc/config/pdp11/pdp11.md b/gcc/config/pdp11/pdp11.md
+index c5de6729e0eb0..3095ed221e071 100644
+--- a/gcc/config/pdp11/pdp11.md
++++ b/gcc/config/pdp11/pdp11.md
+@@ -374,7 +374,7 @@
+   return "";
+ }
+   [(set (attr "length")
+-	(symbol_ref "pdp11_cmp_length (operands, 2)"))
++	(symbol_ref "pdp11_cmp_length (operands, 4)"))
+    (set_attr "base_cost" "0")])
+ 
+ ;; sob instruction
+@@ -1865,7 +1865,14 @@
+       operands[2] = negate_rtx (HImode, operands[2]);
+       if (<QHSint:e_mname> == E_QImode)
+         {
+-          r = copy_to_mode_reg (HImode, gen_rtx_ZERO_EXTEND (HImode, operands[1]));
++          /* Sign extend, not zero extend: this is the arithmetic right
++             shift, and it is done here by handing the byte to the 16-bit
++             ASH, which shifts the whole word.  A byte widened with zeros
++             has no sign left for ASH to propagate, so every negative
++             value came back as though it had been shifted logically --
++             (signed char) -91 >> 4 giving 10 rather than -6.  The
++             logical shift below wants the zeros and says so itself.  */
++          r = copy_to_mode_reg (HImode, gen_rtx_SIGN_EXTEND (HImode, operands[1]));
+           emit_insn (gen_aslhi_op (r, r, operands[2]));
+           emit_insn (gen_movqi (operands[0], gen_rtx_SUBREG (QImode, r, 0)));
+         }
+@@ -1902,10 +1909,22 @@
+              same instruction count), not a build failure, so this
+              went unnoticed until traced back from a C testcase that
+              compared (b >> 4) against its expected value.  */
+-          rtx neg_amount = negate_rtx (HImode, operands[2]);
++          /* Widen with zeros and shift the word, but say so in the RTL
++             the optimizers get to see: hand the widened value to the
++             HImode logical shift rather than to ASH directly.  ASH is
++             described as a left shift by a negative count, and asked
++             about a left shift the optimizers rightly conclude that the
++             high bits of the input do not matter -- whereupon they
++             replaced the widening with a plain byte load, which on this
++             machine extends the sign.  (unsigned char) 0xa5 >> 4 then
++             came back as 0xfa rather than 0x0a, and only with
++             optimization on, the unoptimized code having kept the zeros.
++             A logical right shift says plainly that those bits matter,
++             so the widening survives.  */
++          rtx wide = gen_reg_rtx (HImode);
+           r = copy_to_mode_reg (HImode, gen_rtx_ZERO_EXTEND (HImode, operands[1]));
+-          emit_insn (gen_aslhi_op (r, r, neg_amount));
+-          emit_insn (gen_movqi (operands[0], gen_rtx_SUBREG (QImode, r, 0)));
++          emit_insn (gen_lshrhi3 (wide, r, operands[2]));
++          emit_insn (gen_movqi (operands[0], gen_rtx_SUBREG (QImode, wide, 0)));
+         }
+       else
+         {
+diff --git a/gcc/testsuite/gcc.target/pdp11/lshr-qi-neg-count.c b/gcc/testsuite/gcc.target/pdp11/lshr-qi-neg-count.c
+index f45637c3e43c7..93a7bb0ee9895 100644
+--- a/gcc/testsuite/gcc.target/pdp11/lshr-qi-neg-count.c
++++ b/gcc/testsuite/gcc.target/pdp11/lshr-qi-neg-count.c
+@@ -1,27 +1,52 @@
+ /* { dg-do compile { target pdp11-*-* } } */
+ /* { dg-options "-O2 -m40" } */
+ 
+-/* lshr<mode>3's QImode path (shift counts >= 4, i.e. past
+-   pdp11_small_shift's inline fast path) zero-extends to HImode and emits
+-   a single ASH.  ASH shifts left for a positive count and right for a
+-   negative one, so a logical *right* shift must negate the count first
+-   -- ashr<mode>3's own QImode case already did, lshr<mode>3's copy of it
+-   didn't, and `b >> 4` silently compiled as `b << 4` (same instruction
+-   shape, same operand count, no build error).  -m40: the 1801BM2 has
+-   ASH (SUPP_INSN_ASH), which is what this path emits.  */
++/* Byte shifts by four or more are done by widening to a word and handing
++   that to ASH, which shifts the whole word; -m40 because ASH is what the
++   1801BM2 has.  Three things have gone wrong there, one after another,
++   and each was silently wrong code rather than a build failure:
++
++   ASH shifts left for a positive count and right for a negative one, so a
++   right shift has to negate the count.  The arithmetic shift did; the
++   logical one, copied from it, did not, and b >> 4 compiled as b << 4.
++
++   Then the widening: an arithmetic shift needs the byte's sign carried
++   into the upper half, and a logical shift needs zeros there.  The
++   arithmetic path widened with zeros, so every negative value came back
++   shifted logically -- (signed char) -91 >> 4 giving 10 rather than -6.
++
++   And the logical path, which did widen with zeros, had them taken away
++   again by the optimizers: told the shift was a left shift by a negative
++   count, they concluded the upper half could not matter and replaced the
++   widening with a plain byte load, which on this machine extends the
++   sign.  So it is not enough to widen correctly, the RTL has to say what
++   is really happening -- which is why the logical path now hands the
++   widened value to the HImode logical shift rather than to ASH itself,
++   and pays two instructions for it.  */
+ 
+ unsigned char lshr_qi4 (unsigned char b)
+ {
+-  /* { dg-final { scan-assembler "ash\t.-04,r0" } } */
+   return b >> 4;
+ }
+ 
+ unsigned char lshr_qi7 (unsigned char b)
+ {
+-  /* { dg-final { scan-assembler "ash\t.-07,r0" } } */
+   return b >> 7;
+ }
+ 
+-/* Neither shift may come out as a left shift (positive ASH count).  */
+-/* { dg-final { scan-assembler-not "ash\t.0?4,r0" } } */
+-/* { dg-final { scan-assembler-not "ash\t.0?7,r0" } } */
++signed char ashr_qi4 (signed char b)
++{
++  return b >> 4;
++}
++
++/* The two logical shifts widen with zeros, and that has to survive to the
++   assembly: a movb into a register would bring the sign along with it.  */
++/* { dg-final { scan-assembler-times "clr\tr0\n\tbisb\t" 2 } } */
++
++/* The arithmetic one wants the sign, and movb is how this machine brings
++   it.  */
++/* { dg-final { scan-assembler "movb\t\[^\n\]*,r0\n\tash\t.-04,r0" } } */
++
++/* Every one of them shifts right, never left.  */
++/* { dg-final { scan-assembler-times "ash\t.-0" 3 } } */
++/* { dg-final { scan-assembler-not "ash\t.0?\[0-9\]+,r0" } } */

@@ -1,0 +1,73 @@
+From a3d569699dc78dfd3974af1560b80d71cc1c505e Mon Sep 17 00:00:00 2001
+From: Yury Klushin <digger@live.ru>
+Date: Tue, 8 Sep 2026 23:48:27 +0300
+Subject: [PATCH] rt11: translate '\n' to CR LF in _write() on the console
+
+C's '\n' means "move to the start of the next line" (ISO C 5.2.2), and
+a text stream may be translated to the host's convention to get there
+(7.21.2).  RT-11's convention is CR LF and .TTYOUT sends exactly the
+byte it is given, so a bare LF only moved the cursor down: every line
+printed with puts()/printf()/"\n" started in the column where the
+previous one ended.  A Unix tty driver adds the CR itself (ONLCR);
+RT-11 has no such layer, so _write() now does it for fd 1 and 2, the
+mirror image of the '\r' -> '\n' translation _read() already does on
+input (ICRNL).  Programs keep writing plain "\n" and stay portable; an
+explicit "\r\n" still works (CR twice, harmless on a terminal).
+
+Also fix the comment in read.c, which claimed write.c already did this
+translation -- it never had, in any revision of this port.
+
+Verified in the ukncbtl-debugger emulator: puts(), printf(), fputs()
+and a raw write() of "\n"-terminated lines all start at column 0.
+---
+ newlib/libc/sys/rt11/read.c  |  8 ++++----
+ newlib/libc/sys/rt11/write.c | 16 +++++++++++++++-
+ 2 files changed, 19 insertions(+), 5 deletions(-)
+
+diff --git a/newlib/libc/sys/rt11/read.c b/newlib/libc/sys/rt11/read.c
+index 0cdee7695..9bb742bb1 100644
+--- a/newlib/libc/sys/rt11/read.c
++++ b/newlib/libc/sys/rt11/read.c
+@@ -38,10 +38,10 @@ _read (int file, void *ptr, size_t len)
+ 	     will never get from this line -- confirmed directly: it stalls
+ 	     waiting past the Enter that already terminated the line,
+ 	     silently swallowing whatever key comes next into the same
+-	     buffer.  Translating '\r' to '\n' here mirrors the LF->CRLF
+-	     translation write.c already does symmetrically on output (the
+-	     canonical terminal-driver "icrnl" behavior RT-11 itself
+-	     doesn't provide) and fixes fgets() outright.  Safe for any
++	     buffer.  Translating '\r' to '\n' here is the canonical
++	     terminal-driver "icrnl" behavior RT-11 itself doesn't
++	     provide (write.c does the mirror-image LF -> CR LF on
++	     output, "onlcr") and fixes fgets() outright.  Safe for any
+ 	     caller that still checks for '\r' too (e.g. strcspn(buf,
+ 	     "\r\n")) -- '\n' alone already satisfies that check.  */
+ 	  if (c == '\r')
+diff --git a/newlib/libc/sys/rt11/write.c b/newlib/libc/sys/rt11/write.c
+index cb495b426..ab97b9b1c 100644
+--- a/newlib/libc/sys/rt11/write.c
++++ b/newlib/libc/sys/rt11/write.c
+@@ -30,8 +30,22 @@ _write (int file, const void *ptr, size_t len)
+ 
+   if (file == 1 || file == 2)
+     {
++      /* C's '\n' means "start of the next line" (ISO C 5.2.2), and a
++	 text stream may be translated to the host's convention to get
++	 there (7.21.2).  RT-11's convention is CR LF, and .TTYOUT sends
++	 exactly the byte it is given -- a bare LF just moves the cursor
++	 down, leaving it in the same column.  A Unix tty driver would
++	 add the CR itself (ONLCR); RT-11 has no such layer, so do it
++	 here, the mirror image of the '\r' -> '\n' translation read.c
++	 does on input (ICRNL).  Programs keep writing plain "\n" and
++	 stay portable; an explicit "\r\n" still works, it just sends CR
++	 twice, which is harmless on a terminal.  */
+       for (i = 0; i < len; i++)
+-	rt11_ttyout ((char) p[i]);
++	{
++	  if (p[i] == '\n')
++	    rt11_ttyout ('\r');
++	  rt11_ttyout ((char) p[i]);
++	}
+       return (int) len;
+     }
+ 

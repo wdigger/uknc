@@ -1,0 +1,85 @@
+From 3b581bf2b13a665f237b8c2c86aab5196769381d Mon Sep 17 00:00:00 2001
+From: Yury Klushin <digger@live.ru>
+Date: Sun, 6 Sep 2026 17:52:05 +0300
+Subject: [PATCH] pdp11: fix lshr's variable-count fallback emitting a left
+ shift at count 0
+
+lshr<mode>3's non-QImode path (HImode/SImode, taken whenever
+pdp11_expand_shift's small-constant fast path doesn't apply -- a
+variable, non-constant shift count, or a constant one >= 4) shifts
+right by one bit first via a single logical-shift instruction (to
+clear the sign bit safely), then handles the remaining "count - 1"
+bits with an arithmetic shift, safe now that the sign bit is known
+zero. For a variable count, that remaining amount is computed as
+count - 1 unconditionally, with no check for count == 0.
+
+At count == 0 that subtraction wraps to -1 (0xffff); ashr<mode>3
+negates its own shift-amount operand before handing it to the ASH
+instruction, so n = -1 becomes ASH by +1 -- a *left* shift by one bit,
+not "no shift at all". Net effect: operand1's low bit is silently
+cleared whenever a variable right-shift count turns out to be 0 at
+runtime, instead of leaving operand1 untouched. Same failure shape as
+f2f0dea37 (this branch's own prior lshr fix, QImode side): a wrong
+but plausible-looking result, not a build failure, so it went
+unnoticed until traced back from a C testcase comparing a
+variable-count (b >> n) against its expected value for n == 0 --
+constant counts (n == 0 among them) take pdp11_expand_shift's
+small-constant fast path instead and were never affected.
+
+Fix: guard the variable-count case with the same "skip entirely when
+count <= 0" convention pdp11_expand_shift's own base-machine loop path
+already uses for this identical edge case -- a runtime compare-and-
+branch (cbranchhi4) that copies operand1 through unshifted and jumps
+past the two-step trick when the count is <= 0.
+
+Verified on real hardware (ukncbtl-debugger emulator) with an isolated
+repro independent of any specific call site: a value with every 3-bit
+group equal to 3 (033333 octal), read back via a variable right-shift
+whose amount is loaded from a table, computed arithmetically, or
+passed directly as an argument -- all four previously misread the
+shift-by-0 case as 2 instead of 3, and all four now read 3 correctly.
+---
+ gcc/config/pdp11/pdp11.md | 27 +++++++++++++++++++++++++++
+ 1 file changed, 27 insertions(+)
+
+diff --git a/gcc/config/pdp11/pdp11.md b/gcc/config/pdp11/pdp11.md
+index ad6f69dd3deab..d96cecf94c3ba 100644
+--- a/gcc/config/pdp11/pdp11.md
++++ b/gcc/config/pdp11/pdp11.md
+@@ -1809,9 +1809,36 @@
+           emit_insn (gen_lshiftrt<mode>_sc (r, operands[1], const1_rtx));
+           if (GET_CODE (operands[2]) != CONST_INT)
+             {
++              /* Guard against a runtime count of 0.  The two-step
++                 trick here -- one logical-shift bit first, to clear
++                 the sign bit safely, then an arithmetic shift for the
++                 remaining 'count - 1' bits -- computes n = count - 1
++                 unconditionally.  When count is 0 that wraps to -1
++                 (0xffff); ashr<mode>3 negates its shift-amount operand
++                 before handing it to the ASH instruction, so n = -1
++                 becomes ASH by +1, i.e. a *left* shift by one bit --
++                 silently clearing operand1's low bit instead of
++                 leaving operand1 untouched.  A wrong but
++                 plausible-looking result (no build failure, no
++                 crash), so this went unnoticed until traced back from
++                 a C testcase that compared a variable-count (b >> n)
++                 against its expected value for n == 0.  Skip the
++                 trick entirely and copy operand1 through unshifted
++                 when count <= 0, the same convention
++                 pdp11_expand_shift's own base-machine loop path
++                 already uses for this identical edge case (see
++                 there).  */
++              rtx_code_label *lb = gen_label_rtx ();
++              rtx test;
++
++              emit_move_insn (operands[0], operands[1]);
++              test = gen_rtx_LE (HImode, operands[2], const0_rtx);
++              emit_jump_insn (gen_cbranchhi4 (test, operands[2], const0_rtx, lb));
+               n = gen_reg_rtx (HImode);
+               emit_insn (gen_addhi3 (n, operands [2], GEN_INT (-1)));
+               emit_insn (gen_ashr<mode>3 (operands[0], r, n));
++              emit_label (lb);
++              emit_use (stack_pointer_rtx);
+             }
+           else
+             emit_insn (gen_asl<QHSint:hmode>_op (operands[0], r,

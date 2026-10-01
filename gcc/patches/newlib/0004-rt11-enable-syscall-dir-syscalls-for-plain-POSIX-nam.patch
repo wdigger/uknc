@@ -1,0 +1,55 @@
+From d555cd2dc7d36f9f3381e8491565d306efa585f6 Mon Sep 17 00:00:00 2001
+From: Yury Klushin <digger@live.ru>
+Date: Tue, 1 Sep 2026 21:03:32 +0300
+Subject: [PATCH] rt11: enable syscall_dir=syscalls for plain POSIX-name
+ wrappers
+
+Reverses this port's own original choice to leave syscall_dir unset.
+That was fine for a fully minimal port calling _open/_read/... by
+hand, but every example and test program in this project actually
+calls the plain names (open/read/write/close/lseek/fstat) directly,
+relying on libc/syscalls' thin connectors on top of the
+underscore-prefixed layer -- essentially free (no buffering, no
+FILE* struct) compared to calling the underscore-prefixed functions
+directly.
+
+Without this, a program calling plain open()/read()/etc gets
+"undefined reference to `open'" at link time -- caught by a full
+from-scratch toolchain rebuild after the previous split-syscalls
+commit, since day-to-day work in this project had been reusing a
+long-lived, never-fully-rebuilt libc.a that had these connectors
+baked in from an earlier build configuration.
+---
+ newlib/configure.host | 19 ++++++++++++++-----
+ 1 file changed, 14 insertions(+), 5 deletions(-)
+
+diff --git a/newlib/configure.host b/newlib/configure.host
+index b1799b52d..1643dc484 100644
+--- a/newlib/configure.host
++++ b/newlib/configure.host
+@@ -855,11 +855,20 @@ newlib_cflags="${newlib_cflags} -DCLOCK_PROVIDED -DMALLOC_PROVIDED -DEXIT_PROVID
+ 	# makes libc/reent's _read_r-style wrappers call the plain (e.g.
+ 	# "read") syscall name instead of the underscore-prefixed one
+ 	# (_syslist.h's #define _read read etc.) -- but libc/sys/rt11/
+-	# syscalls.c uses the normal underscore-prefixed convention (_read,
+-	# _write, ...), the same as e.g. d10v above, so nothing here should
+-	# be aliased.  syscall_dir is left unset (no libc/syscalls): that
+-	# directory only adds plain-POSIX-name wrappers (read() calling
+-	# _read_r()) on top, which nothing in this minimal port needs.
++	# syscalls.c (now split one-function-per-file, see
++	# libc/sys/rt11/rt11fs.h) uses the normal underscore-prefixed
++	# convention (_read, _write, ...), the same as e.g. d10v above, so
++	# nothing here should be aliased.
++	#
++	# syscall_dir=syscalls, though (unlike a fully minimal port): this
++	# project's own example/test programs call the plain POSIX names
++	# (open/read/write/close/lseek/fstat) directly, relying on
++	# libc/syscalls' thin connectors (open() calling _open(), etc.) on
++	# top of the underscore-prefixed layer -- essentially free (no
++	# buffering, no FILE* struct) compared to calling _open/_read/...
++	# by hand, and it's what every example/test in this project's tree
++	# is actually written against.
++	syscall_dir=syscalls
+ 	;;
+   powerpc*-*-eabialtivec*)
+ 	default_newlib_io_long_long="yes"

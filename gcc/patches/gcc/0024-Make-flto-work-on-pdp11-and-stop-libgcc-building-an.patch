@@ -1,0 +1,68 @@
+From bf880c06c6ce06e3ff010562ceeebec11939e5bc Mon Sep 17 00:00:00 2001
+From: Yury Klushin <digger@live.ru>
+Date: Mon, 14 Sep 2026 21:40:06 +0300
+Subject: [PATCH] Make -flto work on pdp11, and stop libgcc building an
+ unwinder
+
+Two unrelated things that both stand between this target and a working
+-flto.
+
+lto_build_c_type_nodes knows three spellings of SIZE_TYPE -- unsigned
+int, long unsigned int, long long unsigned int -- and reaches a
+gcc_unreachable for anything else.  pdp11 spells size_t "short unsigned
+int", so -flto ended in an internal compiler error before compiling
+anything.  Add the missing branch, following the shape of the three
+beside it.
+
+And DWARF2_UNWIND_INFO 0.  defaults.h takes a target that defines
+INCOMING_RETURN_ADDR_RTX -- which this one now does, for debug
+information -- to have the whole DWARF 2 frame unwinder as well.  It
+does not: there is no __builtin_eh_return here, and libgcc stops dead
+building unwind-dw2.o.  Frame information in .debug_frame is unaffected;
+that comes from targetm.debug_unwind_info, which asks about debugging
+rather than unwinding.
+---
+ gcc/config/pdp11/pdp11.h |  8 ++++++++
+ gcc/lto/lto-lang.cc      | 10 ++++++++++
+ 2 files changed, 18 insertions(+)
+
+diff --git a/gcc/config/pdp11/pdp11.h b/gcc/config/pdp11/pdp11.h
+index 62d2ddc1c256c..76bf6dea1da7c 100644
+--- a/gcc/config/pdp11/pdp11.h
++++ b/gcc/config/pdp11/pdp11.h
+@@ -355,6 +355,14 @@ extern int current_first_parm_offset;
+ #define INCOMING_RETURN_ADDR_RTX  gen_rtx_MEM (Pmode, stack_pointer_rtx)
+ #define INCOMING_FRAME_SP_OFFSET  2
+ 
++/* defaults.h takes INCOMING_RETURN_ADDR_RTX to mean the whole of the
++   DWARF 2 frame unwinder is available too.  It is not: this target has
++   no __builtin_eh_return, and libgcc stops building unwind-dw2.o on
++   that the moment the assumption is left standing.  Frame information
++   in .debug_frame is unaffected -- it comes from the debug side, which
++   asks targetm.debug_unwind_info, not from this.  */
++#define DWARF2_UNWIND_INFO 0
++
+ /* Define how to find the value returned by a function.
+    VALTYPE is the data type of the value (as a tree).
+    If the precise function being called is known, FUNC is its FUNCTION_DECL;
+diff --git a/gcc/lto/lto-lang.cc b/gcc/lto/lto-lang.cc
+index e41b548b39831..ada2f30def9be 100644
+--- a/gcc/lto/lto-lang.cc
++++ b/gcc/lto/lto-lang.cc
+@@ -1302,6 +1302,16 @@ lto_build_c_type_nodes (void)
+       uintmax_type_node = long_long_unsigned_type_node;
+       signed_size_type_node = long_long_integer_type_node;
+     }
++  else if (strcmp (SIZE_TYPE, "short unsigned int") == 0)
++    {
++      /* A machine whose int is as wide as its pointer can still spell
++	 size_t this way -- pdp11 does.  Without this the only way out of
++	 here is the gcc_unreachable below, so -flto ends in an internal
++	 compiler error before it compiles anything.  */
++      intmax_type_node = short_integer_type_node;
++      uintmax_type_node = short_unsigned_type_node;
++      signed_size_type_node = short_integer_type_node;
++    }
+   else
+     {
+       int i;

@@ -1,0 +1,177 @@
+From 78485b1287f758f315a2d7e4751f206b8fa3f586 Mon Sep 17 00:00:00 2001
+From: Yury Klushin <digger@live.ru>
+Date: Mon, 14 Sep 2026 17:30:39 +0300
+Subject: [PATCH] pdp11: let the rt11 target name a section
+
+a.out has .text, .data and .bss and no way to name a fourth, so this
+backend answered every request for a named section with sorry() and
+turned off TARGET_HAVE_NAMED_SECTIONS, which is what made
+-ffunction-sections and -fdata-sections come back as "not supported for
+this target".  The rt11 OS's objects are ELF now, where a section is an
+ordinary thing with a name, so say so: pdp11_asm_named_section hands
+the ELF case to default_elf_asm_named_section, the option handlers stop
+clearing have_named_sections (there is nothing left to clear), and
+.rodata stops being a synonym for .data -- it needs a section of its own
+before -fdata-sections can build .rodata.<name> out of it.
+
+TARGET_RT11_ELF, keyed off the OS, is the one place that decides this;
+a plain pdp11-*-aout target keeps every bit of the old behaviour,
+sorry() included.
+
+The point of all this is --gc-sections, which on a machine with 64K of
+address space is not a nicety.  Measured on this project's examples and
+tests, each built three ways -- a.out, ELF, and ELF with the option on
+for both the program and newlib/libgcc:
+
+    iofile     10888 -> 7240 -> 5896   (-46%)
+    fileio     14208 -> 10560 -> 6728  (-53%)
+    rdwr       13608 -> 10264 -> 7528  (-45%)
+    ppurun     14536 -> 11928 -> 10576 (-27%)
+    gfour      16096 -> 13600 -> 12216 (-24%)
+    hello      11872 -> 11688 -> 9800  (-17%)
+    sin        33512 -> 31016 -> 28904 (-14%)
+
+Note the middle column: a good part of the saving arrives before this
+patch does anything, because the linker can already drop a whole
+section from a library member that was pulled in for one symbol.  What
+per-function sections add on top is the rest.
+
+Everything still runs: hello, tests/float, tests/rdwr, tests/lseek and
+tests/fileio print what they always printed on the emulated machine,
+and gfour draws its screen.  pdp11.exp is 133 passes, 0 failures, with
+a new test that the three section kinds come out named.
+---
+ gcc/common/config/pdp11/pdp11-common.cc       |  4 +++
+ gcc/config/pdp11/pdp11.cc                     | 17 +++++++++---
+ gcc/config/pdp11/pdp11.h                      | 26 ++++++++++++++----
+ .../gcc.target/pdp11/named-sections.c         | 27 +++++++++++++++++++
+ 4 files changed, 65 insertions(+), 9 deletions(-)
+ create mode 100644 gcc/testsuite/gcc.target/pdp11/named-sections.c
+
+diff --git a/gcc/common/config/pdp11/pdp11-common.cc b/gcc/common/config/pdp11/pdp11-common.cc
+index 3d701c6baf302..0dd319b084cfa 100644
+--- a/gcc/common/config/pdp11/pdp11-common.cc
++++ b/gcc/common/config/pdp11/pdp11-common.cc
+@@ -85,7 +85,11 @@ pdp11_handle_option (struct gcc_options *opts,
+ 
+     case OPT_munix_asm:
+     case OPT_mgnu_asm:
++      /* Only a.out leaves the GNU assembler with nothing to name a
++	 section with; see TARGET_RT11_ELF in pdp11.h.  */
++#if !TARGET_RT11_ELF
+       targetm_common.have_named_sections = false;
++#endif
+       return true;
+ 
+     case OPT_mdec_asm:
+diff --git a/gcc/config/pdp11/pdp11.cc b/gcc/config/pdp11/pdp11.cc
+index 9d099e250aa0f..ec522060430b5 100644
+--- a/gcc/config/pdp11/pdp11.cc
++++ b/gcc/config/pdp11/pdp11.cc
+@@ -2441,14 +2441,23 @@ pdp11_option_override (void)
+ }
+ 
+ static void
+-pdp11_asm_named_section (const char *name, unsigned int flags,
+-			 tree decl ATTRIBUTE_UNUSED)
++pdp11_asm_named_section (const char *name, unsigned int flags, tree decl)
+ {
+   const char *rwro = (flags & SECTION_WRITE) ? "rw" : "ro";
+   const char *insdat = (flags & SECTION_CODE) ? "i" : "d";
+ 
+-  /* Only the DEC assembler has named sections (.psect); the GNU a.out
+-     assembler has just .text/.data/.bss.  Anything that asks for a
++  /* With ELF objects, sections are ordinary: say so the ordinary way.
++     This is what makes -ffunction-sections/-fdata-sections possible,
++     and with them --gc-sections, which matters rather a lot on a
++     machine with 64K of address space.  */
++  if (TARGET_RT11_ELF && !TARGET_DEC_ASM)
++    {
++      default_elf_asm_named_section (name, flags, decl);
++      return;
++    }
++
++  /* Only the DEC assembler has named sections (.psect); the GNU
++     assembler writing a.out has just .text/.data/.bss.  Anything that asks for a
+      named section anyway -- -flto's own .gnu.lto_* sections being the
+      common case, but __attribute__((section)) reaches here too via a
+      different diagnostic -- used to hit a gcc_assert here, i.e. an ICE
+diff --git a/gcc/config/pdp11/pdp11.h b/gcc/config/pdp11/pdp11.h
+index 56c1a38887ce7..d0cc4c24f6cce 100644
+--- a/gcc/config/pdp11/pdp11.h
++++ b/gcc/config/pdp11/pdp11.h
+@@ -546,11 +546,14 @@ extern int current_first_parm_offset;
+ #define DATA_SECTION_ASM_OP \
+   ((TARGET_DEC_ASM) ? "\t.psect\tdata,d,rw,con" : "\t.data")
+ 
+-/* Output before read-only data.  Same as read-write data for non-DEC
+-   assemblers because they don't know about .rodata.  */
++/* Output before read-only data.  Same as read-write data for the GNU
++   assembler on a.out, which has nowhere else to put it; with ELF it
++   gets a section of its own, which is also what -fdata-sections needs
++   to build .rodata.<name> out of.  */
+ 
+ #define READONLY_DATA_SECTION_ASM_OP \
+-  ((TARGET_DEC_ASM) ? "\t.psect\trodata,d,ro,con" : "\t.data")
++  ((TARGET_DEC_ASM) ? "\t.psect\trodata,d,ro,con" \
++   : TARGET_RT11_ELF ? "\t.section\t.rodata" : "\t.data")
+ 
+ /* How to refer to registers in assembler output.
+    This sequence is indexed by compiler's hard-register-number (see above).  */
+@@ -660,8 +663,21 @@ extern int current_first_parm_offset;
+ 
+ #define COMPARE_FLAG_MODE HImode
+ 
+-/* May be overridden by command option processing.  */
+-#define TARGET_HAVE_NAMED_SECTIONS false
++/* Whether this target's objects are ELF.  The rt11 OS is the one that
++   is; a plain pdp11-*-aout target's objects are a.out, which has three
++   sections and no way to name a fourth.  Everything named-section here
++   turns on this, so it is worth a name of its own rather than asking
++   about the OS at each use.  */
++#ifdef TARGET_RT11_DEFAULTS
++#define TARGET_RT11_ELF 1
++#else
++#define TARGET_RT11_ELF 0
++#endif
++
++/* May be overridden by command option processing -- but only where
++   there is something to override: with ELF objects every assembler
++   this target has can name a section, so nothing turns this off.  */
++#define TARGET_HAVE_NAMED_SECTIONS (TARGET_RT11_ELF != 0)
+ 
+ /* pdp11-unknown-aout target has no support of C99 runtime */
+ #undef TARGET_LIBC_HAS_FUNCTION
+diff --git a/gcc/testsuite/gcc.target/pdp11/named-sections.c b/gcc/testsuite/gcc.target/pdp11/named-sections.c
+new file mode 100644
+index 0000000000000..320dbf205a41d
+--- /dev/null
++++ b/gcc/testsuite/gcc.target/pdp11/named-sections.c
+@@ -0,0 +1,27 @@
++/* { dg-do compile { target pdp11-*-rt11* } } */
++/* { dg-options "-O2 -ffunction-sections -fdata-sections" } */
++
++/* The rt11 OS's objects are ELF, so a section can have a name, and both
++   these options work rather than being refused with a warning -- which
++   is what the a.out format left the compiler saying, since it has
++   .text, .data and .bss and no way to name a fourth.  The point of them
++   is --gc-sections, which on a machine with 64K of address space is
++   worth having.  */
++
++int keep_me (int x)
++{
++  return x + 1;
++}
++
++int drop_me (int x)
++{
++  return x * 3;
++}
++
++int writable = 7;
++const char readable[] = "x";
++
++/* { dg-final { scan-assembler "\\.section\t\\.text\\.keep_me" } } */
++/* { dg-final { scan-assembler "\\.section\t\\.text\\.drop_me" } } */
++/* { dg-final { scan-assembler "\\.section\t\\.data\\.writable" } } */
++/* { dg-final { scan-assembler "\\.section\t\\.rodata\\.readable" } } */
