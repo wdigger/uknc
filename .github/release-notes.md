@@ -53,6 +53,7 @@
 |---|---|
 | `uknc-toolchain-@VERSION@-windows-x86_64.exe` | Windows: установщик, предлагает добавить `gcc\bin` в PATH |
 | `uknc-toolchain-@VERSION@-macos-arm64.dmg` | macOS на Apple Silicon: распакованное дерево — готовый тулчейн |
+| `uknc-toolchain-@VERSION@-macos-x86_64.dmg` | macOS на Intel: то же дерево, собранное для x86_64 |
 | `uknc-@VERSION@-src.tar.gz` | Исходники. На Linux собрать из них: `cd gcc && sh build_gcc_uknc.sh` |
 
 Пакет — это корень тулчейна: `gcc/bin`, `gcc/xgcc`, `debugger/bin`, `rom`,

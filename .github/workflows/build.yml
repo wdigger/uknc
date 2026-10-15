@@ -17,16 +17,16 @@ on:
   workflow_dispatch:
     inputs:
       platforms:
-        description: 'Which to build, space separated: linux macos windows'
-        default: 'linux macos windows'
+        description: 'Which to build, space separated: linux macos macos-intel windows'
+        default: 'linux macos macos-intel windows'
   push:
     tags:
       - 'v*'
 
 jobs:
-  # Which platforms this run is for.  A tag builds all three; by hand,
+  # Which platforms this run is for.  A tag builds all four; by hand,
   # one can be asked for on its own, which is worth having when the
-  # thing being fixed is that one's own build and the other two take an
+  # thing being fixed is that one's own build and the others take an
   # hour each to tell you nothing new.
   choose:
     runs-on: ubuntu-latest
@@ -35,12 +35,18 @@ jobs:
     steps:
       - id: pick
         run: |
-          wanted='${{ inputs.platforms || 'linux macos windows' }}'
+          wanted='${{ inputs.platforms || 'linux macos macos-intel windows' }}'
+          # macos-15-intel is the last x86_64 image Actions offers:
+          # macos-13 was retired in December 2025, and asking for it
+          # leaves a job queued for ever rather than failing outright,
+          # and this one goes away itself in 2027.
           all='[
             {"key":"linux",  "name":"Linux",  "os":"ubuntu-latest",
              "platform":"linux-x86_64",   "shell":"bash"},
             {"key":"macos",  "name":"macOS",  "os":"macos-latest",
              "platform":"macos-arm64",    "shell":"bash"},
+            {"key":"macos-intel","name":"macOS (Intel)","os":"macos-15-intel",
+             "platform":"macos-x86_64",   "shell":"bash"},
             {"key":"windows","name":"Windows","os":"windows-latest",
              "platform":"windows-x86_64", "shell":"msys2 {0}"}
           ]'
@@ -125,6 +131,11 @@ jobs:
           pacman -S --noconfirm --needed mingw-w64-ucrt-x86_64-sdl3 \
             || echo "no SDL3 here: the emulator will have no screen"
 
+      # Keyed by platform rather than by runner.os: the two macOS jobs
+      # differ only in their architecture, and under one key the Intel
+      # one would happily restore the Apple Silicon toolchain and
+      # package it.
+      #
       # Worked out here, before anything is built, and used by both the
       # restore and the save below.  hashFiles reads the tree as it is
       # when the step runs, and building the toolchain writes into libs/
@@ -133,7 +144,7 @@ jobs:
       # everything and cached it for nobody.
       - name: What to call the cached toolchain
         run: |
-          echo "toolchainkey=toolchain-${{ runner.os }}-${{ hashFiles('gcc/build_gcc_uknc.sh', 'libs/**') }}" \
+          echo "toolchainkey=toolchain-${{ matrix.platform }}-${{ hashFiles('gcc/build_gcc_uknc.sh', 'libs/**') }}" \
             >> "$GITHUB_ENV"
 
       # Forty minutes of binutils, gdb, gcc and newlib that only change
@@ -439,9 +450,9 @@ jobs:
           compression-level: 0
           if-no-files-found: error
 
-  # A tag, and only a tag, is a release: the three packages, their
-  # checksums and what each of them is for.  Nothing here rebuilds
-  # anything -- it publishes what the jobs above made and checked.
+  # A tag, and only a tag, is a release: the packages, their checksums
+  # and what each of them is for.  Nothing here rebuilds anything -- it
+  # publishes what the jobs above made and checked.
   release:
     needs: build
     if: github.ref_type == 'tag'
