@@ -97,6 +97,101 @@ jobs:
           sudo apt-get install -y libsdl3-dev \
             || echo "no SDL3 here: the emulator will have no screen"
 
+      # Signing, where there is something to sign with.  Everything in
+      # the package is signed either way: a program whose load commands
+      # have been rewritten has a broken signature, and on Apple Silicon
+      # that is a program the kernel kills outright.  With no
+      # certificate that signature is ad-hoc -- enough to run where it
+      # was built, not enough for Gatekeeper on a downloaded image.
+      #
+      # The keychain dance is the one from GitHub's own documentation,
+      # "Installing an Apple certificate on macOS runners for Xcode
+      # development", command for command.  No provisioning profile:
+      # that part of their example is for app targets submitted to the
+      # store, and this is Developer ID distribution of command line
+      # tools.  No clean-up step either -- their page says a
+      # GitHub-hosted runner is a virtual machine destroyed at the end
+      # of the job, and only a self-hosted one needs the keychain
+      # deleting afterwards.
+      #
+      # Secrets.  The first two are enough to sign; add a set of notary
+      # credentials and the image is notarised and stapled as well,
+      # which is what Gatekeeper actually asks for on a download:
+      #
+      #   MACOS_CERTIFICATE           base64 of a "Developer ID
+      #                               Application" .p12
+      #   MACOS_CERTIFICATE_PASSWORD  the password it was exported with
+      #
+      #   either an App Store Connect API key --
+      #   MACOS_NOTARY_KEY            base64 of the .p8
+      #   MACOS_NOTARY_KEY_ID         its key id
+      #   MACOS_NOTARY_ISSUER         issuer uuid; Apple's own tool says
+      #                               this is for team keys and must be
+      #                               left out for individual ones, so
+      #                               an empty secret is honoured
+      #
+      #   or an Apple ID --
+      #   MACOS_NOTARY_APPLE_ID       the developer Apple ID
+      #   MACOS_NOTARY_PASSWORD       an app-specific password for it
+      #   MACOS_NOTARY_TEAM_ID        the team id
+      #
+      # Nothing here fails when they are absent.
+      - name: Signing identity (macOS)
+        if: runner.os == 'macOS'
+        env:
+          CERTIFICATE: ${{ secrets.MACOS_CERTIFICATE }}
+          CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
+        run: |
+          if [ -z "${CERTIFICATE}" ]; then
+            echo "no MACOS_CERTIFICATE: signing ad-hoc, as before"
+            echo "SIGN_IDENTITY=-" >> "$GITHUB_ENV"
+            exit 0
+          fi
+
+          CERTIFICATE_PATH="${RUNNER_TEMP}/certificate.p12"
+          KEYCHAIN_PATH="${RUNNER_TEMP}/signing.keychain-db"
+          # Any new random string, the keychain being created here and
+          # destroyed with the machine -- so it is not a secret of its
+          # own to keep.
+          KEYCHAIN_PASSWORD=$(uuidgen)
+
+          echo -n "${CERTIFICATE}" | base64 --decode -o "${CERTIFICATE_PATH}"
+
+          security create-keychain -p "${KEYCHAIN_PASSWORD}" "${KEYCHAIN_PATH}"
+          security set-keychain-settings -lut 21600 "${KEYCHAIN_PATH}"
+          security unlock-keychain -p "${KEYCHAIN_PASSWORD}" "${KEYCHAIN_PATH}"
+
+          security import "${CERTIFICATE_PATH}" \
+            -P "${CERTIFICATE_PASSWORD}" -A -t cert -f pkcs12 \
+            -k "${KEYCHAIN_PATH}"
+          # Without this codesign stops to ask for the keychain password,
+          # and a build nobody is sitting at waits for ever.
+          security set-key-partition-list -S apple-tool:,apple: \
+            -k "${KEYCHAIN_PASSWORD}" "${KEYCHAIN_PATH}" > /dev/null
+          security list-keychain -d user -s "${KEYCHAIN_PATH}"
+          rm -f "${CERTIFICATE_PATH}"
+
+          # It has to be a Developer ID one.  Apple's notarization notes
+          # are explicit that a Mac Distribution, ad hoc, Apple
+          # Developer or local development certificate will not do, and
+          # the failure if the wrong one is used comes an hour later from
+          # the notary service rather than here.
+          identity=$(security find-identity -v -p codesigning "${KEYCHAIN_PATH}" \
+            | awk -F'"' '/Developer ID Application/ {print $2; exit}')
+          if [ -z "${identity}" ]; then
+            echo "MACOS_CERTIFICATE is not a Developer ID Application" \
+                 "certificate; what it holds:" >&2
+            security find-identity -v -p codesigning "${KEYCHAIN_PATH}" >&2
+            exit 1
+          fi
+          echo "signing as ${identity}"
+          echo "SIGN_IDENTITY=${identity}" >> "$GITHUB_ENV"
+          # What notarization requires of every executable: the hardened
+          # runtime and a secure timestamp.  The timestamp needs the
+          # network -- it comes from timestamp.apple.com -- so it can
+          # fail quietly; the check before notarising looks for it.
+          echo "SIGN_FLAGS=--options runtime --timestamp" >> "$GITHUB_ENV"
+
       - name: Tools (macOS)
         if: runner.os == 'macOS'
         run: |
@@ -282,6 +377,17 @@ jobs:
       - name: Take the libraries with it
         if: runner.os == 'macOS'
         run: |
+          # Ad-hoc when there is no certificate, and then a failure means
+          # only that the file was not a Mach-O one after all; with a
+          # certificate a failure is a failure.
+          sign () {
+            if [ "${SIGN_IDENTITY}" = "-" ]; then
+              codesign -f -s - "$1" 2>/dev/null || true
+            else
+              codesign -f -s "${SIGN_IDENTITY}" ${SIGN_FLAGS} "$1"
+            fi
+          }
+
           cd "dist/${name}"
           mkdir -p lib
 
@@ -331,11 +437,15 @@ jobs:
               "${binary}" 2>/dev/null || true
             # Rewriting a program breaks its signature, and on Apple
             # Silicon a broken signature is a program that will not run
-            # at all -- killed outright, with nothing said.
-            codesign -f -s - "${binary}" 2>/dev/null || true
+            # at all -- killed outright, with nothing said.  With a
+            # certificate this is also the real signature the image is
+            # notarised on, so there it has to succeed rather than be
+            # tried: a package half of which is signed is worse than one
+            # that is not.
+            sign "${binary}"
           done
           for library in lib/*.dylib; do
-            [ -f "${library}" ] && codesign -f -s - "${library}" || true
+            [ -f "${library}" ] && sign "${library}"
           done
 
           echo "still wanted from outside:"
@@ -412,6 +522,113 @@ jobs:
           cd dist
           hdiutil create -volname "UKNC ${version}" -srcfolder "${name}" \
             -ov -format UDZO "${name}.dmg"
+          if [ "${SIGN_IDENTITY}" != "-" ]; then
+            codesign -f -s "${SIGN_IDENTITY}" ${SIGN_FLAGS} "${name}.dmg"
+          fi
+
+      # Signing says who made the image; notarisation is Apple saying
+      # it has seen it, and that is what Gatekeeper asks for on a
+      # download.  The ticket is then stapled into the image, which
+      # Apple recommends so that a mac with no network can still find
+      # it.
+      - name: Notarise (macOS)
+        if: runner.os == 'macOS' && env.SIGN_IDENTITY != '-'
+        env:
+          NOTARY_KEY: ${{ secrets.MACOS_NOTARY_KEY }}
+          NOTARY_KEY_ID: ${{ secrets.MACOS_NOTARY_KEY_ID }}
+          NOTARY_ISSUER: ${{ secrets.MACOS_NOTARY_ISSUER }}
+          NOTARY_APPLE_ID: ${{ secrets.MACOS_NOTARY_APPLE_ID }}
+          NOTARY_PASSWORD: ${{ secrets.MACOS_NOTARY_PASSWORD }}
+          NOTARY_TEAM_ID: ${{ secrets.MACOS_NOTARY_TEAM_ID }}
+        run: |
+          dmg="dist/${name}.dmg"
+
+          # Apple's checks, before spending one of the day's
+          # notarizations on an image that cannot pass: the signature
+          # whole, and a secure timestamp in it.  "Timestamp=" means the
+          # signature has one; "Signed Time=" means it does not, which
+          # is what a signature made without the network looks like.
+          hdiutil verify "${dmg}"
+          codesign -vvv --deep --strict "${dmg}"
+          if ! codesign -dvv "${dmg}" 2>&1 | grep -q "^Timestamp="; then
+            echo "the image is signed without a secure timestamp," \
+                 "which the notary service refuses" >&2
+            codesign -dvv "${dmg}" 2>&1 | grep -E "^(Signed Time|Timestamp)=" >&2
+            exit 1
+          fi
+
+          # A secret holds exactly what was pasted into it, and a value
+          # copied out of a file arrives with the newline on the end.
+          # None of these three can contain a space -- an Apple ID, an
+          # app-specific password (xxxx-xxxx-xxxx-xxxx) and a team id --
+          # so stripping whitespace cannot turn a right one into a wrong
+          # one, and it does stop a stray newline looking like a wrong
+          # password.
+          trim () { printf '%s' "$1" | tr -d '[:space:]'; }
+
+          key_used=no
+          if [ -n "${NOTARY_KEY}" ]; then
+            echo "${NOTARY_KEY}" | base64 --decode > "${RUNNER_TEMP}/notary.p8"
+            key_used=yes
+            set -- --key "${RUNNER_TEMP}/notary.p8" \
+                   --key-id "$(trim "${NOTARY_KEY_ID}")"
+            # Issuer is for team keys; notarytool says not to pass it
+            # for an individual one, so an empty secret means absent
+            # rather than empty.
+            if [ -n "${NOTARY_ISSUER}" ]; then
+              set -- "$@" --issuer "$(trim "${NOTARY_ISSUER}")"
+            fi
+          elif [ -n "${NOTARY_APPLE_ID}" ]; then
+            set -- --apple-id "$(trim "${NOTARY_APPLE_ID}")" \
+                   --password "$(trim "${NOTARY_PASSWORD}")" \
+                   --team-id "$(trim "${NOTARY_TEAM_ID}")"
+          else
+            echo "signed, but no notary credentials: not notarised, so" \
+                 "Gatekeeper will still stop a downloaded image" >&2
+            exit 0
+          fi
+
+          # --wait, because an image published before the service has
+          # answered is an image whose answer nobody will read; and the
+          # machine-readable form, so that what is checked afterwards is
+          # a field and not a line of prose that may be worded
+          # differently tomorrow.  (notarytool says json suppresses the
+          # progress indicator and prints one update at the end.)
+          answer="${RUNNER_TEMP}/notary.json"
+          xcrun notarytool submit "${dmg}" "$@" \
+            --wait --timeout 30m --output-format json > "${answer}" || true
+          cat "${answer}"
+
+          # One line, because a block scalar ends at the first line
+          # that is not indented into it -- and a json file that is not
+          # one answers with nothing, which the check below reads as
+          # "not accepted".
+          field () {
+            python3 -c "import json,sys;print(json.load(open(sys.argv[1])).get(sys.argv[2],''))" \
+              "${answer}" "$1" 2>/dev/null || true
+          }
+          id=$(field id)
+          status=$(field status)
+
+          # Apple: always read the log, even when it succeeded, because
+          # it can hold warnings about what will stop working next.
+          if [ -n "${id}" ]; then
+            xcrun notarytool log "${id}" "$@" || true
+          fi
+          if [ "${key_used}" = yes ]; then
+            rm -f "${RUNNER_TEMP}/notary.p8"
+          fi
+
+          if [ "${status}" != "Accepted" ]; then
+            echo "the notary service answered \"${status}\" and not" \
+                 "Accepted" >&2
+            exit 1
+          fi
+
+          xcrun stapler staple "${dmg}"
+          # What a user's mac will do with it, said out loud here.
+          spctl --assess --type open \
+            --context context:primary-signature -vv "${dmg}"
 
       - name: Package (installer)
         if: runner.os == 'Windows'
@@ -459,6 +676,14 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write
+      # For the provenance attestations below: the first mints the
+      # short-lived OIDC identity the claim is signed with, the second
+      # persists the claim, and the third records it against the
+      # artifact -- that last one is optional, and the action says so
+      # and carries on without it.
+      id-token: write
+      attestations: write
+      artifact-metadata: write
 
     steps:
       - uses: actions/checkout@v5
@@ -486,6 +711,20 @@ jobs:
             echo "Собрано из ${GITHUB_SHA}."
           } > notes.md
           cat notes.md
+
+      # The signature everybody gets, with no Apple account in it: a
+      # statement, signed on this workflow's own short-lived identity,
+      # that these exact bytes came out of this run of this repository.
+      # "gh attestation verify FILE --repo wdigger/uknc" checks it, and
+      # the release notes say so.  It is not what Gatekeeper asks for --
+      # that is the certificate and the notarisation above -- but it is
+      # the thing a checksum in the same release cannot be: a checksum
+      # published beside the file it describes proves nothing about
+      # where either came from.
+      - name: Attest what is being published
+        uses: actions/attest-build-provenance@v4
+        with:
+          subject-path: release/*
 
       - name: Publish
         env:
