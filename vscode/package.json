@@ -15,7 +15,8 @@
     "main": "./extension.js",
     "extensionDependencies": [
         "ms-vscode.cpptools",
-        "ms-vscode.makefile-tools"
+        "ms-vscode.makefile-tools",
+        "ms-vscode.vscode-js-profile-flame"
     ],
     "activationEvents": [
         "onStartupFinished"
@@ -33,6 +34,26 @@
                     "type": "boolean",
                     "default": true,
                     "description": "Показывать экран машины в отдельном окне во время отладки. Окно закрывается вместе с сеансом, а если закрыть его самому — машина останавливается."
+                },
+                "uknc.profileBy": {
+                    "type": "string",
+                    "enum": [
+                        "line",
+                        "function",
+                        "address"
+                    ],
+                    "default": "line",
+                    "description": "Кадр в профиле: строка исходника, функция или отдельный адрес."
+                },
+                "uknc.profileRealTime": {
+                    "type": "boolean",
+                    "default": false,
+                    "description": "Показывать в профиле реальное время, а не такты. Такты пишутся как микросекунды: числа пропорциональны и неверна только подпись, зато их можно сравнивать между прогонами."
+                },
+                "uknc.profileFrames": {
+                    "type": "number",
+                    "default": 60000,
+                    "description": "Сколько кадров по 1/50 секунды дать программе при профилировании всего прогона, прежде чем счесть её зависшей."
                 }
             }
         },
@@ -92,10 +113,39 @@
                 "command": "uknc.showToolchain",
                 "title": "Показать, где найден тулчейн",
                 "category": "УКНЦ"
+            },
+            {
+                "command": "uknc.profile",
+                "title": "Профилировать прогон",
+                "category": "УКНЦ"
+            },
+            {
+                "command": "uknc.profileStart",
+                "title": "Включить профилировщик (в сеансе отладки)",
+                "category": "УКНЦ"
+            },
+            {
+                "command": "uknc.profileShow",
+                "title": "Сохранить и открыть профиль (в сеансе отладки)",
+                "category": "УКНЦ"
+            },
+            {
+                "command": "uknc.profileOpen",
+                "title": "Открыть профиль (.prof)",
+                "category": "УКНЦ"
             }
         ],
         "configurationDefaults": {
             "C_Cpp.default.configurationProvider": "ms-vscode.makefile-tools"
+        },
+        "menus": {
+            "explorer/context": [
+                {
+                    "command": "uknc.profileOpen",
+                    "when": "resourceExtname == .prof",
+                    "group": "navigation"
+                }
+            ]
         }
     }
 }

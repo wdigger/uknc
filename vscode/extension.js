@@ -29,6 +29,7 @@ const net = require('net');
 const path = require('path');
 
 const config = require('./config');
+const profile = require('./profile');
 
 const CPPTOOLS = 'ms-vscode.cpptools';
 
@@ -258,6 +259,201 @@ async function runOnMachine() {
 }
 
 //////////////////////////////////////////////////////////////////////
+// Profiling
+//
+// The emulator counts ticks per instruction address; VS Code reads
+// .cpuprofile and shows it (see profile.js).  What is left is to put the
+// two together without the three commands and the shell in between:
+// either over a whole run, or around the piece of a debug session that
+// is worth measuring.
+
+function profileSettings() {
+    const settings = vscode.workspace.getConfiguration('uknc');
+    return {
+        by: settings.get('profileBy', 'line'),
+        frames: settings.get('profileFrames', 60000),
+        // Ticks as microseconds unless asked for real time: the numbers
+        // are then proportional and wrong only in their label, which is
+        // what one wants while comparing two runs.
+        hz: settings.get('profileRealTime', false) ? 8000000 : 0,
+        screen: settings.get('screen', true),
+    };
+}
+
+// profile -> .cpuprofile -> the editor's own viewer.
+async function openProfile(root, prof, program) {
+    const settings = profileSettings();
+    const made = await profile.convertFile({
+        prof: prof,
+        elf: program,
+        by: settings.by,
+        hz: settings.hz,
+        addr2line: path.join(root, 'gcc', 'bin',
+                             'pdp11-uknc-rt11-addr2line'),
+    });
+    log('профиль: ' + made.ticks + ' такт, ' + made.frames + ' кадров -> ' +
+        made.out);
+    await vscode.commands.executeCommand(
+        'vscode.open', vscode.Uri.file(made.out));
+    return made;
+}
+
+// "УКНЦ: профилировать прогон" -- the whole program, from load to exit,
+// with no breakpoints and nothing to click.
+async function profileRun() {
+    const folder = (vscode.workspace.workspaceFolders || [])[0];
+    const root = await toolchain(folder, true);
+    const dir = projectDir(folder);
+    if (!root || !dir) {
+        if (root) {
+            vscode.window.showErrorMessage(
+                'УКНЦ: не понял, что профилировать — откройте файл проекта.');
+        }
+        return;
+    }
+
+    // The ELF, because addr2line needs its symbols -- and built first,
+    // for the same reason F5 builds: a profile of yesterday's code is
+    // worse than waiting.
+    const made = await runMake(root, dir, config.elfTarget(dir, readFile));
+    if (!made.ok) {
+        log(made.output).show(true);
+        vscode.window.showErrorMessage('УКНЦ: не собралось — см. вывод «УКНЦ».');
+        return;
+    }
+    const found = config.findProgram(
+        dir, (d) => fs.readdirSync(d), (f) => fs.existsSync(f));
+    if (found.error) {
+        vscode.window.showErrorMessage('УКНЦ: ' + found.error + '.');
+        return;
+    }
+
+    const settings = profileSettings();
+    await vscode.window.withProgress({
+        location: vscode.ProgressLocation.Notification,
+        title: 'УКНЦ: профилирую ' + path.basename(found.program),
+        cancellable: false,
+    }, async () => {
+        try {
+            const run = await profile.runProfile({
+                emulator: config.partPath(root, 'emulator'),
+                gdb: config.partPath(root, 'gdb'),
+                disk: config.partPath(root, 'disk'),
+                firmware: config.partPath(root, 'firmware'),
+                program: found.program,
+                cwd: dir,
+                frames: settings.frames,
+                screen: settings.screen,
+                log: log,
+            });
+            await openProfile(root, run.prof, found.program);
+        } catch (e) {
+            log(String(e.message || e)).show(true);
+            vscode.window.showErrorMessage('УКНЦ: ' + (e.message || e));
+        }
+    });
+}
+
+// The two halves of measuring a piece of a session rather than a whole
+// run.  gdb takes a monitor command when the program is stopped, so
+// these belong at a breakpoint: switch the profiler on at one, continue,
+// and ask for the profile at the next.
+function session() {
+    const active = vscode.debug.activeDebugSession;
+    if (!active || !active.configuration ||
+        active.configuration.miDebuggerServerAddress === undefined) {
+        vscode.window.showErrorMessage(
+            'УКНЦ: нет сеанса отладки — это для замера части прогона. ' +
+            'Для всей программы есть «УКНЦ: профилировать прогон».');
+        return null;
+    }
+    return active;
+}
+
+async function monitor(active, command) {
+    return active.customRequest('evaluate', {
+        expression: '-exec monitor ' + command,
+        context: 'repl',
+    });
+}
+
+async function profileStart() {
+    const active = session();
+    if (!active) {
+        return;
+    }
+    try {
+        await monitor(active, 'prof reset');
+        await monitor(active, 'prof on');
+        vscode.window.showInformationMessage(
+            'УКНЦ: профилировщик включён — продолжите программу, ' +
+            'потом «сохранить профиль».');
+    } catch (e) {
+        vscode.window.showErrorMessage(
+            'УКНЦ: не вышло включить профилировщик (программа остановлена?): ' +
+            (e.message || e));
+    }
+}
+
+async function profileShow() {
+    const active = session();
+    if (!active) {
+        return;
+    }
+    const program = active.configuration.program;
+    const dir = active.configuration.cwd || path.dirname(program);
+    const prof = path.join(
+        dir, path.basename(program).replace(/\.elf$/, '') + '.prof');
+    const root = await toolchain(undefined, false);
+    if (!root) {
+        vscode.window.showErrorMessage('УКНЦ: не нашёл тулчейн.');
+        return;
+    }
+    try {
+        await monitor(active, 'prof off');
+        // The emulator's own fopen, so the path is its working
+        // directory's -- which is the project folder, the session having
+        // started it there.
+        await monitor(active, 'prof save ' + path.basename(prof));
+        await openProfile(root, prof, program);
+    } catch (e) {
+        log(String(e.message || e)).show(true);
+        vscode.window.showErrorMessage('УКНЦ: ' + (e.message || e));
+    }
+}
+
+// "УКНЦ: открыть профиль" -- a .prof saved by hand, from the debug
+// console or from the emulator's own one.
+async function profileOpen(uri) {
+    const file = uri && uri.fsPath ? uri.fsPath
+          : (vscode.window.activeTextEditor
+             ? vscode.window.activeTextEditor.document.uri.fsPath : null);
+    if (!file || !file.endsWith('.prof')) {
+        vscode.window.showErrorMessage(
+            'УКНЦ: откройте .prof, сохранённый «monitor prof save».');
+        return;
+    }
+    const dir = path.dirname(file);
+    const root = await toolchain(undefined, true);
+    if (!root) {
+        return;
+    }
+    const found = config.findProgram(
+        dir, (d) => fs.readdirSync(d), (f) => fs.existsSync(f));
+    if (found.error) {
+        vscode.window.showErrorMessage(
+            'УКНЦ: ' + found.error + ' — имена в профиле берутся из .elf.');
+        return;
+    }
+    try {
+        await openProfile(root, file, found.program);
+    } catch (e) {
+        log(String(e.message || e)).show(true);
+        vscode.window.showErrorMessage('УКНЦ: ' + (e.message || e));
+    }
+}
+
+//////////////////////////////////////////////////////////////////////
 
 // "УКНЦ: создать проект" -- a Makefile for a folder that has none, so
 // that the tasks and F5 have something to build.  Everything else the
@@ -340,7 +536,11 @@ function activate(context) {
         vscode.debug.registerDebugConfigurationProvider('uknc', debugProvider),
         vscode.commands.registerCommand('uknc.newProject', newProject),
         vscode.commands.registerCommand('uknc.showToolchain', showToolchain),
-        vscode.commands.registerCommand('uknc.run', runOnMachine));
+        vscode.commands.registerCommand('uknc.run', runOnMachine),
+        vscode.commands.registerCommand('uknc.profile', profileRun),
+        vscode.commands.registerCommand('uknc.profileStart', profileStart),
+        vscode.commands.registerCommand('uknc.profileShow', profileShow),
+        vscode.commands.registerCommand('uknc.profileOpen', profileOpen));
 }
 
 function deactivate() {}

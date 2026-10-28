@@ -7,6 +7,7 @@
 // breakpoint and reports what comes back.
 //
 //   node test.js [ПАПКА-ПРОЕКТА [СТРОКА]] [screen]
+//   node test.js --profile [ПАПКА-ПРОЕКТА]   -- профиль вместо сеанса
 //
 // Default is examples/hello in the toolchain this file belongs to.  The
 // project must already be built (make <name>.elf).  The line to stop at
@@ -22,8 +23,12 @@ const path = require('path');
 const config = require('./config');
 
 const toolchain = path.dirname(__dirname);
-const project = process.argv[2]
-      ? path.resolve(process.argv[2])
+// The first argument that is neither a flag, nor "screen", nor the line
+// number: everything else on this command line has a meaning of its own.
+const named = process.argv.slice(2).filter(
+    (a) => !a.startsWith('--') && a !== 'screen' && !/^\d+$/.test(a))[0];
+const project = named
+      ? path.resolve(named)
       : path.join(toolchain, 'examples', 'hello');
 
 // examples/hello builds hello.elf; a project made by the extension
@@ -73,6 +78,48 @@ const missing = config.missingParts(toolchain);
 if (missing.length > 0) {
     console.error('в тулчейне не хватает: ' + missing.join(', '));
     process.exit(1);
+}
+
+// "node test.js --profile [ПАПКА]" -- the other half of the extension,
+// which needs no adapter and no editor: a whole run measured on the
+// machine and turned into the .cpuprofile VS Code opens.  The same two
+// calls the command makes.
+if (process.argv.indexOf('--profile') >= 0) {
+    const profile = require('./profile');
+    const program = findProgram(project);
+    const sav = program.replace(/\.elf$/, '.sav');
+    if (!fs.existsSync(sav)) {
+        console.error('нет ' + path.basename(sav) + ' -- соберите его сначала');
+        process.exit(1);
+    }
+    profile.runProfile({
+        emulator: config.partPath(toolchain, 'emulator'),
+        gdb: config.partPath(toolchain, 'gdb'),
+        disk: config.partPath(toolchain, 'disk'),
+        firmware: config.partPath(toolchain, 'firmware'),
+        rt11dsk: path.join(toolchain, 'gcc', 'bin', 'rt11dsk'),
+        program: program,
+        sav: sav,
+        cwd: project,
+        frames: 60000,
+        screen: process.argv.indexOf('screen') >= 0,
+    }).then((run) => profile.convertFile({
+        prof: run.prof,
+        elf: program,
+        addr2line: path.join(toolchain, 'gcc', 'bin',
+                             'pdp11-uknc-rt11-addr2line'),
+        by: 'line',
+    })).then((made) => {
+        console.log('профиль:  ' + made.out);
+        console.log('своего:   ' + made.ticks + ' такт в ' + made.frames +
+                    ' кадрах');
+        console.log('в прогоне:' + made.all + ' такт, остальное -- RT-11');
+        process.exit(made.frames > 0 ? 0 : 1);
+    }).catch((e) => {
+        console.error('профиль не вышел: ' + (e.message || e));
+        process.exit(1);
+    });
+    return;
 }
 
 const adapter = path.join(

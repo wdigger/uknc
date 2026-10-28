@@ -16,6 +16,21 @@ set -e
 HERE=$(cd "$(dirname "$0")" && pwd)
 UKNC=$(dirname "${HERE}")
 
+# vsce needs a node of this decade: the current one calls
+# util.styleText, which arrived in 20, and says only "(0 ,
+# util_1.styleText) is not a function" when it is not there.  Said here
+# instead, before the download.
+if ! command -v node > /dev/null 2>&1; then
+	echo "build_extension: no node -- vsce is written in it" >&2
+	exit 1
+fi
+NODE_MAJOR=$(node --version | sed 's/^v\([0-9]*\).*/\1/')
+if [ "${NODE_MAJOR}" -lt 20 ]; then
+	echo "build_extension: node ${NODE_MAJOR} is too old for vsce," \
+	     "which wants 20 or newer" >&2
+	exit 1
+fi
+
 for f in gcc/bin/pdp11-uknc-rt11-gcc gcc/bin/pdp11-uknc-rt11-gdb \
          debugger/bin/ukncbtldebug rom/uknc_rom_autoboot.bin \
          resources/rt11os.dsk gcc/dejagnu/uknc-run; do
@@ -33,18 +48,19 @@ BUILD=$(mktemp -d "${TMPDIR:-/tmp}/uknc-vsix.XXXXXX")
 trap 'rm -rf "${BUILD}"' EXIT INT TERM
 
 cp "${HERE}/package.json" "${HERE}/extension.js" "${HERE}/config.js" \
-   "${HERE}/README.md" "${BUILD}/"
+   "${HERE}/profile.js" "${HERE}/README.md" "${BUILD}/"
 cat > "${BUILD}/packaged.json" <<EOF
 { "toolchain": "${UKNC}" }
 EOF
 
-# The extension is four files; everything else in the build directory is
+# The extension is five files; everything else in the build directory is
 # scaffolding npm left behind and must stay out of the package.
 cat > "${BUILD}/.vscodeignore" <<'EOF'
 **
 !package.json
 !extension.js
 !config.js
+!profile.js
 !packaged.json
 !README.md
 EOF

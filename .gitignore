@@ -31,3 +31,8 @@ sweep.txt
 /debugger/bin
 /debugger/src
 *.vsix
+
+# Профили: что сохраняет «monitor prof save» и во что это переводят
+# prof2cpuprofile.py и расширение VS Code.
+*.prof
+*.cpuprofile
