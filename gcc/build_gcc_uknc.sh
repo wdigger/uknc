@@ -368,3 +368,9 @@ PATH="${BUILDDIR}/bin:${PATH}" make install
 # UKNC-specific, so it needs no wrapper of its own: -lpdp11 is enough.
 cd ${BUILDDIR}/../libs/libpdp11
 PATH="${BUILDDIR}/bin:${PATH}" make install
+
+# Install libuknc (../libs/libuknc): UKNC-specific helper headers.  It is
+# header-only for now; koi7.h goes into the same sysroot include directory
+# as the other project-provided headers.
+cd ${BUILDDIR}/../libs/libuknc
+PATH="${BUILDDIR}/bin:${PATH}" make install
