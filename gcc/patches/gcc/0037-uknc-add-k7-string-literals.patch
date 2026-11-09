@@ -1,0 +1,496 @@
+From: Yury Klushin <digger@live.ru>
+Date: Mon, 9 Nov 2026 23:40:00 +0300
+Subject: [PATCH] uknc: add k7 string literal prefix
+
+The uknc target uses a KOI7 console path where SO/SI switch the Russian
+and Latin glyph sets.  The project had a TO_KOI7 macro for this, but the
+macro expansion is necessarily large and expensive for the compiler to
+parse.
+
+Add a uknc-only k7"..." string literal prefix.  The preprocessor accepts
+it only when the target config defines TARGET_UKNC_DEFAULTS, and the
+literal is interpreted as an ordinary char array whose contents are the
+UKNC KOI7 bytes.  Cyrillic letters are mapped like the existing helper:
+uppercase and lowercase Russian letters use the UKNC KOI layout, Yo maps
+to Ye, ASCII uses the Latin shift, and unrepresentable non-ASCII
+characters become '?'.
+
+---
+ gcc/c-family/c-ada-spec.cc                  |   1 +
+ gcc/c-family/c-common.cc                    |   3 +-
+ gcc/c-family/c-lex.cc                       |  12 +++-
+ gcc/c-family/c-opts.cc                      |   3 +
+ gcc/c/c-parser.cc                           |  16 ++++-
+ gcc/c/gimple-parser.cc                      |   1 +
+ gcc/testsuite/gcc.target/pdp11/k7-string.c  |   5 ++
+ libcpp/charset.cc                           | 133 ++++++++++++++++++++++++++++
+ libcpp/directives.cc                        |   3 +-
+ libcpp/include/cpplib.h                     |   4 +
+ libcpp/lex.cc                               |  21 ++++-
+ libcpp/macro.cc                             |   1 +
+ 12 files changed, 198 insertions(+), 5 deletions(-)
+
+--- a/libcpp/include/cpplib.h	2025-08-08 09:51:44
++++ b/libcpp/include/cpplib.h	2026-11-09 23:28:10
+@@ -129,6 +129,7 @@
+   TK(STRING16,		LITERAL) /* u"string" */			\
+   TK(STRING32,		LITERAL) /* U"string" */			\
+   TK(UTF8STRING,	LITERAL) /* u8"string" */			\
++  TK(KOI7STRING,	LITERAL) /* k7"string" - pdp11-uknc-* */	\
+   TK(OBJC_STRING,	LITERAL) /* @"string" - Objective-C */		\
+   TK(HEADER_NAME,	LITERAL) /* <stdio.h> in #include */		\
+   TK(UNEVAL_STRING,	LITERAL) /* unevaluated "string" - C++26 */	\
+@@ -390,6 +391,9 @@
+ 
+   /* Nonzero means process u8 prefixed character literals (UTF-8).  */
+   unsigned char utf8_char_literals;
++
++  /* Nonzero means process k7-prefixed UKNC KOI7 string literals.  */
++  unsigned char koi7_literals;
+ 
+   /* Nonzero means process r/R raw strings.  If this is set, uliterals
+      must be set as well.  */
+--- a/gcc/c-family/c-opts.cc	2025-08-08 09:51:40
++++ b/gcc/c-family/c-opts.cc	2026-11-09 23:28:12
+@@ -252,6 +252,9 @@
+   cpp_opts->dollars_in_ident = DOLLARS_IN_IDENTIFIERS;
+   cpp_opts->objc = c_dialect_objc ();
+   cpp_opts->deps.modules = true;
++#ifdef TARGET_UKNC_DEFAULTS
++  cpp_opts->koi7_literals = true;
++#endif
+ 
+   /* Reset to avoid warnings on internal definitions.  We set it just
+      before passing on command-line options to cpplib.  */
+--- a/libcpp/lex.cc	2025-08-08 09:51:44
++++ b/libcpp/lex.cc	2026-11-09 23:28:17
+@@ -2852,7 +2852,7 @@
+ 
+ /* Lexes a string, character constant, or angle-bracketed header file
+    name.  The stored string contains the spelling, including opening
+-   quote and any leading 'L', 'u', 'U' or 'u8' and optional
++   quote and any leading 'L', 'u', 'U', 'u8' or 'k7' and optional
+    'R' modifier.  It returns the type of the literal, or CPP_OTHER
+    if it was not properly terminated, or CPP_LESS for an unterminated
+    header name which must be relexed as normal tokens.
+@@ -2877,6 +2877,12 @@
+       if (terminator == '8')
+ 	terminator = *cur++;
+     }
++  else if (terminator == 'k')
++    {
++      terminator = *cur++;
++      if (terminator == '7')
++	terminator = *cur++;
++    }
+   if (terminator == 'R')
+     {
+       lex_raw_string (pfile, token, base);
+@@ -2886,6 +2892,7 @@
+     type = (*base == 'L' ? CPP_WSTRING :
+ 	    *base == 'U' ? CPP_STRING32 :
+ 	    *base == 'u' ? (base[1] == '8' ? CPP_UTF8STRING : CPP_STRING16)
++	    : *base == 'k' ? CPP_KOI7STRING
+ 			 : CPP_STRING);
+   else if (terminator == '\'')
+     type = (*base == 'L' ? CPP_WCHAR :
+@@ -4019,12 +4026,22 @@
+ 	      lex_string (pfile, result, buffer->cur - 1);
+ 	      break;
+ 	    }
++	}
++      /* Fall through.  */
++
++    case 'k':
++      if (CPP_OPTION (pfile, koi7_literals)
++	  && buffer->cur[0] == '7'
++	  && buffer->cur[1] == '"')
++	{
++	  lex_string (pfile, result, buffer->cur - 1);
++	  break;
+ 	}
+       /* Fall through.  */
+ 
+     case '_':
+     case 'a': case 'b': case 'c': case 'd': case 'e': case 'f':
+-    case 'g': case 'h': case 'i': case 'j': case 'k': case 'l':
++    case 'g': case 'h': case 'i': case 'j': case 'l':
+     case 'm': case 'n': case 'o': case 'p': case 'q': case 'r':
+     case 's': case 't':           case 'v': case 'w': case 'x':
+     case 'y': case 'z':
+@@ -4737,6 +4754,7 @@
+     case CPP_STRING:
+     case CPP_WSTRING:
+     case CPP_UTF8STRING:
++    case CPP_KOI7STRING:
+     case CPP_STRING16:
+     case CPP_STRING32:	return (CPP_OPTION (pfile, user_literals)
+ 				&& (b == CPP_NAME
+--- a/libcpp/charset.cc	2025-08-08 09:51:44
++++ b/libcpp/charset.cc	2026-11-09 23:30:26
+@@ -620,7 +620,126 @@
+   to->len += flen;
+   return true;
+ }
++
++static bool
++koi7_map_char (cppchar_t wc, uchar *mode, uchar *byte)
++{
++  *mode = '\017';
++  if (wc < 0x80)
++    {
++      *byte = wc;
++      return true;
++    }
+ 
++  *mode = '\016';
++  switch (wc)
++    {
++    case 0x0410: *byte = 0x61; return true;
++    case 0x0411: *byte = 0x62; return true;
++    case 0x0412: *byte = 0x77; return true;
++    case 0x0413: *byte = 0x67; return true;
++    case 0x0414: *byte = 0x64; return true;
++    case 0x0415: *byte = 0x65; return true;
++    case 0x0401: *byte = 0x65; return true;
++    case 0x0416: *byte = 0x76; return true;
++    case 0x0417: *byte = 0x7a; return true;
++    case 0x0418: *byte = 0x69; return true;
++    case 0x0419: *byte = 0x6a; return true;
++    case 0x041a: *byte = 0x6b; return true;
++    case 0x041b: *byte = 0x6c; return true;
++    case 0x041c: *byte = 0x6d; return true;
++    case 0x041d: *byte = 0x6e; return true;
++    case 0x041e: *byte = 0x6f; return true;
++    case 0x041f: *byte = 0x70; return true;
++    case 0x0420: *byte = 0x72; return true;
++    case 0x0421: *byte = 0x73; return true;
++    case 0x0422: *byte = 0x74; return true;
++    case 0x0423: *byte = 0x75; return true;
++    case 0x0424: *byte = 0x66; return true;
++    case 0x0425: *byte = 0x68; return true;
++    case 0x0426: *byte = 0x63; return true;
++    case 0x0427: *byte = 0x7e; return true;
++    case 0x0428: *byte = 0x7b; return true;
++    case 0x0429: *byte = 0x7d; return true;
++    case 0x042a: *byte = 0x7f; return true;
++    case 0x042b: *byte = 0x79; return true;
++    case 0x042c: *byte = 0x78; return true;
++    case 0x042d: *byte = 0x7c; return true;
++    case 0x042e: *byte = 0x60; return true;
++    case 0x042f: *byte = 0x71; return true;
++    case 0x0430: *byte = 0x41; return true;
++    case 0x0431: *byte = 0x42; return true;
++    case 0x0432: *byte = 0x57; return true;
++    case 0x0433: *byte = 0x47; return true;
++    case 0x0434: *byte = 0x44; return true;
++    case 0x0435: *byte = 0x45; return true;
++    case 0x0451: *byte = 0x45; return true;
++    case 0x0436: *byte = 0x56; return true;
++    case 0x0437: *byte = 0x5a; return true;
++    case 0x0438: *byte = 0x49; return true;
++    case 0x0439: *byte = 0x4a; return true;
++    case 0x043a: *byte = 0x4b; return true;
++    case 0x043b: *byte = 0x4c; return true;
++    case 0x043c: *byte = 0x4d; return true;
++    case 0x043d: *byte = 0x4e; return true;
++    case 0x043e: *byte = 0x4f; return true;
++    case 0x043f: *byte = 0x50; return true;
++    case 0x0440: *byte = 0x52; return true;
++    case 0x0441: *byte = 0x53; return true;
++    case 0x0442: *byte = 0x54; return true;
++    case 0x0443: *byte = 0x55; return true;
++    case 0x0444: *byte = 0x46; return true;
++    case 0x0445: *byte = 0x48; return true;
++    case 0x0446: *byte = 0x43; return true;
++    case 0x0447: *byte = 0x5e; return true;
++    case 0x0448: *byte = 0x5b; return true;
++    case 0x0449: *byte = 0x5d; return true;
++    case 0x044a: *byte = 0x5f; return true;
++    case 0x044b: *byte = 0x59; return true;
++    case 0x044c: *byte = 0x58; return true;
++    case 0x044d: *byte = 0x5c; return true;
++    case 0x044e: *byte = 0x40; return true;
++    case 0x044f: *byte = 0x51; return true;
++    default:
++      *mode = '\017';
++      *byte = '?';
++      return true;
++    }
++}
++
++static bool
++convert_utf8_koi7 (iconv_t cd ATTRIBUTE_UNUSED,
++		   const uchar *from, size_t flen, struct _cpp_strbuf *to)
++{
++  const uchar *p = from;
++  size_t bytesleft = flen;
++
++  while (bytesleft)
++    {
++      cppchar_t wc;
++      int err = one_utf8_to_cppchar (&p, &bytesleft, &wc);
++      uchar mode, byte;
++
++      if (err)
++	{
++	  errno = err;
++	  return false;
++	}
++
++      if (!koi7_map_char (wc, &mode, &byte))
++	return false;
++
++      if (to->len + 2 > to->asize)
++	{
++	  to->asize = MAX (to->asize + OUTBUF_BLOCK_SIZE, to->len + 2);
++	  to->text = XRESIZEVEC (uchar, to->text, to->asize);
++	}
++      to->text[to->len++] = mode;
++      to->text[to->len++] = byte;
++    }
++  return true;
++}
++
+ /* And this one uses the system iconv primitive.  It's a little
+    different, since iconv's interface is a little different.  */
+ #if HAVE_ICONV
+@@ -2456,6 +2575,13 @@
+     case CPP_UTF8CHAR:
+     case CPP_UTF8STRING:
+ 	return pfile->utf8_cset_desc;
++    case CPP_KOI7STRING:
++	{
++	  struct cset_converter ret = { convert_utf8_koi7, (iconv_t)-1,
++					CPP_OPTION (pfile, char_precision),
++					SOURCE_CHARSET, "UKNC-KOI7" };
++	  return ret;
++	}
+     case CPP_CHAR16:
+     case CPP_STRING16:
+ 	return pfile->char16_cset_desc;
+@@ -2520,6 +2646,15 @@
+ 	    }
+ 	}
+       else if (*p == 'L' || *p == 'U') p++;
++      else if (*p == 'k' && p[1] == '7')
++	{
++	  p += 2;
++	  if (loc_reader)
++	    {
++	      loc_reader->get_next ();
++	      loc_reader->get_next ();
++	    }
++	}
+       if (*p == 'R')
+ 	{
+ 	  const uchar *prefix;
+--- a/libcpp/macro.cc	2025-08-08 09:51:44
++++ b/libcpp/macro.cc	2026-11-09 23:28:41
+@@ -956,6 +956,7 @@
+ 		   || token->type == CPP_STRING32 || token->type == CPP_CHAR32
+ 		   || token->type == CPP_STRING16 || token->type == CPP_CHAR16
+ 		   || token->type == CPP_UTF8STRING || token->type == CPP_UTF8CHAR
++		   || token->type == CPP_KOI7STRING
+ 		   || cpp_userdef_string_p (token->type)
+ 		   || cpp_userdef_char_p (token->type));
+ 
+--- a/libcpp/directives.cc	2025-08-08 09:51:44
++++ b/libcpp/directives.cc	2026-11-09 23:29:34
+@@ -2372,7 +2372,8 @@
+     _cpp_backup_tokens (pfile, 1);
+   if (string->type != CPP_STRING && string->type != CPP_WSTRING
+       && string->type != CPP_STRING32 && string->type != CPP_STRING16
+-      && string->type != CPP_UTF8STRING)
++      && string->type != CPP_UTF8STRING
++      && string->type != CPP_KOI7STRING)
+     return NULL;
+ 
+   paren = get_token_no_padding (pfile);
+--- a/gcc/c-family/c-lex.cc	2025-08-08 09:51:40
++++ b/gcc/c-family/c-lex.cc	2026-11-09 23:28:45
+@@ -657,6 +657,7 @@
+ 	    case CPP_STRING16:
+ 	    case CPP_STRING32:
+ 	    case CPP_UTF8STRING:
++	    case CPP_KOI7STRING:
+ 	      type = lex_string (tok, value, true, true);
+ 	      break;
+ 
+@@ -766,6 +767,7 @@
+     case CPP_STRING16:
+     case CPP_STRING32:
+     case CPP_UTF8STRING:
++    case CPP_KOI7STRING:
+       if ((lex_flags & C_LEX_STRING_NO_JOIN) == 0)
+ 	{
+ 	  type = lex_string (tok, value, false,
+@@ -1589,7 +1591,8 @@
+    be ObjC strings, preceded by a single '@', or normal strings, not
+    preceded by '@'.  The result will be a CPP_OBJC_STRING).  Returns
+    the CPP token type of the result (CPP_STRING, CPP_WSTRING,
+-   CPP_STRING32, CPP_STRING16, CPP_UTF8STRING, or CPP_OBJC_STRING).
++   CPP_STRING32, CPP_STRING16, CPP_UTF8STRING, CPP_KOI7STRING,
++   or CPP_OBJC_STRING).
+ 
+    This is unfortunately more work than it should be.  If any of the
+    strings in the series has an L prefix, the result is a wide string
+@@ -1647,9 +1650,10 @@
+     case CPP_STRING16:
+     case CPP_STRING32:
+     case CPP_UTF8STRING:
++    case CPP_KOI7STRING:
+       if (type != tok->type)
+ 	{
+-	  if (type == CPP_STRING)
++	  if (type == CPP_STRING || tok->type == CPP_KOI7STRING)
+ 	    type = tok->type;
+ 	  else
+ 	    error ("unsupported non-standard concatenation of string literals");
+@@ -1713,6 +1717,7 @@
+ 	default:
+ 	case CPP_STRING:
+ 	case CPP_UTF8STRING:
++	case CPP_KOI7STRING:
+ 	  if (type == CPP_UTF8STRING && flag_char8_t)
+ 	    {
+ 	      value = build_string (TYPE_PRECISION (char8_type_node)
+@@ -1753,6 +1758,9 @@
+       else
+         TREE_TYPE (value) = char_array_type_node;
+       break;
++    case CPP_KOI7STRING:
++      TREE_TYPE (value) = char_array_type_node;
++      break;
+     case CPP_STRING16:
+       TREE_TYPE (value) = char16_array_type_node;
+       break;
+--- a/gcc/c/c-parser.cc	2025-08-08 09:51:40
++++ b/gcc/c/c-parser.cc	2026-11-09 23:29:47
+@@ -3385,6 +3385,7 @@
+ 	case CPP_STRING32:
+ 	case CPP_WSTRING:
+ 	case CPP_UTF8STRING:
++	case CPP_KOI7STRING:
+ 	  string = c_parser_string_literal (parser, false, true).value;
+ 	  break;
+ 	default:
+@@ -9674,6 +9675,7 @@
+     case CPP_STRING16:
+     case CPP_STRING32:
+     case CPP_UTF8STRING:
++    case CPP_KOI7STRING:
+       string_tree = tok->value;
+       break;
+ 
+@@ -9703,6 +9705,7 @@
+     case CPP_STRING16:
+     case CPP_STRING32:
+     case CPP_UTF8STRING:
++    case CPP_KOI7STRING:
+       gcc_obstack_init (&str_ob);
+       gcc_obstack_init (&loc_ob);
+       count = 0;
+@@ -9714,7 +9717,7 @@
+ 	  str.len = TREE_STRING_LENGTH (string_tree);
+ 	  if (type != tok->type)
+ 	    {
+-	      if (type == CPP_STRING)
++	      if (type == CPP_STRING || tok->type == CPP_KOI7STRING)
+ 		type = tok->type;
+ 	      else if (tok->type != CPP_STRING)
+ 		error ("unsupported non-standard concatenation "
+@@ -9732,7 +9735,8 @@
+ 	     || tok->type == CPP_WSTRING
+ 	     || tok->type == CPP_STRING16
+ 	     || tok->type == CPP_STRING32
+-	     || tok->type == CPP_UTF8STRING);
++	     || tok->type == CPP_UTF8STRING
++	     || tok->type == CPP_KOI7STRING);
+       strs = (cpp_string *) obstack_finish (&str_ob);
+     }
+ 
+@@ -9740,7 +9744,7 @@
+     warning (OPT_Wtraditional,
+ 	     "traditional C rejects string constant concatenation");
+ 
+-  if ((type == CPP_STRING || wide_ok)
++  if ((type == CPP_STRING || type == CPP_KOI7STRING || wide_ok)
+       && ((translate
+ 	  ? cpp_interpret_string : cpp_interpret_string_notranslate)
+ 	  (parse_in, strs, count, &istr, type)))
+@@ -9756,7 +9760,7 @@
+     }
+   else
+     {
+-      if (type != CPP_STRING && !wide_ok)
++      if (type != CPP_STRING && type != CPP_KOI7STRING && !wide_ok)
+ 	{
+ 	  error_at (loc, "a wide string is invalid in this context");
+ 	  type = CPP_STRING;
+@@ -9769,6 +9773,7 @@
+ 	default:
+ 	case CPP_STRING:
+ 	case CPP_UTF8STRING:
++	case CPP_KOI7STRING:
+ 	  if (type == CPP_UTF8STRING && flag_char8_t)
+ 	    {
+ 	      value = build_string (TYPE_PRECISION (char8_type_node)
+@@ -9808,6 +9813,9 @@
+ 	TREE_TYPE (value) = char8_array_type_node;
+       else
+ 	TREE_TYPE (value) = char_array_type_node;
++      break;
++    case CPP_KOI7STRING:
++      TREE_TYPE (value) = char_array_type_node;
+       break;
+     case CPP_STRING16:
+       TREE_TYPE (value) = char16_array_type_node;
+@@ -11506,6 +11514,7 @@
+     case CPP_STRING32:
+     case CPP_WSTRING:
+     case CPP_UTF8STRING:
++    case CPP_KOI7STRING:
+       expr = c_parser_string_literal (parser, parser->translate_strings_p,
+ 				      true);
+       break;
+--- a/gcc/c/gimple-parser.cc	2025-08-08 09:51:40
++++ b/gcc/c/gimple-parser.cc	2026-11-09 23:28:53
+@@ -1556,6 +1556,7 @@
+     case CPP_STRING32:
+     case CPP_WSTRING:
+     case CPP_UTF8STRING:
++    case CPP_KOI7STRING:
+       expr = c_parser_string_literal (parser, false, true);
+       break;
+     case CPP_DOT:
+--- a/gcc/c-family/c-common.cc	2025-08-08 09:51:40
++++ b/gcc/c-family/c-common.cc	2026-11-09 23:29:32
+@@ -6939,7 +6939,8 @@
+ 	   || token_type == CPP_WSTRING
+ 	   || token_type == CPP_STRING16
+ 	   || token_type == CPP_STRING32
+-	   || token_type == CPP_UTF8STRING)
++	   || token_type == CPP_UTF8STRING
++	   || token_type == CPP_KOI7STRING)
+     message = catenate_messages (gmsgid, " before string constant");
+   else if (token_type == CPP_NUMBER)
+     message = catenate_messages (gmsgid, " before numeric constant");
+--- a/gcc/c-family/c-ada-spec.cc	2025-08-08 09:51:40
++++ b/gcc/c-family/c-ada-spec.cc	2026-11-09 23:29:37
+@@ -405,6 +405,7 @@
+ 		  case CPP_STRING16:
+ 		  case CPP_STRING32:
+ 		  case CPP_UTF8STRING:
++		  case CPP_KOI7STRING:
+ 		  case CPP_WCHAR:
+ 		  case CPP_CHAR16:
+ 		  case CPP_CHAR32:
+--- a/gcc/testsuite/gcc.target/pdp11/k7-string.c	1970-01-01 03:00:00
++++ b/gcc/testsuite/gcc.target/pdp11/k7-string.c	2026-11-09 23:34:46
+@@ -0,0 +1,5 @@
++/* { dg-do compile { target pdp11-uknc-* } } */
++/* { dg-options "-std=gnu23" } */
++/* { dg-final { scan-assembler "\\.byte 016,0160,016,0122,016,0111" } } */
++
++const char text[] = k7"Привет GCC мир!";

@@ -5,7 +5,9 @@
  * TO_KOI7(L"...") expands to a static const byte string at compile time.
  * The UKNC console path is 7-bit here; SO/SI switch Russian/Latin glyph sets.
  */
-#define KOI7_MAX_CHARS 4096
+#ifndef KOI7_MAX_CHARS
+#define KOI7_MAX_CHARS 128
+#endif
 
 #define _K7_LEN(wstr) (sizeof(wstr) / sizeof((wstr)[0]) - 1)
 #define _K7_ASSERT_LEN(wstr) \
@@ -72,12 +74,22 @@
 	_K7_BLOCK1K(wstr, (off) + 0), _K7_BLOCK1K(wstr, (off) + 1024), \
 	_K7_BLOCK1K(wstr, (off) + 2048), _K7_BLOCK1K(wstr, (off) + 3072)
 
+#if KOI7_MAX_CHARS <= 128
+#define _K7_BLOCK(wstr) _K7_BLOCK128(wstr, 0)
+#elif KOI7_MAX_CHARS <= 1024
+#define _K7_BLOCK(wstr) _K7_BLOCK1K(wstr, 0)
+#elif KOI7_MAX_CHARS <= 4096
+#define _K7_BLOCK(wstr) _K7_BLOCK4K(wstr, 0)
+#else
+#error "KOI7_MAX_CHARS must be 4096 or less"
+#endif
+
 #define TO_KOI7(wstr) \
 	(_K7_ASSERT_LEN(wstr), \
 	 ({ \
 		_Pragma("GCC diagnostic push") \
 		_Pragma("GCC diagnostic ignored \"-Woverride-init\"") \
-		static const char _koi7[] = { _K7_BLOCK4K(wstr, 0), [_K7_LEN(wstr) * 2] = '\0' }; \
+		static const char _koi7[] = { _K7_BLOCK(wstr), [_K7_LEN(wstr) * 2] = '\0' }; \
 		_Pragma("GCC diagnostic pop") \
 		_koi7; \
 	 }))
